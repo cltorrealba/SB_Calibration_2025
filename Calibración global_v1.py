@@ -399,9 +399,9 @@ def preview_data(mats: Dict[str, pd.DataFrame], max_print: int = 6, plot_temp: b
 # ---------- Costo (SSE) en espacio REAL ----------
 def sse_for_experiments_real(p_real: np.ndarray,
                              mats: Dict[str, pd.DataFrame],
-                             pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                             x0_by_assay: Dict[str, np.ndarray] = None,
-                             weights: Dict[str, float] = None,
+                             pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                             x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
+                             weights: Optional[Dict[str, float]] = None,
                              scales=None,
                              verbose: bool = False) -> float:
     if weights is None:
@@ -565,8 +565,8 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
                               p0_real: np.ndarray,
                               bounds_real: List[Tuple[float, float]],
                               mode: str = "de",
-                              pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                              x0_by_assay: Dict[str, np.ndarray] = None,
+                              pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                              x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
                               maxiter_de: int = 80,
                               n_starts: int = 20,
                               verbose: bool = True):
@@ -613,7 +613,11 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
             # Tomar lo mejor visto por el progreso (si lo hay)
             if prog.best_z is None:
                 raise
-            de_res = type("DEres", (), {})()
+            # Crear un contenedor tipado para evitar errores de análisis estático
+            class DEres:
+                x: np.ndarray
+                fun: float
+            de_res = DEres()
             de_res.x = prog.best_z
             de_res.fun = prog.best_sse
 
@@ -637,7 +641,7 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
         # Muestreo inicial Sobol/uniforme
         try:
             from scipy.stats.qmc import Sobol
-            qmc = Sobol(d=len(z_bounds), scramble=True, seed=123)
+            qmc = Sobol(d=len(z_bounds), scramble=True)
             U = qmc.random_base2(int(np.ceil(np.log2(n_starts))))
             U = U[:n_starts]
         except Exception:
@@ -700,8 +704,8 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
 # ---------- Gráfica de ajuste ----------
 def plot_fit_per_assay(p_real: np.ndarray,
                        mats: Dict[str, pd.DataFrame],
-                       pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                       x0_by_assay: Dict[str, np.ndarray] = None):
+                       pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                       x0_by_assay: Optional[Dict[str, np.ndarray]] = None):
     kept = [k for k in mats.keys() if k not in EXCLUDE_ASSAYS]
     n = len(kept)
     if n == 0:
