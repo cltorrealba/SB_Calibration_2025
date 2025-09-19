@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
-def load_parameters_from_excel(xlsx_path="zenteno_parameters.xlsx", sheet_name="Hoja1", param_set=3):
+def load_parameters_from_excel(xlsx_path="zenteno_parameters.xlsx", sheet_name="Hoja1", param_set=4):
     """
     Carga el vector de parámetros desde un Excel.
     Espera una columna 'set' para filtrar y el resto de columnas en el orden del modelo.
@@ -288,28 +288,29 @@ DEFAULT_X0 = np.array([0.5, 0.140, 110.0, 110.0, 0.0])
 
 
 if __name__ == "__main__":
-    p = load_parameters_from_excel("zenteno_parameters.xlsx", "Hoja1", param_set=3)
+    p = load_parameters_from_excel("zenteno_parameters.xlsx", "Hoja1", param_set=4)
 
     # Opción A (legacy): tres tramos iguales
     temps = [25.0, 20.0, 15.0]  # °C
 
     # Opción B (nueva): segmentos con tiempos de cambio (en horas)
     # Formato 1: (t_start, t_end, T_C)
+    
     temp_segments = [
-        (00.0,  48.0, 25.0),   # 0-24 h a 25°C - MODIFICAR AQUI
-        (48.0, 224.0, 20.0),   # 24-96 h a 20°C - MODIFICAR AQUI
-        (224.0, 336.0, 17.0),   # 96-168 h a 15°C - MODIFICAR AQUI
+        (00.0,  24,    21.0),   # 0-24 h a 25°C - MODIFICAR AQUI
+        (24.0,  21*24, 23.0),   # 24-96 h a 20°C - MODIFICAR AQUI
+        # (224.0, 21*24, 17.0),   # 96-168 h a 15°C - MODIFICAR AQUI
     ]
     # Alternativamente, puedes usar el Formato 2: (t_change, T_C), p. ej.:
     # temp_segments = [(0.0, 25.0), (24.0, 20.0), (96.0, 15.0)]
-
-    pulsos = [(0.0, 0.05), (48.0, 0.1), (48.0, 0.0)]    # (hora, g/L) - MODIFICAR AQUI
+    T_NUT = 48
+    pulsos = [(0.0, 0.02), (T_NUT, 0.066)]    # (hora, g/L) - MODIFICAR AQUI
 
     t_proc, t, x, T_profile, Nadd_profile = simulate_process_time(
-        p, DEFAULT_X0, temps, pulsos, tf=14*24.0, n=None, threshold=5.0, temp_segments=temp_segments
+        p, DEFAULT_X0, temps, pulsos, tf=21*24.0, n=None, threshold=2.0, temp_segments=temp_segments
     ) #t_proc ES LA VARIABLE CON EL TIEMPO TOTAL DE PROCESO HASTA EL SECADO
     
-    print("Tiempo total (G+F <= 5 g/L):", t_proc, "h")
+    print("Tiempo total (G+F <= 2 g/L):", t_proc, "h")
 
     # === Gráficos ===
     td = np.asarray(t, dtype=float) / 24.0  # tiempo en días

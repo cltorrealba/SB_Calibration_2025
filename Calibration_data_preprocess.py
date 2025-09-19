@@ -14,12 +14,12 @@ from math import ceil
 from sklearn.isotonic import IsotonicRegression
 
 # ===================== CONFIG =====================
-FILE_PATH = r"C:/Users/ctorrealba/OneDrive - Viña Concha y Toro S.A/Documentos/Proyectos I+D/PI-4497/Resultados/2025/dFBA/Calibración modelo piloto 24_25/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"   # <-- EDITA
+FILE_PATH = r"C:\Users\ctorrealba\OneDrive - Viña Concha y Toro S.A\Documentos\Proyectos I+D\PI-4497\Resultados\2025\SB_Calibration_2025\Procesos_I+D_2025_3.xlsx"   # <-- EDITA
 SHEET_BDD = "BDD_Maestra"
 
 # Carpeta con planillas de temperatura "Data <ID>.xlsx"
 # (relativa al script o ruta absoluta; ajusta a tu estructura)
-TEMPS_DIR = r"C:/Users/ctorrealba/OneDrive - Viña Concha y Toro S.A/Documentos/Proyectos I+D/PI-4497/Resultados/2025/dFBA/Calibración modelo piloto 24_25/SB_Calibration_2025/Datos Experimentales"          # <-- EDITA: carpeta donde guardas "Data 25026.xlsx", etc.
+TEMPS_DIR = "Datos Experimentales"          # <-- EDITA: carpeta donde guardas "Data 25026.xlsx", etc.
 TEMP_SHEET = "Manual Temperaturas"
 TEMP_DATE_COL = "medicion_fecha"    # columna de fecha-hora (timestamp)
 TEMP_VALUE_COL = "temperatura"      # columna de temperatura en °C
@@ -481,7 +481,7 @@ def _interp_temperature_for_assay(df_assay: pd.DataFrame, assay_code: str) -> np
             return np.interp(xr, x, y)
 
     # Fallback: alinear por tiempo relativo (ensayo) vs tiempo relativo (temperatura)
-    t_h = pd.to_numeric(df_assay.get("time_hours", np.arange(n)*1.0), errors="coerce").to_numpy(dtype=float)
+    t_h = pd.to_numeric(df_assay.get("time_hours", np.arange(n)*1.0), errors="coerce").to_numpy(dtype=float) # type: ignore
     x = dfT["time_h_rel"].to_numpy(dtype=float)
     y = dfT["temp_C"].to_numpy(dtype=float)
     xr = np.clip(t_h, x.min(), x.max())
@@ -501,7 +501,7 @@ def attach_temperature_to_results(results: Dict[str, pd.DataFrame]) -> Dict[str,
 # ---------- MATRICES PARA CALIBRACIÓN (tiempo en horas) ----------
 def build_calibration_matrices(results: dict,
                                use_smoothed_biomass: bool = False,
-                               cols_order: List[str] = None) -> Dict[str, pd.DataFrame]:
+                               cols_order: List[str] = None) -> Dict[str, pd.DataFrame]: # type: ignore
     """
     Construye una matriz por ensayo para calibración:
     columnas = [time_h, BiomasaViable_gL, BiomasaMuerta_gL, YAN, AMMONIA, PAN, Fructose, Glucose, Glycerol, Ethanol, Temperature_C]
@@ -632,7 +632,7 @@ def plot_panel(results: dict, ncols=3, smooth=True):
         axes.flat[i].set_visible(False)
 
     plt.suptitle(f"Biomasa viable, muerta y TOTAL (g/L) — MA({SMOOTH_WINDOW}) solo biomasa + YAN crudo\nEje X = tiempo desde t0 (días)", fontsize=13)
-    plt.tight_layout(rect=[0,0,1,0.94])
+    plt.tight_layout(rect=[0,0,1,0.94]) # type: ignore
     plt.show()
 
 
