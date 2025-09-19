@@ -13,7 +13,7 @@ Usa: modelo_dinamico_sim.py y Calibration_data_preprocess.py
 """
 
 import sys, time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -170,7 +170,8 @@ def make_jacobian_num(zenteno_model, u_of_t, p, h_c=1e-20, h_fd=1e-6):
             fj = zenteno_model(t, xh, u_of_t(t), p)
             fj = np.asarray(fj, dtype=complex)
             # derivada = Im(f)/h_c (solo para filas marcadas)
-            J[J_SPARSE[:, j], j] = (fj[J_SPARSE[:, j]].imag) / h_c
+            fj_complex = np.asarray(fj, dtype=complex)
+            J[J_SPARSE[:, j], j] = (fj_complex[J_SPARSE[:, j]].imag) / h_c # type: ignore
         return J
 
     def forward_diff(t, x):
@@ -342,10 +343,10 @@ def compute_global_stds(mats: Dict[str, pd.DataFrame]) -> Dict[str, float]:
 # ---------- Costo (SSE) normalizado ----------
 def sse_for_experiments_real(p_real: np.ndarray,
                              mats: Dict[str, pd.DataFrame],
-                             pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                             x0_by_assay: Dict[str, np.ndarray] = None,
-                             weights: Dict[str, float] = None,
-                             stds: Dict[str, float] = None,
+                             pulses_by_assay: 'Optional[Dict[str, List[Tuple[float, float]]]]' = None,
+                             x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
+                             weights: Optional[Dict[str, float]] = None,
+                             stds: Optional[Dict[str, float]] = None,
                              verbose: bool = False) -> float:
     if weights is None: weights = WEIGHTS
     if stds is None: stds = {k:1.0 for k in ["X","N","G","F","E"]}
@@ -436,8 +437,8 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
                               p0_real: np.ndarray,
                               bounds_real: List[Tuple[float, float]],
                               mode: str = "de",
-                              pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                              x0_by_assay: Dict[str, np.ndarray] = None,
+                              pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                              x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
                               n_starts: int = 20,
                               verbose: bool = True,
                               # --- nuevos controles de parada temprana:
@@ -478,7 +479,7 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
         # candidatos Sobol / uniforme
         try:
             from scipy.stats.qmc import Sobol
-            qmc = Sobol(d=len(z_bounds), scramble=True, seed=123)
+            qmc = Sobol(d=len(z_bounds), scramble=True)
             U = qmc.random_base2(int(np.ceil(np.log2(n_starts))))
             U = U[:n_starts]
         except Exception:
@@ -570,8 +571,8 @@ def calibrate_global_internal(mats: Dict[str, pd.DataFrame],
 # ---------- Gráfica ----------
 def plot_fit_per_assay(p_real: np.ndarray,
                        mats: Dict[str, pd.DataFrame],
-                       pulses_by_assay: Dict[str, List[Tuple[float, float]]] = None,
-                       x0_by_assay: Dict[str, np.ndarray] = None):
+                       pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                       x0_by_assay: Optional[Dict[str, np.ndarray]] = None):
     import matplotlib as mpl
 
     kept = [k for k in mats.keys() if k not in EXCLUDE_ASSAYS]
@@ -663,7 +664,7 @@ if __name__ == "__main__":
 
     # 1) Cargar matrices desde tu preprocesamiento
     from Calibration_data_preprocess import process_all, build_calibration_matrices, attach_temperature_to_results
-    FILE_PATH = r"C:/Users/ctorrealba/OneDrive - Viña Concha y Toro S.A/Documentos/Proyectos I+D/PI-4497/Resultados/2025/dFBA/Calibración modelo piloto 24_25/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"   # <-- EDITA si cambia
+    FILE_PATH = r"C:/Users/ctorrealba/OneDrive - Viña Concha y Toro S.A/Documentos/Proyectos I+D/PI-4497/Resultados/2025/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"   # <-- EDITA si cambia
     results_dict, chem_df = process_all(FILE_PATH, assays=None)
     results_with_T = attach_temperature_to_results(results_dict)
     
