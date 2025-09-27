@@ -1,0 +1,10 @@
+Polynomial regression (density -> total_sugar)
+Degree: 3
+Feature names: ['density', 'density^2', 'density^3']
+Scaler mean: [1025.4007104086845] var: [644.0054002476342]
+Coefficients: [54.725724534488876, 0.47175519331933957, -1.696384199467877]
+Intercept: 64.03265593602501
+R2: 0.981610
+RMSE: 7.176714
+MAE: 4.156660
+sklearn_version: 1.7.2
