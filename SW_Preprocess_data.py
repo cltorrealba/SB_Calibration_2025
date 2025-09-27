@@ -348,18 +348,19 @@ def _inject_initial_lab_from_fermentacion(merged: pd.DataFrame, lab_df: pd.DataF
         if "__dt__" not in lab_df.columns or "muestreo_text" not in lab_df.columns: return merged
 
         mtxt = lab_df["muestreo_text"].astype(str)
-        mask_fer = mtxt.apply(lambda x: "durante la fermentacion" in _norm_txt(x))
-        lab_fer = lab_df.loc[mask_fer].copy()
-        if lab_fer.empty:
-            _dprint("[FER-INIT] No hay '3. Durante la fermentación'"); return merged
+        # CAMBIO: ahora usamos "1. Post despalillado y molienda"
+        mask_post = mtxt.apply(lambda x: "post despalillado y molienda" in _norm_txt(x))
+        lab_post = lab_df.loc[mask_post].copy()
+        if lab_post.empty:
+            _dprint("[FER-INIT] No hay '1. Post despalillado y molienda'"); return merged
 
-        lab_fer["__dt__"] = pd.to_datetime(lab_fer["__dt__"], errors="coerce", utc=True)
-        lab_fer = lab_fer.dropna(subset=["__dt__"]).sort_values("__dt__")
-        if lab_fer.empty:
+        lab_post["__dt__"] = pd.to_datetime(lab_post["__dt__"], errors="coerce", utc=True)
+        lab_post = lab_post.dropna(subset=["__dt__"]).sort_values("__dt__")
+        if lab_post.empty:
             _dprint("[FER-INIT] Filtrado por dt dejó vacío."); return merged
 
-        dt0 = lab_fer["__dt__"].iloc[0]
-        sub = lab_fer.loc[lab_fer["__dt__"] == dt0]
+        dt0 = lab_post["__dt__"].iloc[0]
+        sub = lab_post.loc[lab_post["__dt__"] == dt0]
         name_col = "variable_text" if "variable_text" in sub.columns else ("template_variable_text" if "template_variable_text" in sub.columns else None)
         if name_col is None:
             _dprint("[FER-INIT] No hay columnas de nombre de variable."); return merged
@@ -375,7 +376,7 @@ def _inject_initial_lab_from_fermentacion(merged: pd.DataFrame, lab_df: pd.DataF
             if pd.notna(v): row_vals[target] = float(v)
 
         if not row_vals:
-            _dprint("[FER-INIT] No se pudieron extraer valores en dt0 fermentación."); return merged
+            _dprint("[FER-INIT] No se pudieron extraer valores en dt0 'Post despalillado'."); return merged
 
         if not np.isclose(merged["time_h"].values, 0.0, atol=1e-6).any():
             merged = pd.concat([merged, pd.DataFrame({"time_h":[0.0]})], ignore_index=True)
@@ -392,7 +393,7 @@ def _inject_initial_lab_from_fermentacion(merged: pd.DataFrame, lab_df: pd.DataF
                     if col not in merged.columns: merged[col] = np.nan
                     if pd.isna(merged.loc[i0, col]):
                         merged.loc[i0, col] = row_vals[col]; filled.append(col)
-            _dprint(f"[FER-INIT] Punto inicial alimentado (dt={dt0}) → columnas:", filled)
+            _dprint(f"[FER-INIT] Punto inicial (Post despalillado) dt={dt0} → columnas:", filled)
         return merged
     except Exception as e:
         _dprint("[FER-INIT] EXC:", e)
@@ -655,155 +656,89 @@ def process_all(file_path: str, assays: Optional[List[str]] = None):
 
     results_dict = {assay_code: merged}
 
-    # ---- chem_df YAN (mediciones + pulsos de nutrientes)
-    chem_df = pd.DataFrame()
-    chem_rows = []
+    # ---- chem_df: SOLO adiciones de nitrógeno (FDA / Vitaferm)
+    chem_rows: List[Dict[str, object]] = []
 
-    # (A) Mediciones de laboratorio de YAN (se mantienen)
-    if lab is not None and "__dt__" in lab.columns:
-        name_col = "variable_text" if "variable_text" in lab.columns else None
-        if (name_col is None or lab[name_col].astype(str).str.strip().eq("").all()) and "template_variable_text" in lab.columns:
-            name_col = "template_variable_text"
-        if name_col is not None:
-            yan_mask = lab[name_col].astype(str).str.contains("YAN", case=False, na=False)
-            sub = lab.loc[yan_mask].copy()
-            if not sub.empty:
-                sub["time_h"] = (pd.to_datetime(sub["__dt__"], errors="coerce", utc=True) - t0).dt.total_seconds() / 3600.0
-                sub.loc[sub["time_h"] < 0, "time_h"] = 0.0
-                sub["assay"] = assay_code
-                if "valor_numeric" in sub.columns and sub["valor_numeric"].notna().any():
-                    sub["valor"] = pd.to_numeric(sub["valor_numeric"], errors="coerce")
-                for _, r in sub.iterrows():
-                    chem_rows.append({
-                        "assay": assay_code,
-                        "time_h": float(r.get("time_h", np.nan)),
-                        "valor": r.get("valor", np.nan),
-                        "variable_text": "YAN",
-                        "nombre_insumo": np.nan  # medición de laboratorio
-                    })
-
-    # NUEVO: lookup densidad→time_h para mapear densidad_aplicacion
-    dens_lookup = merged[["time_h", "Densidad"]].dropna()
-    def _map_density_to_time(d_appl):
-        if dens_lookup.empty or pd.isna(d_appl):
+    # Helper densidad → time_h
+    def _map_density_to_time(dens_appl):
+        if pd.isna(dens_appl):
             return np.nan
-        idx = (dens_lookup["Densidad"] - d_appl).abs().idxmin()
-        return float(dens_lookup.loc[idx, "time_h"])
+        if "Densidad" in merged.columns:
+            idx = (merged["Densidad"] - dens_appl).abs().idxmin()
+            return float(merged.loc[idx, "time_h"])
+        return np.nan
 
-    # (B) Pulsos de FDA y Vitaferm
-    # Obtener volumen (V_L) para convertir a mg/L
+    # Volumen (L) para expresar en mg/L
     V_L = None
     try:
-        # 'ant' ya fue leído arriba (si falló queda en except); reintentar si no existe
-        if 'ant' not in locals() or isinstance(ant, Exception):
-            ant = pd.read_excel(xls, sheet_name="Antecedentes")
-        for col_vol in ["ant_vino_estimado_l", "ant_volumen_l", "volumen_l"]:
-            if col_vol in ant.columns:
-                V_L = pd.to_numeric(ant[col_vol].iloc[0], errors="coerce")
+        ant_local = pd.read_excel(xls, sheet_name="Antecedentes")
+        for _col in ["ant_vino_estimado_l", "ant_volumen_l", "volumen_l"]:
+            if _col in ant_local.columns:
+                V_L = pd.to_numeric(ant_local[_col].iloc[0], errors="coerce")
                 if pd.notna(V_L) and V_L > 0:
                     break
     except Exception:
-        V_L = None
-
-    # Determinar fecha de inóculo (levadura) para filtrar Vitaferm (>0.5 días después)
-    inoculum_dt = None
-    try:
-        ops_inoc = pd.read_excel(xls, sheet_name="Insumos Operacionales")
-        ops_inoc.columns = [str(c).strip() for c in ops_inoc.columns]
-        if "insumo" in ops_inoc.columns:
-            mask_lev = ops_inoc["insumo"].astype(str).str.contains("levadura", case=False, na=False)
-            if mask_lev.any():
-                # Preferencia de columna de fecha
-                for cand in ["fecha_proceso_format", "fecha", "fecha_aplicacion_format"]:
-                    if cand in ops_inoc.columns:
-                        dt_series = pd.to_datetime(ops_inoc.loc[mask_lev, cand], errors="coerce", utc=True)
-                        dt_series = dt_series.dropna()
-                        if not dt_series.empty:
-                            inoculum_dt = dt_series.sort_values().iloc[0]
-                        break
-    except Exception:
         pass
-    if inoculum_dt is None:
-        inoculum_dt = pd.to_datetime(t0, utc=True)
 
-    # (B1) FDA en "Insumos Operacionales"
+    # (B1) Adiciones inorgánicas (FDA) en "Insumos Operacionales"
     try:
         ops = pd.read_excel(xls, sheet_name="Insumos Operacionales")
         ops.columns = [str(c).strip() for c in ops.columns]
-        needed_cols_ops = {"insumo", "cantidad"}
-        if needed_cols_ops.issubset(set(ops.columns)):
-            dt_col_ops = None
-            for c in ["fecha_proceso_format", "fecha", "fecha_aplicacion_format"]:
-                if c in ops.columns:
-                    dt_col_ops = c
-                    break
-            # Eliminada restricción 'etapa' == 'Durante'
-            mask_fda = (ops["insumo"].astype(str).str.strip().str.lower() == "fda")
-            sub_fda = ops.loc[mask_fda].copy()
-            if not sub_fda.empty:
-                if dt_col_ops:
-                    sub_fda["_dt_utc"] = pd.to_datetime(sub_fda[dt_col_ops], errors="coerce", utc=True)
-                for _, r in sub_fda.iterrows():
-                    kg = pd.to_numeric(r.get("cantidad"), errors="coerce")
-                    if pd.isna(kg) or kg <= 0:
-                        continue
-                    dens_appl = pd.to_numeric(r.get("densidad"), errors="coerce")
-                    if pd.isna(dens_appl):
-                        dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
-                    time_h_pulse = _map_density_to_time(dens_appl)
-                    if pd.isna(time_h_pulse):
-                        continue
-                    yan_mg_total = kg * 1e6 * 0.2
-                    yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
-                    chem_rows.append({
-                        "assay": assay_code,
-                        "time_h": time_h_pulse,
-                        "valor": yan_val,
-                        "variable_text": "YAN",
-                        "nombre_insumo": "FDA"
-                    })
+        if {"insumo", "cantidad"}.issubset(ops.columns):
+            sub_fda = ops.loc[ops["insumo"].astype(str).str.strip().str.lower() == "fda"].copy()
+            for _, r in sub_fda.iterrows():
+                kg = pd.to_numeric(r.get("cantidad"), errors="coerce")
+                if pd.isna(kg) or kg <= 0:
+                    continue
+                dens_appl = pd.to_numeric(r.get("densidad"), errors="coerce")
+                if pd.isna(dens_appl):
+                    dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
+                time_h_pulse = _map_density_to_time(dens_appl)
+                if pd.isna(time_h_pulse):
+                    continue
+                yan_mg_total = kg * 1e6 * 0.2  # factor inorgánico
+                yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
+                chem_rows.append({
+                    "assay": assay_code,
+                    "time_h": time_h_pulse,
+                    "valor": yan_val,
+                    "variable_text": "YAN",
+                    "nombre_insumo": "FDA"
+                })
     except Exception:
         pass
 
-    # (B2) Vitaferm en "Otros Insumos"
+    # (B2) Adiciones orgánicas (Vitaferm) en "Otros Insumos"
     try:
         otros = pd.read_excel(xls, sheet_name="Otros Insumos")
         otros.columns = [str(c).strip() for c in otros.columns]
-        needed_cols_otros = {"nombre", "cantidad"}
-        if needed_cols_otros.issubset(set(otros.columns)):
-            dt_col_v = None
-            for c in ["fecha_aplicacion_format", "fecha", "fecha_proceso_format"]:
-                if c in otros.columns:
-                    dt_col_v = c
-                    break
-            mask_vita = otros["nombre"].astype(str).str.strip().str.lower() == "vitaferm"
-            sub_vita = otros.loc[mask_vita].copy()
-            if not sub_vita.empty:
-                if dt_col_v:
-                    sub_vita["_dt_utc"] = pd.to_datetime(sub_vita[dt_col_v], errors="coerce", utc=True)
-                for _, r in sub_vita.iterrows():
-                    # Eliminado filtro de >0.5 días desde inóculo
-                    g = pd.to_numeric(r.get("cantidad"), errors="coerce")
-                    if pd.isna(g) or g <= 0:
-                        continue
-                    dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
-                    time_h_pulse = _map_density_to_time(dens_appl)
-                    if pd.isna(time_h_pulse):
-                        continue
-                    yan_mg_total = g * 1000.0 * 0.08
-                    yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
-                    chem_rows.append({
-                        "assay": assay_code,
-                        "time_h": time_h_pulse,
-                        "valor": yan_val,
-                        "variable_text": "YAN",
-                        "nombre_insumo": "Vitaferm"
-                    })
+        if {"nombre", "cantidad"}.issubset(otros.columns):
+            sub_vita = otros.loc[otros["nombre"].astype(str).str.strip().str.lower() == "vitaferm"].copy()
+            for _, r in sub_vita.iterrows():
+                g = pd.to_numeric(r.get("cantidad"), errors="coerce")
+                if pd.isna(g) or g <= 0:
+                    continue
+                dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
+                time_h_pulse = _map_density_to_time(dens_appl)
+                if pd.isna(time_h_pulse):
+                    continue
+                yan_mg_total = g * 1000.0 * 0.08  # factor orgánico
+                yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
+                chem_rows.append({
+                    "assay": assay_code,
+                    "time_h": time_h_pulse,
+                    "valor": yan_val,
+                    "variable_text": "YAN",
+                    "nombre_insumo": "Vitaferm"
+                })
     except Exception:
         pass
 
-    if chem_rows:
-        chem_df = pd.DataFrame(chem_rows).sort_values("time_h").reset_index(drop=True)
+    chem_df = (pd.DataFrame(chem_rows)
+                 .sort_values("time_h")
+                 .reset_index(drop=True)) if chem_rows else pd.DataFrame(
+                     columns=["assay","time_h","valor","variable_text","nombre_insumo"]
+                 )
 
     return results_dict, chem_df
 
@@ -850,8 +785,9 @@ def process_multiple(codes: List[str], directory: str) -> Dict[str, Dict[str, pd
     Solo incluye códigos cuyo archivo existe y se procesa sin excepción.
     """
     out: Dict[str, Dict[str, pd.DataFrame]] = {}
+    data_dir = directory  # Ensure data_dir is defined from the argument
     for code in codes:
-        file_path = os.path.join(directory, f"Data {code}.xlsx")
+        file_path = os.path.join(data_dir, f"Data {code}.xlsx")
         if not os.path.isfile(file_path):
             _dprint(f"[BATCH] Archivo no encontrado: {file_path}")
             continue
@@ -871,7 +807,6 @@ def process_multiple(codes: List[str], directory: str) -> Dict[str, Dict[str, pd
         except Exception as e:
             _dprint(f"[BATCH] Error procesando {code}: {e}")
     return out
-
 # =========================
 # MAIN (procesa 24018–24031)
 # =========================
@@ -902,13 +837,18 @@ if __name__ == "__main__":
             df_main = bundle.get("data", pd.DataFrame())
             chem_df = bundle.get("chem_df", pd.DataFrame())
             out_main = os.path.join(data_dir, f"preproc_{code}.csv")
-            df_main.to_csv(out_main, index=False)
             print(f"[MAIN] {code}: data filas={len(df_main)} → {out_main}")
             if not chem_df.empty:
                 out_chem = os.path.join(data_dir, f"chem_{code}.csv")
-                chem_df.to_csv(out_chem, index=False)
                 print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
                 out_chem = os.path.join(data_dir, f"chem_{code}.csv")
-                chem_df.to_csv(out_chem, index=False)
+                print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
+            out_main = os.path.join(data_dir, f"preproc_{code}.csv")
+            print(f"[MAIN] {code}: data filas={len(df_main)} → {out_main}")
+            if not chem_df.empty:
+                out_chem = os.path.join(data_dir, f"chem_{code}.csv")
+                print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
+                out_chem = os.path.join(data_dir, f"chem_{code}.csv")
                 print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
         print("[MAIN] Listo.")
+# (Removed duplicate/erroneous block that used undefined 'out')
