@@ -37,3 +37,4 @@ Thumbs.db
 # Local scripts not to track
 Calibration_data_preprocess_bdd.py
 
+metadata_2024_2025.csv
