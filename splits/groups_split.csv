@@ -1,0 +1,18 @@
+year,batch_id,condition_id,T_bin,tnut_med,n_rep,assays,split
+2025,lot20250313,RICH_T21_A42h,high,40.833333333333336,2,"('SB003', 'SB005')",validation
+2025,lot20250325,RICH_T18_A48h,med,46.66666666666666,2,"('SB007', 'SB008')",validation
+2025,lot20250421,RICH_T15_A42h,low,43.5,1,"('SB012',)",validation
+2025,lot20250313,RICH_T19_A42h,med,40.833333333333336,2,"('SB004', 'SB006')",train
+2025,lot20250408,RICH_T21_A42h,high,42.0,2,"('SB009', 'SB010')",train
+2025,lot20250421,RICH_T16_A42h,low,39.5,1,"('SB011',)",train
+2024,lot20240322,CCD_T14_tnut54h,low,54.0,1,"('24028',)",validation
+2024,lot20240322,CCD_T16_tnut78h,med,78.0,1,"('24025',)",validation
+2024,lot20240322,CCD_T17_tnut6h,med,6.0,1,"('24020',)",validation
+2024,lot20240322,CCD_T18_tnut54h,med,54.0,1,"('24029',)",validation
+2024,lot20240322,CCD_T19_tnut24h,high,24.0,1,"('24030',)",validation
+2024,lot20240322,CCD_T14_tnut24h,low,24.0,1,"('24027',)",train
+2024,lot20240322,CCD_T15_tnut30h,low,30.0,1,"('24026',)",train
+2024,lot20240322,CCD_T16_tnut30h,med,30.0,1,"('24023',)",train
+2024,lot20240322,CCD_T17_tnut18h,med,18.0,1,"('24024',)",train
+2024,lot20240322,CCD_T17_tnut30h,med,30.0,4,"('24018', '24019', '24021', '24022')",train
+2024,lot20240322,CCD_T20_tnut30h,high,30.0,1,"('24031',)",train
