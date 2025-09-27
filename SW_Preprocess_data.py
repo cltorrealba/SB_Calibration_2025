@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from typing import List, Optional, Tuple, Dict
 
 import numpy as np
@@ -654,8 +655,11 @@ def process_all(file_path: str, assays: Optional[List[str]] = None):
 
     results_dict = {assay_code: merged}
 
-    # ---- chem_df YAN (para pulsos)
+    # ---- chem_df YAN (mediciones + pulsos de nutrientes)
     chem_df = pd.DataFrame()
+    chem_rows = []
+
+    # (A) Mediciones de laboratorio de YAN (se mantienen)
     if lab is not None and "__dt__" in lab.columns:
         name_col = "variable_text" if "variable_text" in lab.columns else None
         if (name_col is None or lab[name_col].astype(str).str.strip().eq("").all()) and "template_variable_text" in lab.columns:
@@ -665,11 +669,141 @@ def process_all(file_path: str, assays: Optional[List[str]] = None):
             sub = lab.loc[yan_mask].copy()
             if not sub.empty:
                 sub["time_h"] = (pd.to_datetime(sub["__dt__"], errors="coerce", utc=True) - t0).dt.total_seconds() / 3600.0
-                sub.loc[sub["time_h"] < 0, "time_h"] = 0.0  # consistencia con plegado a 0
+                sub.loc[sub["time_h"] < 0, "time_h"] = 0.0
                 sub["assay"] = assay_code
                 if "valor_numeric" in sub.columns and sub["valor_numeric"].notna().any():
                     sub["valor"] = pd.to_numeric(sub["valor_numeric"], errors="coerce")
-                chem_df = sub[["assay", "time_h", "valor", name_col]].rename(columns={name_col: "variable_text"})
+                for _, r in sub.iterrows():
+                    chem_rows.append({
+                        "assay": assay_code,
+                        "time_h": float(r.get("time_h", np.nan)),
+                        "valor": r.get("valor", np.nan),
+                        "variable_text": "YAN",
+                        "nombre_insumo": np.nan  # medición de laboratorio
+                    })
+
+    # NUEVO: lookup densidad→time_h para mapear densidad_aplicacion
+    dens_lookup = merged[["time_h", "Densidad"]].dropna()
+    def _map_density_to_time(d_appl):
+        if dens_lookup.empty or pd.isna(d_appl):
+            return np.nan
+        idx = (dens_lookup["Densidad"] - d_appl).abs().idxmin()
+        return float(dens_lookup.loc[idx, "time_h"])
+
+    # (B) Pulsos de FDA y Vitaferm
+    # Obtener volumen (V_L) para convertir a mg/L
+    V_L = None
+    try:
+        # 'ant' ya fue leído arriba (si falló queda en except); reintentar si no existe
+        if 'ant' not in locals() or isinstance(ant, Exception):
+            ant = pd.read_excel(xls, sheet_name="Antecedentes")
+        for col_vol in ["ant_vino_estimado_l", "ant_volumen_l", "volumen_l"]:
+            if col_vol in ant.columns:
+                V_L = pd.to_numeric(ant[col_vol].iloc[0], errors="coerce")
+                if pd.notna(V_L) and V_L > 0:
+                    break
+    except Exception:
+        V_L = None
+
+    # Determinar fecha de inóculo (levadura) para filtrar Vitaferm (>0.5 días después)
+    inoculum_dt = None
+    try:
+        ops_inoc = pd.read_excel(xls, sheet_name="Insumos Operacionales")
+        ops_inoc.columns = [str(c).strip() for c in ops_inoc.columns]
+        if "insumo" in ops_inoc.columns:
+            mask_lev = ops_inoc["insumo"].astype(str).str.contains("levadura", case=False, na=False)
+            if mask_lev.any():
+                # Preferencia de columna de fecha
+                for cand in ["fecha_proceso_format", "fecha", "fecha_aplicacion_format"]:
+                    if cand in ops_inoc.columns:
+                        dt_series = pd.to_datetime(ops_inoc.loc[mask_lev, cand], errors="coerce", utc=True)
+                        dt_series = dt_series.dropna()
+                        if not dt_series.empty:
+                            inoculum_dt = dt_series.sort_values().iloc[0]
+                        break
+    except Exception:
+        pass
+    if inoculum_dt is None:
+        inoculum_dt = pd.to_datetime(t0, utc=True)
+
+    # (B1) FDA en "Insumos Operacionales"
+    try:
+        ops = pd.read_excel(xls, sheet_name="Insumos Operacionales")
+        ops.columns = [str(c).strip() for c in ops.columns]
+        needed_cols_ops = {"insumo", "cantidad"}
+        if needed_cols_ops.issubset(set(ops.columns)):
+            dt_col_ops = None
+            for c in ["fecha_proceso_format", "fecha", "fecha_aplicacion_format"]:
+                if c in ops.columns:
+                    dt_col_ops = c
+                    break
+            # Eliminada restricción 'etapa' == 'Durante'
+            mask_fda = (ops["insumo"].astype(str).str.strip().str.lower() == "fda")
+            sub_fda = ops.loc[mask_fda].copy()
+            if not sub_fda.empty:
+                if dt_col_ops:
+                    sub_fda["_dt_utc"] = pd.to_datetime(sub_fda[dt_col_ops], errors="coerce", utc=True)
+                for _, r in sub_fda.iterrows():
+                    kg = pd.to_numeric(r.get("cantidad"), errors="coerce")
+                    if pd.isna(kg) or kg <= 0:
+                        continue
+                    dens_appl = pd.to_numeric(r.get("densidad"), errors="coerce")
+                    if pd.isna(dens_appl):
+                        dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
+                    time_h_pulse = _map_density_to_time(dens_appl)
+                    if pd.isna(time_h_pulse):
+                        continue
+                    yan_mg_total = kg * 1e6 * 0.2
+                    yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
+                    chem_rows.append({
+                        "assay": assay_code,
+                        "time_h": time_h_pulse,
+                        "valor": yan_val,
+                        "variable_text": "YAN",
+                        "nombre_insumo": "FDA"
+                    })
+    except Exception:
+        pass
+
+    # (B2) Vitaferm en "Otros Insumos"
+    try:
+        otros = pd.read_excel(xls, sheet_name="Otros Insumos")
+        otros.columns = [str(c).strip() for c in otros.columns]
+        needed_cols_otros = {"nombre", "cantidad"}
+        if needed_cols_otros.issubset(set(otros.columns)):
+            dt_col_v = None
+            for c in ["fecha_aplicacion_format", "fecha", "fecha_proceso_format"]:
+                if c in otros.columns:
+                    dt_col_v = c
+                    break
+            mask_vita = otros["nombre"].astype(str).str.strip().str.lower() == "vitaferm"
+            sub_vita = otros.loc[mask_vita].copy()
+            if not sub_vita.empty:
+                if dt_col_v:
+                    sub_vita["_dt_utc"] = pd.to_datetime(sub_vita[dt_col_v], errors="coerce", utc=True)
+                for _, r in sub_vita.iterrows():
+                    # Eliminado filtro de >0.5 días desde inóculo
+                    g = pd.to_numeric(r.get("cantidad"), errors="coerce")
+                    if pd.isna(g) or g <= 0:
+                        continue
+                    dens_appl = pd.to_numeric(r.get("densidad_aplicacion"), errors="coerce")
+                    time_h_pulse = _map_density_to_time(dens_appl)
+                    if pd.isna(time_h_pulse):
+                        continue
+                    yan_mg_total = g * 1000.0 * 0.08
+                    yan_val = (yan_mg_total / V_L) if (V_L and V_L > 0) else np.nan
+                    chem_rows.append({
+                        "assay": assay_code,
+                        "time_h": time_h_pulse,
+                        "valor": yan_val,
+                        "variable_text": "YAN",
+                        "nombre_insumo": "Vitaferm"
+                    })
+    except Exception:
+        pass
+
+    if chem_rows:
+        chem_df = pd.DataFrame(chem_rows).sort_values("time_h").reset_index(drop=True)
 
     return results_dict, chem_df
 
@@ -699,3 +833,82 @@ def build_calibration_matrices(results_dict: Dict[str, pd.DataFrame], use_smooth
             if neg: _dprint(f"[MATS] '{assay}' con {neg} filas time_h < 0")
         mats[assay] = m
     return mats
+
+def process_multiple(codes: List[str], directory: str) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Procesa múltiples archivos 'Data <codigo>.xlsx'.
+    Retorna:
+        {
+          codigo: {
+             'data': DataFrame principal,
+             'chem_df': DataFrame YAN (puede estar vacío),
+             'assay_code': código interno devuelto por process_all,
+             'file_path': ruta del archivo procesado
+          },
+          ...
+        }
+    Solo incluye códigos cuyo archivo existe y se procesa sin excepción.
+    """
+    out: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for code in codes:
+        file_path = os.path.join(directory, f"Data {code}.xlsx")
+        if not os.path.isfile(file_path):
+            _dprint(f"[BATCH] Archivo no encontrado: {file_path}")
+            continue
+        try:
+            results_dict, chem_df = process_all(file_path)
+            if not results_dict:
+                _dprint(f"[BATCH] Sin resultados para {code}")
+                continue
+            assay_code, df_main = next(iter(results_dict.items()))
+            out[code] = {
+                "data": df_main,
+                "chem_df": chem_df,
+                "assay_code": assay_code,
+                "file_path": file_path,
+            }
+            _dprint(f"[BATCH] OK {code} -> assay_code={assay_code}, filas={len(df_main)}")
+        except Exception as e:
+            _dprint(f"[BATCH] Error procesando {code}: {e}")
+    return out
+
+# =========================
+# MAIN (procesa 24018–24031)
+# =========================
+if __name__ == "__main__":
+    codes = [str(i) for i in range(24018, 24032)]  # 24018 … 24031
+    script_dir = os.path.dirname(__file__)
+    default_data_dir = os.path.join(script_dir, "Datos Experimentales")
+    data_dir = os.environ.get("CALIB_DATA_DIR", default_data_dir)
+    # Parse argumentos (ej: --data-dir=PATH o PATH posicional)
+    for arg in sys.argv[1:]:
+        if arg == "--wdir":
+            continue
+        if arg.startswith("--data-dir="):
+            data_dir = arg.split("=", 1)[1]
+        elif not arg.startswith("--"):
+            data_dir = arg  # primer posicional
+    if not os.path.isdir(data_dir):
+        print(f"[MAIN] Carpeta de datos no encontrada: {data_dir}")
+        print(f"[MAIN] Cree la carpeta o pase ruta con --data-dir=...  (default era: {default_data_dir})")
+        sys.exit(1)
+    print(f"[MAIN] Procesando códigos: {', '.join(codes)} en '{data_dir}'")
+    results = process_multiple(codes, data_dir)
+
+    if not results:
+        print("[MAIN] No se generaron resultados (verifique existencia de archivos).")
+    else:
+        for code, bundle in results.items():
+            df_main = bundle.get("data", pd.DataFrame())
+            chem_df = bundle.get("chem_df", pd.DataFrame())
+            out_main = os.path.join(data_dir, f"preproc_{code}.csv")
+            df_main.to_csv(out_main, index=False)
+            print(f"[MAIN] {code}: data filas={len(df_main)} → {out_main}")
+            if not chem_df.empty:
+                out_chem = os.path.join(data_dir, f"chem_{code}.csv")
+                chem_df.to_csv(out_chem, index=False)
+                print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
+                out_chem = os.path.join(data_dir, f"chem_{code}.csv")
+                chem_df.to_csv(out_chem, index=False)
+                print(f"[MAIN] {code}: chem_df filas={len(chem_df)} → {out_chem}")
+        print("[MAIN] Listo.")

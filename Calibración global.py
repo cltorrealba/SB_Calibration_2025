@@ -654,7 +654,7 @@ def plot_fit_per_assay(p_real: np.ndarray,
     plt.tight_layout()
     plt.show()
 
-# ===================== MAIN =====================
+# %% ===================== MAIN =====================
 if __name__ == "__main__":
     # 0) Parámetros iniciales (reales)
     P0 = load_parameters_from_excel(PARAM_XLSX, sheet_name=PARAM_SHEET, param_set=PARAM_SET)
@@ -664,7 +664,7 @@ if __name__ == "__main__":
 
     # 1) Cargar matrices desde tu preprocesamiento
     from Calibration_data_preprocess import process_all, build_calibration_matrices, attach_temperature_to_results
-    FILE_PATH = r"C:/Users/ctorrealba/OneDrive - Viña Concha y Toro S.A/Documentos/Proyectos I+D/PI-4497/Resultados/2025/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"   # <-- EDITA si cambia
+    FILE_PATH = r"C:/Users/cltor/Documents/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"   # <-- EDITA si cambia
     results_dict, chem_df = process_all(FILE_PATH, assays=None)
     results_with_T = attach_temperature_to_results(results_dict)
     
@@ -957,3 +957,5 @@ if __name__ == "__main__":
 
     # 3) Gráfico de ajuste
     plot_fit_per_assay(P0, mats, pulses_by_assay=PULSOS, x0_by_assay=X0S)
+
+# %%
