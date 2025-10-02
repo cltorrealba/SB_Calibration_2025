@@ -34,7 +34,7 @@ from modelo_dinamico_sim import (
 # Ruta al Excel de parámetros iniciales
 PARAM_XLSX  = "zenteno_parameters.xlsx"   # <-- EDITA si es necesario
 PARAM_SHEET = "Hoja1"
-PARAM_SET   = 4
+PARAM_SET   = 3
 
 # Pesos base (antes de normalizar por std)
 WEIGHTS = {"X": 1.0, "N": 1.0, "G": 1.0, "F": 1.0, "E": 1.0, "S": 1.0}  # S: azúcar total (G+F vs densidad)
@@ -96,7 +96,7 @@ SPLITS_DIR            = "splits"
 TRAIN_IDS_CSV         = os.path.join(SPLITS_DIR, "train_ids.csv")
 VALID_IDS_CSV         = os.path.join(SPLITS_DIR, "valid_ids.csv")
 DATA_DIR_2024         = "Datos Experimentales"        # donde están Data <code>.xlsx año 2024
-DATA_DIR_2025_FILE    = r"C:/Users/cltor/Documents/SB_Calibration_2025/Procesos_I+D_2025_3.xlsx"
+DATA_DIR_2025_FILE    = "Procesos_I+D_2025_3.xlsx"
 SUGAR_MODEL_TXT       = os.path.join("sugar_density_out", "sugar_density_model_coeffs.txt")
 YAN_OFFSET_CORRECTION = 10.0        # ajuste offset YAN (antes 15.0) — se resta a datos exp
 YAN_MIN_MG_L          = 0.0
