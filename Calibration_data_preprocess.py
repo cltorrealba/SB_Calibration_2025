@@ -14,7 +14,7 @@ from math import ceil
 from sklearn.isotonic import IsotonicRegression
 
 # ===================== CONFIG =====================
-FILE_PATH = r"C:\Users\cltor\Documents\SB_Calibration_2025\Procesos_I+D_2025_3.xlsx"   # <-- EDITA
+FILE_PATH = "Procesos_I+D_2025_3.xlsx"   # <-- EDITA
 SHEET_BDD = "BDD_Maestra"
 
 # Carpeta con planillas de temperatura "Data <ID>.xlsx"
