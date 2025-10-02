@@ -1,30 +1,28 @@
+"""Calibration preprocessing helpers (ported from top-level script).
+
+This module provides robust helpers to turn the experimental BDD sheet into per-assay
+wide tables and calibration matrices. It preserves behaviour from the legacy script
+and adds small defensive adjustments to be importable in tests.
 """
-Construye una matriz por ensayo para calibración:
-columnas = [time_h, BiomasaViable_gL, BiomasaMuerta_gL, YAN, AMMONIA, PAN, Fructose, Glucose, Glycerol, Ethanol, Temperature_C]
-- time_h en HORAS desde t0 del ensayo (float)
-- biomasa: usa *_adj por defecto, o *_ma3 si use_smoothed_biomass=True
-- Ethanol en g/L (conv. desde % v/v usando densidad 0.78924 g/mL @ 20°C)
-"""
-import os, re, math
-from typing import Dict, List, Tuple, Optional
+import os
+import re
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from math import ceil
 from sklearn.isotonic import IsotonicRegression
 
-# ===================== CONFIG =====================
-FILE_PATH = "Procesos_I+D_2025_3.xlsx"   # <-- EDITA
+
+# ===================== CONFIG (defaults from legacy) =====================
+FILE_PATH = "Procesos_I+D_2025_3.xlsx"
 SHEET_BDD = "BDD_Maestra"
-
-# Carpeta con planillas de temperatura "Data <ID>.xlsx"
-# (relativa al script o ruta absoluta; ajusta a tu estructura)
-TEMPS_DIR = "Datos Experimentales"          # <-- EDITA: carpeta donde guardas "Data 25026.xlsx", etc.
+TEMPS_DIR = "Datos Experimentales"
 TEMP_SHEET = "Manual Temperaturas"
-TEMP_DATE_COL = "medicion_fecha"    # columna de fecha-hora (timestamp)
-TEMP_VALUE_COL = "temperatura"      # columna de temperatura en °C
+TEMP_DATE_COL = "medicion_fecha"
+TEMP_VALUE_COL = "temperatura"
 
-# Homologación código SBxxx -> ID Ensayo (nombre de archivo "Data <ID>.xlsx")
 SB2ID = {
     "SB003": 25026,
     "SB004": 25027,
@@ -38,7 +36,6 @@ SB2ID = {
     "SB012": 25171,
 }
 
-# Inóculo (g) por ensayo; volumen del reactor (L)
 INOCULUM_G = {
     "SB003": 72, "SB004": 72,
     "SB007": 144, "SB008": 144, "SB009": 144,
@@ -46,20 +43,15 @@ INOCULUM_G = {
 }
 REACTOR_VOL_L = 240.0
 
-# Parámetros de “corte” por N (ajustables)
 PAN_THR = 12.0
 AMM_THR = 2.0
-RUN_LEN = 2          # puntos consecutivos que cumplen el umbral
+RUN_LEN = 2
 
-# Calibración experimental (de tu curva de PS)
 SLOPE = 0.03692948069886653
 INTERCEPT = 1.8737767179767686
 
-# Suavizado (solo biomasa)
-SMOOTH_WINDOW = 3    # Ventana elegida
-
-# Conversión EtOH % v/v -> g/L (densidad a 20°C)
-ETHANOL_DENSITY_G_ML = 0.78924  # g/mL a 20 °C
+SMOOTH_WINDOW = 3
+ETHANOL_DENSITY_G_ML = 0.78924
 # =================== FIN CONFIG ===================
 
 
@@ -74,14 +66,17 @@ def normalize_ensayo(code: object) -> str:
         return f"SB{int(m2.group(1)):03d}"
     return s
 
+
 def moving_average_centered(a, w=3):
     s = pd.Series(a, dtype=float)
     return s.rolling(window=w, center=True, min_periods=1).mean().values
+
 
 def load_bdd(path=FILE_PATH, sheet=SHEET_BDD):
     df = pd.read_excel(path, sheet_name=sheet)
     df["Ensayo_norm"] = df["Ensayo"].apply(normalize_ensayo)
     return df
+
 
 def _as_float(series_like):
     return pd.to_numeric(pd.Series(series_like), errors="coerce").to_numpy(dtype=float)
@@ -89,25 +84,22 @@ def _as_float(series_like):
 
 # ---------- Normalización de nombres "ID Análisis" ----------
 ANALYTE_MAP = {
-    # Biomasa
     "CONCENTRATION": "Concentration",
     "VIABILITY": "Viability",
-    # Nitrógeno
     "YAN": "YAN",
     "AMMONIA": "AMMONIA",
     "PAN": "PAN",
-    # Azúcares y metabolitos
     "FRUCTOSE": "Fructose",
     "GLUCOSE": "Glucose",
     "GLYCEROL": "Glycerol",
     "ETANOL": "Ethanol",
     "ETHANOL": "Ethanol",
-    # Otros posibles
     "PYRUVIC ACID": "Pyruvic_Acid",
     "L-MALIC ACID": "L_Malic_Acid",
     "PESO SECO": "Peso_Seco",
     "PESO HUMEDO": "Peso_Humedo",
 }
+
 
 def normalize_analysis_name(name: object) -> str:
     if name is None:
@@ -133,15 +125,14 @@ def _find_timestamp_columns(columns):
                     ordered.append(c)
     return ordered
 
+
 def _build_timestamp_series(sub: pd.DataFrame) -> Optional[pd.Series]:
     cand = _find_timestamp_columns(sub.columns)
     if not cand:
         return None
     for name in cand:
-        # (pd >= 2.0) infer_datetime_format ya no es necesario
         s = pd.to_datetime(sub[name], errors="coerce", dayfirst=True)
         if s.notna().any():
-            # Si hay columna 'Hora' separada, intentar combinar
             if re.search(r"fecha$", str(name), flags=re.I):
                 for hname in cand:
                     if re.search(r"(hora|time)$", str(hname), flags=re.I):
@@ -161,13 +152,12 @@ def _build_timestamp_series(sub: pd.DataFrame) -> Optional[pd.Series]:
 
 # ---------- Extracción y armado "wide" por ensayo ----------
 def extract_assay(df_bdd: pd.DataFrame, assay_code: str) -> pd.DataFrame:
-    """
-    Devuelve 'wide' por ensayo con columnas de interés en float y
-    eje temporal 'time_days' desde la primera muestra.
-    Si hay timestamp, también devuelve columna 'timestamp' (datetime64).
-    Ahora incluye 'Código' alineado por muestra.
-    """
-    sub = df_bdd[df_bdd["Ensayo_norm"] == assay_code].copy()
+    # Ensure Ensayo_norm exists (legacy BDD created it via load_bdd)
+    df = df_bdd.copy()
+    if "Ensayo_norm" not in df.columns and "Ensayo" in df.columns:
+        df["Ensayo_norm"] = df["Ensayo"].apply(normalize_ensayo)
+
+    sub = df[df["Ensayo_norm"] == assay_code].copy()
     if sub.empty:
         return pd.DataFrame()
 
@@ -185,40 +175,30 @@ def extract_assay(df_bdd: pd.DataFrame, assay_code: str) -> pd.DataFrame:
 
     frames = []
     for idc, vc in zip(id_cols, val_cols):
-        # Propagamos 'Código' para poder reinyectarlo tras el pivot
         cols_take = ["Ensayo_norm", "Código", idc, vc]
-        take = [c for c in cols_take if c in sub.columns]  # por si faltara 'Código'
+        take = [c for c in cols_take if c in sub.columns]
         tmp = sub[take].rename(columns={idc: "Analisis", vc: "Valor"})
         tmp["Analisis_norm"] = tmp["Analisis"].apply(normalize_analysis_name)
         if ts_series is not None:
             tmp["__ts__"] = ts_series.values
         frames.append(tmp)
 
-    long_df = pd.concat(frames, ignore_index=True).dropna(subset=["Analisis_norm", "Valor"])
+    long_df = pd.concat(frames, ignore_index=True).dropna(subset=["Analisis_norm", "Valor"]) if frames else pd.DataFrame()
     key = long_df[long_df["Analisis_norm"].isin(keep)].copy()
     if key.empty:
         return pd.DataFrame()
 
-    # --- Con timestamp ---
     if "__ts__" in key.columns and key["__ts__"].notna().any():
         key["__ts__"] = pd.to_datetime(key["__ts__"], errors="coerce")
         key = key.dropna(subset=["__ts__"])
 
-        # Mapa (Ensayo_norm, __ts__) -> Código
         if "Código" in key.columns:
             code_map = (key[["Ensayo_norm", "__ts__", "Código"]]
-                        .dropna(subset=["Código"])
-                        .drop_duplicates(subset=["Ensayo_norm", "__ts__"]))
+                        .dropna(subset=["Código"]).drop_duplicates(subset=["Ensayo_norm", "__ts__"]))
         else:
             code_map = None
 
-        wide = key.pivot_table(
-            index=["Ensayo_norm", "__ts__"],
-            columns="Analisis_norm",
-            values="Valor",
-            aggfunc="first"
-        ).reset_index()
-
+        wide = key.pivot_table(index=["Ensayo_norm", "__ts__"], columns="Analisis_norm", values="Valor", aggfunc="first").reset_index()
         wide = wide.sort_values("__ts__").reset_index(drop=True)
         if code_map is not None:
             wide = wide.merge(code_map, on=["Ensayo_norm", "__ts__"], how="left")
@@ -227,38 +207,26 @@ def extract_assay(df_bdd: pd.DataFrame, assay_code: str) -> pd.DataFrame:
         wide["time_days"] = (wide["__ts__"] - t0).dt.total_seconds() / 86400.0
         wide["timestamp"] = wide["__ts__"]
         wide["idx"] = np.arange(len(wide))
-
-    # --- Sin timestamp (fallback por índice) ---
     else:
-        # Misma lógica de idx que tenías, y mapeamos (Ensayo_norm, idx) -> Código
         key["idx"] = key.groupby(["Ensayo_norm", "Analisis_norm"]).cumcount()
 
         if "Código" in key.columns:
             code_map = (key[["Ensayo_norm", "idx", "Código"]]
-                        .dropna(subset=["Código"])
-                        .drop_duplicates(subset=["Ensayo_norm", "idx"]))
+                        .dropna(subset=["Código"]).drop_duplicates(subset=["Ensayo_norm", "idx"]))
         else:
             code_map = None
 
-        wide = key.pivot_table(
-            index=["Ensayo_norm", "idx"],
-            columns="Analisis_norm",
-            values="Valor",
-            aggfunc="first"
-        ).reset_index()
-
+        wide = key.pivot_table(index=["Ensayo_norm", "idx"], columns="Analisis_norm", values="Valor", aggfunc="first").reset_index()
         wide = wide.sort_values("idx").reset_index(drop=True)
         if code_map is not None:
             wide = wide.merge(code_map, on=["Ensayo_norm", "idx"], how="left")
 
-        wide["time_days"] = wide["idx"].astype(float)  # fallback
+        wide["time_days"] = wide["idx"].astype(float)
 
-    # Tipado numérico de columnas clave
     for col in keep:
         if col in wide.columns:
             wide[col] = pd.to_numeric(wide[col], errors="coerce")
 
-    # Reordenar para que 'Código' quede visible cerca del frente
     front = ["Ensayo_norm"]
     if "__ts__" in wide.columns: front.append("__ts__")
     if "idx" in wide.columns: front.append("idx")
@@ -268,6 +236,7 @@ def extract_assay(df_bdd: pd.DataFrame, assay_code: str) -> pd.DataFrame:
     wide = wide[front + others]
 
     return wide
+
 
 # ---------- Isotónica y helpers numéricos ----------
 def safe_interpolate_nan(y: np.ndarray) -> np.ndarray:
@@ -279,7 +248,7 @@ def safe_interpolate_nan(y: np.ndarray) -> np.ndarray:
     if mask.sum() == 0:
         return np.zeros_like(y, dtype=float)
     first = np.argmax(mask)
-    last  = n - 1 - np.argmax(mask[::-1])
+    last = n - 1 - np.argmax(mask[::-1])
     y[:first] = y[first]
     y[last+1:] = y[last]
     idx = np.arange(n, dtype=float)
@@ -289,10 +258,11 @@ def safe_interpolate_nan(y: np.ndarray) -> np.ndarray:
         y_interp[holes] = np.interp(idx[holes], idx[mask], y[mask])
     return y_interp
 
+
 def correct_with_isotonic(conc, pan, amm, pan_thr=PAN_THR, amm_thr=AMM_THR, run_len=RUN_LEN) -> np.ndarray:
     conc = pd.to_numeric(pd.Series(conc), errors="coerce").to_numpy(dtype=float)
-    pan  = pd.to_numeric(pd.Series(pan ), errors="coerce").to_numpy(dtype=float)
-    amm  = pd.to_numeric(pd.Series(amm ), errors="coerce").to_numpy(dtype=float)
+    pan = pd.to_numeric(pd.Series(pan), errors="coerce").to_numpy(dtype=float)
+    amm = pd.to_numeric(pd.Series(amm), errors="coerce").to_numpy(dtype=float)
 
     n = len(conc)
     if n == 0:
@@ -327,65 +297,57 @@ def correct_with_isotonic(conc, pan, amm, pan_thr=PAN_THR, amm_thr=AMM_THR, run_
 
 # ---------- Pipeline por ensayo ----------
 def process_one_assay(wide: pd.DataFrame, assay_code: str) -> pd.DataFrame:
-    """Devuelve dataframe con columnas *_raw, *_adj y *_ma3 para el ensayo (robusto a texto/NaN)."""
     wide = wide.copy()
-    for c in ["Concentration","Viability","YAN","AMMONIA","PAN"]:
+    for c in ["Concentration", "Viability", "YAN", "AMMONIA", "PAN"]:
         if c not in wide.columns:
             wide[c] = np.nan
 
-    conc = _as_float(wide["Concentration"])
-    viab = _as_float(wide["Viability"])
-    pan  = _as_float(wide["PAN"])
-    amm  = _as_float(wide["AMMONIA"])
+    conc = _as_float(wide["Concentration"]) if "Concentration" in wide.columns else np.array([])
+    viab = _as_float(wide["Viability"]) if "Viability" in wide.columns else np.array([])
+    pan = _as_float(wide.get("PAN", np.array([])))
+    amm = _as_float(wide.get("AMMONIA", np.array([])))
 
-    # 1) Corrección isotónica (hasta corte)
     conc_corr = correct_with_isotonic(conc, pan, amm)
 
-    # 2) Ratio muerto y separación
     with np.errstate(divide='ignore', invalid='ignore'):
         dead_ratio = np.divide(conc - viab, conc, out=np.zeros_like(conc, dtype=float), where=conc>0)
     dead_ratio = np.clip(dead_ratio, 0.0, 1.0)
 
     total_gL_raw = SLOPE * conc_corr + INTERCEPT
-    dead_gL_raw  = total_gL_raw * dead_ratio
-    viable_gL_raw= total_gL_raw - dead_gL_raw
+    dead_gL_raw = total_gL_raw * dead_ratio
+    viable_gL_raw = total_gL_raw - dead_gL_raw
 
-    # 3) Corrección suave: quitar INTERCEPT y repartir por fracciones
     with np.errstate(divide='ignore', invalid='ignore'):
         frac_viab = np.where(total_gL_raw > 0, viable_gL_raw/total_gL_raw, 0.5)
     frac_dead = 1.0 - frac_viab
 
     total_adj = np.maximum(total_gL_raw - INTERCEPT, 0.0)
-    viable_adj= total_adj * frac_viab
-    dead_adj  = total_adj * frac_dead
+    viable_adj = total_adj * frac_viab
+    dead_adj = total_adj * frac_dead
 
-    # 4) Anclaje t0 al inóculo
     inoc_g = INOCULUM_G.get(assay_code, None)
     inoc_gL = (inoc_g / REACTOR_VOL_L) if (inoc_g is not None and not pd.isna(inoc_g)) else 0.0
     f0 = float(frac_viab[0]) if total_gL_raw[0] > 0 else 0.5
     viable_adj[0] = inoc_gL * f0
-    dead_adj[0]   = inoc_gL * (1.0 - f0)
-    total_adj[0]  = viable_adj[0] + dead_adj[0]
+    dead_adj[0] = inoc_gL * (1.0 - f0)
+    total_adj[0] = viable_adj[0] + dead_adj[0]
 
     out = wide.copy()
-    out["total_gL_raw"]  = total_gL_raw
+    out["total_gL_raw"] = total_gL_raw
     out["viable_gL_raw"] = viable_gL_raw
-    out["dead_gL_raw"]   = dead_gL_raw
+    out["dead_gL_raw"] = dead_gL_raw
 
-    out["total_gL_adj"]  = total_adj
+    out["total_gL_adj"] = total_adj
     out["viable_gL_adj"] = viable_adj
-    out["dead_gL_adj"]   = dead_adj
+    out["dead_gL_adj"] = dead_adj
 
-    # 5) Suavizado MA(3) SOLO para biomasa
     out["viable_gL_ma3"] = pd.Series(out["viable_gL_adj"]).rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).mean().values
-    out["dead_gL_ma3"]   = pd.Series(out["dead_gL_adj"]).rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).mean().values
-    out["total_gL_ma3"]  = pd.Series(out["total_gL_adj"]).rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).mean().values
+    out["dead_gL_ma3"] = pd.Series(out["dead_gL_adj"]).rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).mean().values
+    out["total_gL_ma3"] = pd.Series(out["total_gL_adj"]).rolling(window=SMOOTH_WINDOW, center=True, min_periods=1).mean().values
 
-    # YAN crudo; NO suavizamos N
     if "YAN" in out.columns:
         out["YAN"] = pd.to_numeric(out["YAN"], errors="coerce")
 
-    # Tiempos
     if "time_days" not in out.columns and "idx" in out.columns:
         out["time_days"] = out["idx"].astype(float)
     out["time_hours"] = out["time_days"] * 24.0
@@ -396,7 +358,6 @@ def process_one_assay(wide: pd.DataFrame, assay_code: str) -> pd.DataFrame:
 
 # ---------- Orquestado ----------
 def process_all(file_path=FILE_PATH, assays=None):
-    """Procesa todos los ensayos solicitados. Devuelve (results_dict, combined_df)."""
     bdd = load_bdd(file_path)
     all_codes = sorted(bdd["Ensayo_norm"].dropna().unique())
     target = assays if assays is not None else all_codes
@@ -411,11 +372,9 @@ def process_all(file_path=FILE_PATH, assays=None):
         results[code] = df_res
         frames.append(df_res)
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    
     return results, combined
 
 
-# ---------- Helper robusto para columnas opcionales ----------
 def _col_as_float_vector(df: pd.DataFrame, col: str, n: int) -> np.ndarray:
     if col in df.columns:
         s = pd.to_numeric(df[col], errors="coerce")
@@ -424,11 +383,7 @@ def _col_as_float_vector(df: pd.DataFrame, col: str, n: int) -> np.ndarray:
         return np.full(n, np.nan, dtype=float)
 
 
-# ---------- Carga e interpolación de temperatura ----------
 def _load_temperature_table_for_assay(assay_code: str) -> Optional[pd.DataFrame]:
-    """Lee 'Data <ID>.xlsx' / hoja 'Manual Temperaturas' y devuelve DF con columnas:
-       'ts_temp' (datetime64), 'temp_C' (float), y 'time_h_rel' (horas desde t0 temp).
-    """
     ens_id = SB2ID.get(assay_code)
     if ens_id is None:
         return None
@@ -459,29 +414,22 @@ def _load_temperature_table_for_assay(assay_code: str) -> Optional[pd.DataFrame]
 
 
 def _interp_temperature_for_assay(df_assay: pd.DataFrame, assay_code: str) -> np.ndarray:
-    """Devuelve vector de temperatura (°C) alineado a df_assay, usando timestamp si existe;
-       si no, interpola por tiempo relativo (time_hours) contra 'time_h_rel' del archivo de temperaturas.
-    """
     dfT = _load_temperature_table_for_assay(assay_code)
     n = len(df_assay)
     if dfT is None or n == 0:
         return np.full(n, np.nan, dtype=float)
 
-    # Preferimos alinear por timestamp si el ensayo lo tiene
     if "timestamp" in df_assay.columns and df_assay["timestamp"].notna().any():
         ts_samp = pd.to_datetime(df_assay["timestamp"], errors="coerce")
         if ts_samp.notna().any():
-            # construir eje relativo con base en el primer timestamp de temperatura
             t0T = dfT["ts_temp"].iloc[0]
             t_rel_samp = (ts_samp - t0T).dt.total_seconds() / 3600.0
-            # interp tipo 1D (extrapolación por extremos)
             x = dfT["time_h_rel"].to_numpy(dtype=float)
             y = dfT["temp_C"].to_numpy(dtype=float)
             xr = np.clip(t_rel_samp.to_numpy(dtype=float), x.min(), x.max())
             return np.interp(xr, x, y)
 
-    # Fallback: alinear por tiempo relativo (ensayo) vs tiempo relativo (temperatura)
-    t_h = pd.to_numeric(df_assay.get("time_hours", np.arange(n)*1.0), errors="coerce").to_numpy(dtype=float) # type: ignore
+    t_h = pd.to_numeric(df_assay.get("time_hours", np.arange(n)*1.0), errors="coerce").to_numpy(dtype=float)
     x = dfT["time_h_rel"].to_numpy(dtype=float)
     y = dfT["temp_C"].to_numpy(dtype=float)
     xr = np.clip(t_h, x.min(), x.max())
@@ -489,7 +437,6 @@ def _interp_temperature_for_assay(df_assay: pd.DataFrame, assay_code: str) -> np
 
 
 def attach_temperature_to_results(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    """Añade columna 'Temperature_C' a cada DF de results con la temperatura interpolada."""
     out = {}
     for code, df in results.items():
         df2 = df.copy()
@@ -498,17 +445,9 @@ def attach_temperature_to_results(results: Dict[str, pd.DataFrame]) -> Dict[str,
     return out
 
 
-# ---------- MATRICES PARA CALIBRACIÓN (tiempo en horas) ----------
 def build_calibration_matrices(results: dict,
                                use_smoothed_biomass: bool = False,
-                               cols_order: List[str] = None) -> Dict[str, pd.DataFrame]: # type: ignore
-    """
-    Construye una matriz por ensayo para calibración:
-    columnas = [time_h, BiomasaViable_gL, BiomasaMuerta_gL, YAN, AMMONIA, PAN, Fructose, Glucose, Glycerol, Ethanol, Temperature_C]
-    - time_h en HORAS desde t0 del ensayo (float)
-    - biomasa: usa *_adj por defecto, o *_ma3 si use_smoothed_biomass=True
-    Devuelve: dict { ensayo -> DataFrame }
-    """
+                               cols_order: List[str] = None) -> Dict[str, pd.DataFrame]:
     default_cols = [
         "time_h",
         "biomass_viable_gL", "biomass_dead_gL",
@@ -521,7 +460,6 @@ def build_calibration_matrices(results: dict,
 
     out = {}
     for code, df in results.items():
-        # tiempo en horas
         if "time_hours" in df.columns:
             t_h = df["time_hours"].to_numpy(dtype=float)
         elif "time_days" in df.columns:
@@ -531,27 +469,23 @@ def build_calibration_matrices(results: dict,
 
         n = len(t_h)
 
-        # biomasa
         if use_smoothed_biomass:
             viable = df.get("viable_gL_ma3", df["viable_gL_adj"]).to_numpy(dtype=float)
-            dead   = df.get("dead_gL_ma3",   df["dead_gL_adj"]).to_numpy(dtype=float)
+            dead = df.get("dead_gL_ma3", df["dead_gL_adj"]).to_numpy(dtype=float)
         else:
             viable = df["viable_gL_adj"].to_numpy(dtype=float)
-            dead   = df["dead_gL_adj"].to_numpy(dtype=float)
+            dead = df["dead_gL_adj"].to_numpy(dtype=float)
 
-        # analitos adicionales
-        yan  = _col_as_float_vector(df, "YAN",      n)
-        amm  = _col_as_float_vector(df, "AMMONIA",  n)
-        pan  = _col_as_float_vector(df, "PAN",      n)
-        fru  = _col_as_float_vector(df, "Fructose", n)
-        glu  = _col_as_float_vector(df, "Glucose",  n)
+        yan = _col_as_float_vector(df, "YAN", n)
+        amm = _col_as_float_vector(df, "AMMONIA", n)
+        pan = _col_as_float_vector(df, "PAN", n)
+        fru = _col_as_float_vector(df, "Fructose", n)
+        glu = _col_as_float_vector(df, "Glucose", n)
         glyc = _col_as_float_vector(df, "Glycerol", n)
 
-        # Etanol en % v/v -> g/L
-        etoh_pct = _col_as_float_vector(df, "Ethanol", n)  # % v/v
-        etoh_gL  = np.clip(etoh_pct * ETHANOL_DENSITY_G_ML * 10.0, 0.0, None)
+        etoh_pct = _col_as_float_vector(df, "Ethanol", n)
+        etoh_gL = np.clip(etoh_pct * ETHANOL_DENSITY_G_ML * 10.0, 0.0, None)
 
-        # temperatura (si no existe ya en df, la interpolamos on-the-fly)
         if "Temperature_C" in df.columns:
             tempC = _col_as_float_vector(df, "Temperature_C", n)
         else:
@@ -567,7 +501,7 @@ def build_calibration_matrices(results: dict,
             "Fructose": fru,
             "Glucose": glu,
             "Glycerol": glyc,
-            "Ethanol": etoh_gL,           # <- ahora en g/L
+            "Ethanol": etoh_gL,
             "Temperature_C": tempC,
         })
 
@@ -580,9 +514,6 @@ def build_calibration_matrices(results: dict,
 
 # ---------- Gráficos (eje X en días) ----------
 def plot_panel(results: dict, ncols=3, smooth=True):
-    """Panel de subplots con Viable/Muerta/TOTAL (g/L) y YAN (YAN sin suavizar).
-       Eje X = tiempo en días desde la primera muestra de cada ensayo.
-    """
     assays = list(results.keys())
     n = len(assays)
     if n == 0:
@@ -595,18 +526,16 @@ def plot_panel(results: dict, ncols=3, smooth=True):
     elif nrows == 1:
         axes = np.array([axes])
 
-    COL_VIABLE="#1f77b4"; COL_DEAD="#d62728"; COL_TOTAL="#2ca02c"; COL_YAN="#ff7f0e"
+    COL_VIABLE = "#1f77b4"; COL_DEAD = "#d62728"; COL_TOTAL = "#2ca02c"; COL_YAN = "#ff7f0e"
 
     for ax, code in zip(axes.flat, assays):
         df = results[code]
         x = df["time_days"].values if "time_days" in df.columns else df["idx"].astype(float).values
 
-        # puntos biomasa ajustada
         ax.plot(x, df["viable_gL_adj"], 'o', color=COL_VIABLE, label="Viable (g/L)", alpha=0.85, ms=4)
         ax.plot(x, df["dead_gL_adj"],   'v', color=COL_DEAD,   label="Muerta (g/L)", alpha=0.85, ms=4)
         ax.plot(x, df["total_gL_adj"],  's', color=COL_TOTAL,  label="TOTAL (g/L)",  alpha=0.85, ms=4)
 
-        # líneas suavizadas SOLO biomasa
         if smooth:
             ax.plot(x, df["viable_gL_ma3"], '-', color=COL_VIABLE, lw=2)
             ax.plot(x, df["dead_gL_ma3"],   '-', color=COL_DEAD,   lw=2)
@@ -617,7 +546,6 @@ def plot_panel(results: dict, ncols=3, smooth=True):
         ax.set_ylabel("Biomasa [g/L]")
         ax.grid(True, alpha=0.3)
 
-        # YAN (solo crudo, sin suavizado)
         ax2 = ax.twinx()
         if "YAN" in df.columns:
             ax2.plot(x, df["YAN"].values, 'd--', color=COL_YAN, label="YAN", lw=1.2, ms=4, alpha=0.9)
@@ -632,30 +560,17 @@ def plot_panel(results: dict, ncols=3, smooth=True):
         axes.flat[i].set_visible(False)
 
     plt.suptitle(f"Biomasa viable, muerta y TOTAL (g/L) — MA({SMOOTH_WINDOW}) solo biomasa + YAN crudo\nEje X = tiempo desde t0 (días)", fontsize=13)
-    plt.tight_layout(rect=[0,0,1,0.94]) # type: ignore
+    plt.tight_layout(rect=[0,0,1,0.94])
     plt.show()
 
 
-# ===================== EJEMPLO DE USO =====================
 if __name__ == "__main__":
-    # 0) (opcional) verificar carpeta de temperaturas
     if not os.path.isdir(TEMPS_DIR):
-        print(f"[ADVERTENCIA] Carpeta de temperaturas no encontrada: {TEMPS_DIR}\n"
-              f"Se crearán matrices con Temperature_C = NaN donde no haya archivo.")
-    # 1) Procesar todo lo disponible en la BDD
+        print(f"[ADVERTENCIA] Carpeta de temperaturas no encontrada: {TEMPS_DIR}\nSe crearán matrices con Temperature_C = NaN donde no haya archivo.")
     results_dict, combined_df = process_all(FILE_PATH, assays=None)
-
-    # 1.1) Adjuntar la temperatura interpolada a cada ensayo (no es estrictamente necesario,
-    #      porque build_calibration_matrices también interpola si falta)
     results_with_T = attach_temperature_to_results(results_dict)
-
-    # 2) Graficar (3 columnas por defecto) con eje X en días
     plot_panel(results_with_T, ncols=3, smooth=True)
-
-    # 3) Construir matrices para calibración (tiempo en horas) con biomasa AJUSTADA (no suavizada)
     mats = build_calibration_matrices(results_with_T, use_smoothed_biomass=True)
-
-    # 4) Inspección rápida: mostrar tamaño y primeras filas de 2 ensayos (si existen)
     keys = list(mats.keys())
     print("\n=== Resumen matrices de calibración (con Temperature_C) ===")
     for code in keys[:2]:
@@ -663,8 +578,3 @@ if __name__ == "__main__":
         cols_show = ["time_h","biomass_viable_gL","biomass_dead_gL","YAN","Glucose","Fructose","Ethanol","Temperature_C"]
         cols_show = [c for c in cols_show if c in mats[code].columns]
         print(mats[code][cols_show].head(8).to_string(index=False))
-
-    # 5) (Opcional) Exportar todas las matrices a CSV
-    # os.makedirs("calib_matrices", exist_ok=True)
-    # for code, dfm in mats.items():
-    #     dfm.to_csv(os.path.join("calib_matrices", f"calib_matrix_{code}.csv"), index=False)
