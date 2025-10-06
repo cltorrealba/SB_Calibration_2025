@@ -3,6 +3,7 @@ import os
 from typing import Optional, Dict, Tuple
 import numpy as np
 import pandas as pd
+from sb_calibration.preprocess.calibration_preprocess import ETHANOL_DENSITY_G_ML
 
 
 def _col_like(df: pd.DataFrame, *cands: str) -> Optional[str]:
@@ -67,8 +68,45 @@ def _read_temperature_table(xlsx_path: str) -> Optional[pd.DataFrame]:
     return df
 
 
+def _read_density_table(xlsx_path: str) -> Optional[pd.DataFrame]:
+    """Read manual densities sheet if present and return time_h and Densidad (kg/m3-style as numeric)."""
+    try:
+        dfD = pd.read_excel(xlsx_path, sheet_name='Manual Densidades')
+    except Exception:
+        try:
+            xl = pd.ExcelFile(xlsx_path)
+            for s in xl.sheet_names:
+                df = xl.parse(s)
+                if _col_like(df, 'densidad', 'density') is not None:
+                    dfD = df
+                    break
+            else:
+                return None
+        except Exception:
+            return None
+
+    c_den = _col_like(dfD, 'densidad', 'density')
+    if c_den is None:
+        return None
+    t = _build_time_h_from_any(dfD)
+    if t is None:
+        return None
+    den = pd.to_numeric(dfD[c_den], errors='coerce').to_numpy(dtype=float)
+    m = ~(np.isnan(t) | np.isnan(den))
+    if not m.any():
+        return None
+    df = pd.DataFrame({'time_h': t[m], 'Densidad': den[m]})
+    df = df.sort_values('time_h').drop_duplicates(subset=['time_h'])
+    return df
+
+
 def _read_signals_any(xlsx_path: str) -> Dict[str, pd.DataFrame]:
-    """Scan sheets to find columns for YAN, Glucose, Fructose, Ethanol and return per-signal dataframes with time_h and value."""
+    """Scan sheets to find columns for YAN, Glucose, Fructose, Ethanol.
+
+    Returns per-signal dataframes with time_h and value, but DOES NOT resample/interpolate.
+    If a column that maps to 'Ethanol' is actually 'Alcohol' in % v/v, it is converted to g/L
+    using ETHANOL_DENSITY_G_ML.
+    """
     out: Dict[str, pd.DataFrame] = {}
     try:
         xl = pd.ExcelFile(xlsx_path)
@@ -95,6 +133,10 @@ def _read_signals_any(xlsx_path: str) -> Dict[str, pd.DataFrame]:
             if col is None:
                 continue
             val = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
+            # Convert Alcohol % v/v to Ethanol g/L if needed
+            if key == 'Ethanol' and str(col).strip().lower() in ('alcohol',):
+                # % v/v to g/L: pct * density(g/mL) * 10
+                val = np.clip(val, a_min=0.0, a_max=None) * ETHANOL_DENSITY_G_ML * 10.0
             m = ~(np.isnan(t) | np.isnan(val))
             if not m.any():
                 continue
@@ -108,51 +150,162 @@ def _read_signals_any(xlsx_path: str) -> Dict[str, pd.DataFrame]:
 
 
 def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimentales') -> Optional[pd.DataFrame]:
-    """Build a calibration matrix for a 24xxx assay directly from its experimental Excel file.
+    """Build legacy-homologated mats for a 24xxx assay from its experimental Excel.
 
-    Best-effort flexible parsing: finds time and values for Temperature_C, YAN, Glucose, Fructose, Ethanol.
-    Aligns signals onto a common time grid (from Temperature if available; otherwise union of available times).
-    Returns a DataFrame with standard columns or None if the file cannot be parsed.
+    Rules (matching legacy):
+    - Time grid comes from the union of Temperature and Density measurement times.
+    - Operational signals (Temperature_C, Densidad) are linearly interpolated onto the grid.
+    - Lab signals (YAN [mg/L], Glucose, Fructose, Ethanol [g/L]) are NOT interpolated; only two points are injected:
+        initial (first t≥0 present) and final (last t≤t_end present). All other grid rows remain NaN for lab vars.
     """
     xlsx_path = os.path.join(temps_dir, f"Data {assay_id}.xlsx")
     if not os.path.exists(xlsx_path):
         return None
 
     dfT = _read_temperature_table(xlsx_path)
+    dfD = _read_density_table(xlsx_path)
     sigs = _read_signals_any(xlsx_path)
 
-    if dfT is not None:
-        base_t = dfT['time_h'].to_numpy(dtype=float)
-    else:
-        # choose any available time as base (prefers YAN)
+    # Build base time grid from operational signals
+    t_parts = []
+    if dfT is not None and not dfT.empty:
+        t_parts.append(dfT['time_h'].to_numpy(dtype=float))
+    if dfD is not None and not dfD.empty:
+        t_parts.append(dfD['time_h'].to_numpy(dtype=float))
+    if not t_parts:
+        # fallback: use any signal time (prefers YAN) but clip to >=0
         for k in ('YAN', 'Glucose', 'Fructose', 'Ethanol'):
             if k in sigs:
-                base_t = sigs[k]['time_h'].to_numpy(dtype=float)
+                t_parts.append(sigs[k]['time_h'].to_numpy(dtype=float))
                 break
-        else:
+        if not t_parts:
             return None
-
-    base_t = np.asarray(base_t, dtype=float)
-    base_t = np.unique(np.clip(base_t, a_min=0.0, a_max=None))
+    base_t = np.unique(np.clip(np.concatenate(t_parts).astype(float), a_min=0.0, a_max=None))
     mat = pd.DataFrame({'time_h': base_t})
 
-    if dfT is not None:
+    # Operational interpolation
+    if dfT is not None and not dfT.empty:
         mat['Temperature_C'] = np.interp(base_t, dfT['time_h'].to_numpy(dtype=float), dfT['Temperature_C'].to_numpy(dtype=float))
     else:
         mat['Temperature_C'] = np.nan
+    if dfD is not None and not dfD.empty:
+        mat['Densidad'] = np.interp(base_t, dfD['time_h'].to_numpy(dtype=float), dfD['Densidad'].to_numpy(dtype=float))
+    else:
+        mat['Densidad'] = np.nan
 
-    for k, dfk in sigs.items():
-        mat[k] = np.interp(base_t, dfk['time_h'].to_numpy(dtype=float), dfk[k].to_numpy(dtype=float))
-
-    # Standard columns expected by downstream code
-    for c in ['biomass_viable_gL', 'biomass_dead_gL', 'AMMONIA', 'PAN', 'Glycerol']:
+    # Prepare lab columns (NaN except initial/final injections)
+    for c in ['biomass_viable_gL', 'biomass_dead_gL', 'YAN', 'AMMONIA', 'PAN', 'Fructose', 'Glucose', 'Glycerol', 'Ethanol']:
         if c not in mat.columns:
             mat[c] = np.nan
 
-    # Reorder columns to canonical order when possible
-    cols = [
-        'time_h', 'biomass_viable_gL', 'biomass_dead_gL', 'YAN', 'AMMONIA', 'PAN',
-        'Fructose', 'Glucose', 'Glycerol', 'Ethanol', 'Temperature_C'
-    ]
-    mat = mat.reindex(columns=cols)
+    # Inject only first and last observed values for lab signals
+    t_end = float(base_t.max()) if base_t.size else np.nan
+    def _inject_two_points(col: str, df_sig: pd.DataFrame):
+        if df_sig is None or df_sig.empty:
+            return
+        tt = df_sig['time_h'].to_numpy(dtype=float)
+        vv = df_sig[col].to_numpy(dtype=float)
+        m = ~(np.isnan(tt) | np.isnan(vv))
+        if not m.any():
+            return
+        tt = tt[m]; vv = vv[m]
+        # choose initial >=0 and final <= t_end
+        t_init = None; v_init = None
+        pos = tt[tt >= 0.0]
+        if pos.size:
+            idx = int(np.argmin(pos))
+            t_init = float(pos[idx])
+            # value at that time
+            v_init = float(vv[tt >= 0.0][idx])
+        t_final = None; v_final = None
+        if np.isfinite(t_end):
+            le = tt[tt <= t_end]
+            if le.size:
+                idx2 = int(np.argmax(le))
+                t_final = float(le[idx2])
+                v_final = float(vv[tt <= t_end][idx2])
+        # map to nearest grid indices and set values
+        if t_init is not None:
+            i0 = int(np.argmin(np.abs(base_t - t_init)))
+            mat.loc[i0, col] = v_init
+        if t_final is not None:
+            i1 = int(np.argmin(np.abs(base_t - t_final)))
+            mat.loc[i1, col] = v_final
+
+    for key in ('YAN', 'Glucose', 'Fructose', 'Ethanol'):
+        if key in sigs:
+            _inject_two_points(key, sigs[key])
+
+    # Try to read explicit 'descube' endpoints from Laboratorio (legacy behavior)
+    try:
+        lab = pd.read_excel(xlsx_path, sheet_name='Laboratorio')
+        cols = {str(c).strip().lower(): c for c in lab.columns}
+        mcol = cols.get('muestreo_text') or cols.get('muestreo') or cols.get('etapa')
+        vname = cols.get('variable_text') or cols.get('template_variable_text') or cols.get('variable')
+        vnum = cols.get('valor_numeric') or cols.get('valor_num')
+        vtxt = cols.get('valor')
+        if mcol and vname and (vnum or vtxt):
+            m = lab[mcol].astype(str).str.lower().str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('ascii')
+            desc = lab.loc[m.str.contains('descube', na=False)].copy()
+            if not desc.empty:
+                # Take first occurrence like legacy
+                if 'create_fecha' in lab.columns or 'fecha' in lab.columns:
+                    # optional sort by time if present
+                    dtc = 'create_fecha' if 'create_fecha' in lab.columns else 'fecha'
+                    desc['_dt_'] = pd.to_datetime(desc[dtc], errors='coerce')
+                    desc = desc.sort_values('_dt_')
+                desc = desc.head(1)
+                # Map spanish names to canonical
+                def _norm(s: str) -> str:
+                    s = (s or '').strip().lower()
+                    repl = (('á','a'),('é','e'),('í','i'),('ó','o'),('ú','u'),('ñ','n'))
+                    for a,b in repl:
+                        s = s.replace(a,b)
+                    s = s.replace('-', ' ')
+                    return ' '.join(s.split())
+                MAP = {
+                    'yan': 'YAN', 'alcohol': 'Ethanol', 'ethanol': 'Ethanol',
+                    'glucosa': 'Glucose', 'glucose': 'Glucose', 'fructosa': 'Fructose', 'fructose': 'Fructose'
+                }
+                vals: Dict[str, float] = {}
+                for _, r in desc.iterrows():
+                    nm = MAP.get(_norm(str(r[vname])), None)
+                    if not nm:
+                        continue
+                    val = None
+                    if vnum and pd.notna(r.get(vnum)):
+                        try:
+                            val = float(r[vnum])
+                        except Exception:
+                            val = None
+                    if val is None and vtxt and pd.notna(r.get(vtxt)):
+                        import re
+                        s = str(r[vtxt]).replace(',', '.')
+                        m0 = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+                        if m0:
+                            try:
+                                val = float(m0.group(0))
+                            except Exception:
+                                val = None
+                    if val is None:
+                        continue
+                    vals[nm] = float(val)
+                if vals:
+                    # Write to last grid row; convert Alcohol% to Ethanol g/L if needed
+                    i_last = len(mat) - 1
+                    if 'Ethanol' in vals and mat.loc[i_last, 'Ethanol'] != mat.loc[i_last, 'Ethanol']:
+                        # assume % v/v
+                        mat.loc[i_last, 'Ethanol'] = max(0.0, float(vals['Ethanol'])) * ETHANOL_DENSITY_G_ML * 10.0
+                    for k in ('YAN','Glucose','Fructose'):
+                        if k in vals and mat.loc[i_last, k] != mat.loc[i_last, k]:
+                            mat.loc[i_last, k] = float(vals[k])
+    except Exception:
+        pass
+
+    # Canonical column order (includes Densidad as in legacy examples)
+    cols = ['time_h', 'biomass_viable_gL', 'YAN', 'Glucose', 'Fructose', 'Ethanol', 'Temperature_C', 'Densidad']
+    # Keep any extra columns at the end
+    front = [c for c in cols if c in mat.columns]
+    rest = [c for c in mat.columns if c not in front]
+    mat = mat[front + rest]
     return mat

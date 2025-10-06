@@ -3,12 +3,17 @@
 This module exposes `run_calibration` which can be invoked from tests or a simple CLI.
 """
 from typing import Optional
+import os
 import numpy as np
 from ..calibration.optimize import calibrate_full
-from ..model.zenteno import simulate_on_grid
+from ..model.zenteno import simulate_on_grid, load_parameters_from_excel
 from ..calibration.config import CalibrationConfig
-from ..viz.plots import plot_fit_for_assay
-from ..calibration.pulses import build_pulses_from_chem
+# Lazy import inside plotting block to avoid hard dependency at import time
+try:
+    from ..viz.plots import plot_fit_for_assay  # type: ignore
+except Exception:
+    plot_fit_for_assay = None  # will be checked before plotting
+from ..calibration.pulses import build_pulses_from_chem, pulses_from_mats_yan_diff, pulses_from_2024_insumos
 from ..preprocess.calibration_preprocess import (
     process_all as pp_process_all,
     attach_temperature_to_results as pp_attach_T,
@@ -95,12 +100,42 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
                     plot: bool = False, plots_dir: str = "mats/plots",
                     split: str | None = None, split_file: str | None = None,
                     cache_2024: bool = True,
+                    preview_p0_before: bool = False,
+                    p0_excel: str | None = None,
+                    p0_set: int = 3,
+                    pulses_csv_path: str | None = None,
                     verbose: bool = False):
     """Run calibration using the real simulator. If `mats` is None, a small
     synthetic mats dict will be used for a quick smoke run.
     """
     pulses_by_assay = None
     built_2024_cached: list[str] = []
+    # helper to map a generic pulses table (CSV/DF) into {assay: [(t_h, dN_gL), ...]}
+    def _pulses_from_table(df_any):
+        try:
+            import pandas as pd
+            dfp = df_any.copy()
+            cols = {str(c).strip().lower(): c for c in dfp.columns}
+            assay_col = cols.get("assay") or cols.get("ensayo_norm") or cols.get("ensayo")
+            time_col = cols.get("time_h") or cols.get("t_h") or cols.get("t")
+            val_gl = cols.get("dn_gl") or cols.get("dngl") or cols.get("delta_g_l")
+            val_mgl = cols.get("deltayan_mgl") or cols.get("delta_mg_l") or cols.get("yan_delta_mgl")
+            if assay_col is None or time_col is None or (val_gl is None and val_mgl is None):
+                return None
+            out: dict[str, list[tuple[float, float]]] = {}
+            for k, g in dfp.groupby(assay_col):
+                t = pd.to_numeric(g[time_col], errors="coerce").to_numpy(dtype=float)
+                if val_gl is not None:
+                    v = pd.to_numeric(g[val_gl], errors="coerce").to_numpy(dtype=float)
+                else:
+                    v = pd.to_numeric(g[val_mgl], errors="coerce").to_numpy(dtype=float) * 1e-3
+                mask = ~(np.isnan(t) | np.isnan(v))
+                pairs = sorted([(float(tt), float(vv)) for tt, vv in zip(t[mask], v[mask])])
+                if pairs:
+                    out[str(k)] = pairs
+            return out
+        except Exception:
+            return None
     if mats is None:
         if file_path is not None:
             # Build mats from preprocess pipeline
@@ -180,22 +215,68 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
                 except Exception:
                     cdf = None
                 if cdf is not None:
-                    pulses_by_assay = build_pulses_from_chem(cdf)
+                    # prefer builder; fallback to generic table parser
+                    pulses_by_assay = build_pulses_from_chem(cdf) or _pulses_from_table(cdf)
                     # filter to present assays and apply exclusions
                     present = set(mats.keys())
                     if exclude:
                         present = present - set(exclude)
-                    pulses_by_assay = {k: v for k, v in pulses_by_assay.items() if k in present}
+                    pulses_by_assay = {k: v for k, v in (pulses_by_assay or {}).items() if k in present}
                     if verbose:
                         print(f"[INFO] Pulses loaded for assays: {sorted(pulses_by_assay.keys())}")
+            # fallback to mats/pulses_YAN.csv if no chem_file or failed to load
+            if pulses_by_assay is None or len(pulses_by_assay) == 0:
+                try:
+                    import os, pandas as pd
+                    default_csv = pulses_csv_path or os.path.join("mats", "pulses_YAN.csv")
+                    if os.path.exists(default_csv):
+                        pdf = pd.read_csv(default_csv)
+                        pulses_by_assay = _pulses_from_table(pdf)
+                        # filter to present assays
+                        if pulses_by_assay:
+                            present = set(mats.keys())
+                            pulses_by_assay = {k: v for k, v in pulses_by_assay.items() if k in present}
+                            if verbose:
+                                print(f"[INFO] Pulses loaded from {default_csv}")
+                except Exception:
+                    pass
+            # ultimate fallback: construct automatically like legacy
+            if pulses_by_assay is None or len(pulses_by_assay) == 0:
+                try:
+                    # 1) SBxxx from mats YAN deltas (select main pulse)
+                    auto_sb = pulses_from_mats_yan_diff(mats, select_main=True)
+                    # 2) 24xxx from 2024 insumos (read original Excel)
+                    auto_24 = {}
+                    for code in mats.keys():
+                        if str(code).isdigit():
+                            lst = pulses_from_2024_insumos(str(code), temps_dir or "Datos Experimentales")
+                            if lst:
+                                auto_24[str(code)] = lst
+                    # combine, prefer 24xxx specific if available
+                    combined = dict(auto_sb)
+                    combined.update(auto_24)
+                    if combined:
+                        pulses_by_assay = combined
+                        if verbose:
+                            ks = sorted(pulses_by_assay.keys())
+                            print(f"[PULSES][AUTO] Construidos automáticamente para: {ks}")
+                except Exception:
+                    pass
         else:
             # small synthetic mats to keep smoke runs fast
             import pandas as pd
             mats = {"A": pd.DataFrame({"time_h": np.linspace(0, 10, 6), "biomass_viable_gL": np.linspace(0.5, 1.0, 6)})}
 
-    # tiny defaults for a smoke run; for real calibration increase n_starts and local_maxiter
-    # zenteno model expects 14 parameters
-    p0 = np.ones(14)
+    # Load p0 from excel if available; fallback to ones
+    try:
+        src_excel = p0_excel or "zenteno_parameters.xlsx"
+        p0 = load_parameters_from_excel(src_excel, param_set=p0_set)
+        if verbose:
+            print(f"[P0] loaded from {src_excel} (set={p0_set})")
+    except Exception:
+        p0 = np.ones(14)
+        if verbose:
+            print("[P0] using ones(14)")
     bounds = [(1e-6, 1e3)] * 14
     if cfg is None:
         cfg = CalibrationConfig()
@@ -203,7 +284,25 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
         cfg.local_maxiter = 20
     # wrap simulate_on_grid with tolerances
     def sim_wrapped(p, t_meas, temp_segs, pulses, x0):
-        return simulate_on_grid(p, t_meas, temp_segs, pulses, x0, method=method, rtol=cfg.rtol, atol_vec=cfg.atol_vec(), jacobian=jacobian)
+        return simulate_on_grid(p, t_meas, temp_segs, pulses, x0, method=method, rtol=cfg.rtol, atol_vec=cfg.atol_vec(), jacobian=jacobian, verbose=verbose)
+
+    # Optional: generate preview plots with p0 before running optimization
+    if preview_p0_before and plot_fit_for_assay is not None and file_path is not None and mats is not None:
+        try:
+            import os
+            base_dir = os.path.dirname(out_path) if out_path else "."
+            prev_dir = os.path.join(base_dir, "preview_p0")
+            os.makedirs(prev_dir, exist_ok=True)
+            if verbose:
+                print(f"[PREVIEW] Generating p0 plots in {prev_dir}")
+            for code, df in mats.items():
+                pulses = (pulses_by_assay or {}).get(code)
+                try:
+                    plot_fit_for_assay(code, df, p0, sim_wrapped, pulses=pulses, x0=None, out_path=f"{prev_dir}/{code}.png")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     pbest, score, meta = calibrate_full(
         mats,
@@ -212,6 +311,16 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
         sim_wrapped,
         mode=cfg.mode,
         pulses_by_assay=pulses_by_assay,
+        x0_by_assay=(lambda _m: {
+            k: (lambda r: __import__('numpy').array([
+                float(r.get('biomass_viable_gL', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('biomass_viable_gL', __import__('numpy').nan))) else __import__('numpy').nan,
+                (float(r.get('YAN', __import__('numpy').nan))*1e-3) if __import__('numpy').isfinite(float(r.get('YAN', __import__('numpy').nan))) else __import__('numpy').nan,
+                float(r.get('Glucose', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Glucose', __import__('numpy').nan))) else __import__('numpy').nan,
+                float(r.get('Fructose', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Fructose', __import__('numpy').nan))) else __import__('numpy').nan,
+                float(r.get('Ethanol', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Ethanol', __import__('numpy').nan))) else __import__('numpy').nan,
+            ], dtype=float)) (v.iloc[0] if len(v)>0 else {})
+            for k, v in _m.items()
+        })(mats),
         weights=weights,
         n_starts=cfg.n_starts,
         local_maxiter=cfg.local_maxiter,
@@ -219,15 +328,37 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
         patience_evals=cfg.patience_evals,
         min_improvement_rel=cfg.min_improvement_rel,
         out_path=out_path,
+        verbose=verbose,
     )
     if verbose:
         print(f"[RESULT] SSE={score:.4e}  out={out_path}")
     # optional plotting
-    if plot:
+    if plot and plot_fit_for_assay is not None:
         for code, df in mats.items():
             pulses = (pulses_by_assay or {}).get(code)
             try:
-                plot_fit_for_assay(code, df, pbest, sim_wrapped, pulses=pulses, x0=None, out_path=f"{plots_dir}/{code}.png")
+                # Build x0 from first experimental row (like preview)
+                import numpy as _np
+                try:
+                    t0_row = df.iloc[0]
+                    X0 = float(t0_row.get("biomass_viable_gL", _np.nan))
+                    N0_mgL = float(t0_row.get("YAN", _np.nan))
+                    G0 = float(t0_row.get("Glucose", _np.nan))
+                    F0 = float(t0_row.get("Fructose", _np.nan))
+                    E0 = float(t0_row.get("Ethanol", _np.nan))
+                    N0 = (N0_mgL * 1e-3) if _np.isfinite(N0_mgL) else _np.nan
+                    from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
+                    x0_vec = _np.array([
+                        X0 if _np.isfinite(X0) else _DEF[0],
+                        N0 if _np.isfinite(N0) else _DEF[1],
+                        G0 if _np.isfinite(G0) else _DEF[2],
+                        F0 if _np.isfinite(F0) else _DEF[3],
+                        E0 if _np.isfinite(E0) else _DEF[4],
+                    ], dtype=float)
+                except Exception:
+                    from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
+                    x0_vec = _DEF
+                plot_fit_for_assay(code, df, pbest, sim_wrapped, pulses=pulses, x0=x0_vec, out_path=f"{plots_dir}/{code}.png")
             except Exception:
                 # keep calibration robust even if plotting fails for some assay
                 pass
@@ -267,6 +398,9 @@ if __name__ == "__main__":
     parser.add_argument("--atol-e", type=float, default=1e-3)
     parser.add_argument("--plot", action="store_true", help="Guardar gráficos sim vs. meas por ensayo")
     parser.add_argument("--plots-dir", default="mats/plots", help="Carpeta de salida para los gráficos")
+    parser.add_argument("--preview-p0-before", action="store_true", help="Generar plots con p0 antes de calibrar (preview)")
+    parser.add_argument("--p0-excel", default="zenteno_parameters.xlsx", help="Excel con parámetros base para p0 (por defecto: zenteno_parameters.xlsx)")
+    parser.add_argument("--p0-set", type=int, default=3, help="Set de parámetros dentro del Excel de p0 (por defecto: 3)")
     parser.add_argument("--no-cache-2024", action="store_true", help="No persistir a parquet las matrices 24xxx construidas on-the-fly")
     parser.add_argument("--verbose", action="store_true", help="Imprimir pasos detallados de preprocesado y calibración")
     parser.add_argument("--prebuild-2024", action="store_true", help="Preconstruir matrices 24xxx listadas en el split antes de calibrar")
@@ -277,6 +411,7 @@ if __name__ == "__main__":
     parser.add_argument("--w-g", type=float, default=1.0, help="Peso para G en la SSE")
     parser.add_argument("--w-f", type=float, default=1.0, help="Peso para F en la SSE")
     parser.add_argument("--w-e", type=float, default=1.0, help="Peso para E en la SSE")
+    parser.add_argument("--pulses-csv", default=os.path.join("mats", "pulses_YAN.csv"), help="Ruta a CSV de pulsos (assay,time_h,dN_gL) si no se usa --chem-file")
     args = parser.parse_args()
     cfg = CalibrationConfig(
         mode=args.mode,
@@ -303,4 +438,4 @@ if __name__ == "__main__":
         if args.prebuild_only:
             raise SystemExit(0)
 
-    run_calibration(None, out_path=args.out, cfg=cfg, file_path=args.file, assays=assays, temps_dir=args.temps_dir, use_smoothed_biomass=args.use_smoothed_biomass, method=args.method, jacobian=args.jacobian, exclude=exclude, chem_file=args.chem_file, weights=weights, plot=args.plot, plots_dir=args.plots_dir, split=args.split, split_file=args.split_file, cache_2024=(not args.no_cache_2024), verbose=args.verbose)
+    run_calibration(None, out_path=args.out, cfg=cfg, file_path=args.file, assays=assays, temps_dir=args.temps_dir, use_smoothed_biomass=args.use_smoothed_biomass, method=args.method, jacobian=args.jacobian, exclude=exclude, chem_file=args.chem_file, weights=weights, plot=args.plot, plots_dir=args.plots_dir, split=args.split, split_file=args.split_file, cache_2024=(not args.no_cache_2024), preview_p0_before=args.preview_p0_before, p0_excel=args.p0_excel, p0_set=args.p0_set, pulses_csv_path=args.pulses_csv, verbose=args.verbose)

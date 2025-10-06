@@ -303,7 +303,8 @@ def simulate_on_grid(p_real,
                      method: str = "Radau",
                      rtol: float = 1e-6,
                      atol_vec=None,
-                     jacobian: str = "analytic"):
+                     jacobian: str = "analytic",
+                     verbose: bool = False):
     """Lightweight simulate_on_grid adapter used by the calibrator.
 
     - `temp_segments` may be a DataFrame (with time_h and temp column) or a list of (t_h, T_C).
@@ -342,6 +343,10 @@ def simulate_on_grid(p_real,
         return np.array([T_of_t(t), 0.0], dtype=float)
 
     # stiff integration by segments with pulses
+    import time as _time
+    _t0 = _time.time()
+    if verbose:
+        print(f"[SIM] method={method} jac={jacobian} tf={tf:.2f}h segs={len(segs)} pulses={len(pulses or [])}")
     from scipy.integrate import solve_ivp
     J_sparse = J_SPARSE
     ATOL_VEC = np.array([1e-3, 1e-2, 1e-2, 1e-2, 1e-3], dtype=float) if atol_vec is None else np.asarray(atol_vec, dtype=float)
@@ -397,6 +402,8 @@ def simulate_on_grid(p_real,
     for i in range(len(breakpoints) - 1):
         ta, tb = breakpoints[i], breakpoints[i + 1]
         if tb - ta >= 1e-9:
+            if verbose:
+                print(f"[SIM] seg {i+1}/{len(breakpoints)-1}: t=[{ta:.2f},{tb:.2f}]  x0={x_curr}")
             # choose jacobian mode
             jac_func = None
             jac_sparsity = None
@@ -416,12 +423,16 @@ def simulate_on_grid(p_real,
                 dense_output=False, jac=jac_func, jac_sparsity=jac_sparsity
             )
             if not sol.success:
+                if verbose:
+                    print(f"[SIM]   retry: relaxing tolerances (rtol*10, atol*10)")
                 # relax tolerances and retry
                 sol = solve_ivp(
                     f_ivp, (ta, tb), x_curr,
                     method=method, rtol=max(rtol * 10, 1e-5), atol=np.maximum(ATOL_VEC * 10, 1e-2),
                     dense_output=False, jac=jac_func, jac_sparsity=jac_sparsity
                 )
+            if verbose:
+                print(f"[SIM]   seg done: npts={len(sol.t)} success={sol.success}")
             t_seg = sol.t
             X_seg = sol.y.T
             if len(t_seg) > 0:
@@ -437,6 +448,8 @@ def simulate_on_grid(p_real,
             if np.isclose(tp, tb, atol=1e-12):
                 x_curr = x_curr.copy()
                 x_curr[1] = max(0.0, x_curr[1] + dN)
+                if verbose:
+                    print(f"[SIM]   pulse @t={tb:.2f}h  dN={dN:+.4f} g/L  N={x_curr[1]:.4f}")
                 t_all.append(tb)
                 X_all.append(x_curr.copy())
 
@@ -445,4 +458,7 @@ def simulate_on_grid(p_real,
     if t_all[-1] < tf:
         t_all = np.append(t_all, tf)
         X_all = np.vstack([X_all, X_all[-1]])
+    if verbose:
+        dt = _time.time() - _t0
+        print(f"[SIM] done: total_pts={len(t_all)}  wall={dt:5.2f}s")
     return t_all, X_all

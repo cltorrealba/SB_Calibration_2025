@@ -124,7 +124,7 @@ Estado actual de la migración del orquestador y simulación:
 - CLI: `cli/calibrate_cli.py`
   - Modo (`--mode`), `--n-starts`, `--local-maxiter`, tolerancias (`--rtol`, `--atol-*`),
     solver (`--method`), jacobiano (`--jacobian`), `--file`/`--temps-dir`/`--assays`, `--exclude`, `--use-smoothed-biomass`.
-  - Splits train/valid (`--split`, `--split-file`). Si hay 24xxx, se construyen on-the-fly desde `Datos Experimentales/Data <ID>.xlsx` (módulo `preprocess.sw_2024`) con cache opcional (`--no-cache-2024`).
+  - Splits train/valid (`--split`, `--split-file`). Si hay 24xxx, se construyen on-the-fly desde `Datos Experimentales/Data <ID>.xlsx` (módulo `preprocess.sw_2024`) con cache opcional (`--no-cache-2024`). Para 2024 seguimos la política del legacy: la grilla de tiempos proviene de Temperatura/Densidad; solo se interpolan señales operacionales (Temperature_C, Densidad). Las variables de laboratorio (YAN, Glucose, Fructose, Ethanol) se inyectan únicamente en t≈0 y t≈t_end, dejando NaN en el resto de la grilla para evitar falsos puntos intermedios.
   - Pulsos desde química (`--chem-file`) y pesos por variable (`--w-x ...`).
   - Prebuild de 24xxx (`--prebuild-2024`, `--prebuild-split`, `--prebuild-only`).
   - Plots por ensayo (`--plot`, `--plots-dir`) y `--verbose` para trazabilidad.
@@ -143,6 +143,13 @@ Completado recientemente:
 
 Completado también:
 - Visualización del ajuste por ensayo (plots) en `viz/plots.py` y opción `--plot` en la CLI.
+
+Mats 2024 homologados (evitar puntos densos en YAN/Ethanol)
+------------------------------------------------------------
+El builder `preprocess.sw_2024.build_mats_for_assay_2024` reproduce el formato del legacy:
+- La grilla se arma con la unión de tiempos de Temperatura y Densidad.
+- Temperatura y Densidad se interpolan sobre esa grilla.
+- YAN, Ethanol, Glucose y Fructose no se interpolan ni densifican; solo se setean en dos puntos: inicial y final observados. Esto evita la aparición de "muchos puntos cerca de 0" en gráficos y protege al optimizador de sesgos por densificación artificial.
 
 Riesgos/Notas:
 - Los defaults de `n_starts`, `maxiter` y tolerancias están acotados para tests rápidos. Para calibraciones reales conviene incrementarlos.
