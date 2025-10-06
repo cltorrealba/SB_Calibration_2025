@@ -26,17 +26,18 @@ def make_internal_transform(p0_real: np.ndarray, bounds_real: list):
 
 
 class Progress:
-    def __init__(self, name="OPT"):
+    def __init__(self, name="OPT", verbose: bool = True):
         self.name = name
         self.t0 = time.time()
         self.eval_count = 0
         self.best_sse = float("inf")
+        self.verbose = verbose
 
     def mark_eval(self, sse, every=50):
         self.eval_count += 1
         if sse < self.best_sse:
             self.best_sse = float(sse)
-        if (self.eval_count % every) == 0:
+        if self.verbose and (self.eval_count % every) == 0:
             dt = time.time() - self.t0
             print(f"[{self.name}] eval={self.eval_count:6d}  best_SSE={self.best_sse:.4e}  t={dt:6.1f}s")
             sys.stdout.flush()
@@ -56,7 +57,8 @@ def calibrate_full(mats: Dict[str, Any],
                     patience_evals: int = 2000,
                     min_improvement_rel: float = 1e-3,
                     out_path: str = "mats/pbest_checkpoint.npz",
-                    verbose: bool = True) -> Tup[np.ndarray, float, Dict[str, Any]]:
+                    verbose: bool = True,
+                    eval_print_every: int = 50) -> Tup[np.ndarray, float, Dict[str, Any]]:
     """Port of the legacy calibrator with limited defaults for fast unit tests.
 
     The function expects a callable `simulate_fn(p_real, t_meas, temp_segments, pulses, x0)`.
@@ -65,7 +67,7 @@ def calibrate_full(mats: Dict[str, Any],
     z0 = np.clip(z_from_real(p0_real), [b[0] for b in z_bounds], [b[1] for b in z_bounds])
 
     stds = objective.compute_global_stds(mats)
-    prog = Progress(name=f"OPT-{mode.upper()}")
+    prog = Progress(name=f"OPT-{mode.upper()}", verbose=verbose)
     best_sse_seen = np.inf
     last_improve_eval = 0
 
@@ -96,13 +98,14 @@ def calibrate_full(mats: Dict[str, Any],
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             np.savez(out_path, pbest=p_best_real, score=float(best_sse_seen))
             if verbose:
-                print(f"[CKPT] best SSE improved to {best_sse_seen:.4e}")
+                dt = time.time() - prog.t0
+                print(f"[CKPT] best SSE improved to {best_sse_seen:.4e}  eval={prog.eval_count}  t={dt:6.1f}s")
 
     def obj_z(z):
         nonlocal best_sse_seen, last_improve_eval
         p = real_from_z(z)
         sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
-        prog.mark_eval(sse, every=50)
+        prog.mark_eval(sse, every=eval_print_every)
         if sse < (1.0 - min_improvement_rel) * best_sse_seen:
             best_sse_seen = sse
             last_improve_eval = prog.eval_count
@@ -133,7 +136,7 @@ def calibrate_full(mats: Dict[str, Any],
         no_improve_starts = 0
         for i, zi in enumerate(Z, start=1):
             if verbose:
-                print(f"[MS] start {i}/{len(Z)}")
+                print(f"[MS] start {i}/{len(Z)}  (maxiter={local_maxiter})")
             try:
                 loc = minimize(obj_z, zi, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9))
             except RuntimeError as e:
@@ -144,6 +147,8 @@ def calibrate_full(mats: Dict[str, Any],
                 else:
                     raise
             local_runs.append(loc)
+            if verbose:
+                print(f"[MS] end   {i}/{len(Z)}  nit={getattr(loc, 'nit', '-') }  f={loc.fun:.4e}  success={loc.success}")
             improved = loc.success and (loc.fun < (1.0 - min_improvement_rel) * sse_best)
             if improved:
                 sse_best = float(loc.fun)
@@ -162,13 +167,14 @@ def calibrate_full(mats: Dict[str, Any],
         def obj_z_de(z):
             p = real_from_z(z)
             sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
-            prog.mark_eval(sse, every=50)
+            prog.mark_eval(sse, every=eval_print_every)
             return sse
 
         def cb_de(xk, convergence):
-            dt = time.time() - prog.t0
-            print(f"[DE] conv={convergence:.3e}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
-            sys.stdout.flush()
+            if verbose:
+                dt = time.time() - prog.t0
+                print(f"[DE] conv={convergence:.3e}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
+                sys.stdout.flush()
             return False
 
         de_res = differential_evolution(
@@ -176,6 +182,8 @@ def calibrate_full(mats: Dict[str, Any],
             recombination=0.7, tol=1e-6, polish=False, updating='deferred', workers=1, disp=False, callback=cb_de
         )
         loc = minimize(obj_z, de_res.x, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9))
+        if verbose:
+            print(f"[DE->LBFGS] nit={getattr(loc, 'nit', '-') }  f={loc.fun:.4e}  success={loc.success}")
         z_best = (loc.x if (loc.success and loc.fun < de_res.fun) else de_res.x).copy()
         sse_best = float(min(loc.fun, de_res.fun))
         save_checkpoint_if_better(z_best, sse_best)
