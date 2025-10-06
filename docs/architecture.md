@@ -27,18 +27,17 @@ Organizar el código como un paquete Python bajo `src/sb_calibration/` con módu
     - util.py              # helpers reutilizables (fechas, interpolación)
   - model/
     - zenteno.py           # zenteno_model, jacobiano, simuladores (stiff/RK4)
-    - interface.py         # Adapter/Factory para simulador (simulate())
     - profiles.py          # Construcción de perfiles T/pulsos
   - calibration/
     - objective.py         # SSE, normalizaciones y balanceos
-    - optimize.py          # differential_evolution / multistart wrappers
-    - transforms.py        # reparametrizaciones (log-space)
+    - optimize.py          # multistart + DE, early stop, checkpoints
+    - pulses.py            # Inferencia de pulsos desde química
   - metadata/
     - build.py             # lógica de `metadata.py`
     - partition.py         # lógica de `data_partition.py`
   - cli/
-    - calibrate_cli.py     # Entrypoint para calibración
-    - preprocess_cli.py    # Entrypoint para preprocesado
+    - calibrate_cli.py     # Entrypoint para calibración (splits, 2024 builder, cache, plots)
+    - preprocess_cli.py    # Entrypoint para preprocesado (2024/2025)
   - viz/
     - plots.py             # Todas las funciones de visualización
 
@@ -102,3 +101,50 @@ CI (Integración continua) es el proceso mediante el cual se ejecutan pruebas au
 cada vez que se hacen cambios en el repositorio (push / PR). En este proyecto añadimos un workflow
 de CI que ejecuta `pytest` para validar que los cambios no rompan la base de código. Recomendamos
 extender el pipeline para incluir linters, formateo y comprobaciones de seguridad.
+
+
+Calibración refactorizada (2025-10-06)
+--------------------------------------
+Estado actual de la migración del orquestador y simulación:
+
+- Simulador (stiff por tramos con pulsos): `model.zenteno.simulate_on_grid`
+  - solve_ivp (Radau/BDF), con soporte de jacobiano analítico (`zenteno_jacobian` + `J_SPARSE`),
+    jacobiano numérico (complex-step/forward-diff) o sin jacobiano.
+  - Temperatura entrada como segmentos o DataFrame con `time_h` + `Temperature_C`.
+  - Pulsos de N aplicados instantáneamente al final de cada tramo, como en el legacy.
+
+- Objetivo: `calibration.objective.sse_for_experiments_real`
+  - SSE normalizado por std global por variable (X,N,G,F,E), con `N_SCALE=1e-3` para mg/L→g/L.
+  - Interpolación de simulación a tiempos de medición.
+
+- Optimizador: `calibration.optimize.calibrate_full`
+  - Modos `multistart` y `de` (DE + pulido local), reparametrización en z-space.
+  - Early stopping por evaluaciones y starts, checkpoint incremental (`pbest_checkpoint.npz`) y reanudación.
+
+- CLI: `cli/calibrate_cli.py`
+  - Modo (`--mode`), `--n-starts`, `--local-maxiter`, tolerancias (`--rtol`, `--atol-*`),
+    solver (`--method`), jacobiano (`--jacobian`), `--file`/`--temps-dir`/`--assays`, `--exclude`, `--use-smoothed-biomass`.
+  - Splits train/valid (`--split`, `--split-file`). Si hay 24xxx, se construyen on-the-fly desde `Datos Experimentales/Data <ID>.xlsx` (módulo `preprocess.sw_2024`) con cache opcional (`--no-cache-2024`).
+  - Pulsos desde química (`--chem-file`) y pesos por variable (`--w-x ...`).
+  - Prebuild de 24xxx (`--prebuild-2024`, `--prebuild-split`, `--prebuild-only`).
+  - Plots por ensayo (`--plot`, `--plots-dir`) y `--verbose` para trazabilidad.
+
+Paridad con legacy (Calibración global / jac_ana)
+-------------------------------------------------
+Replicado:
+- Integración stiff con jacobiano y sparsidad, por tramos con pulsos.
+- Normalizaciones (std global, N en g/L), SSE sobre (X,N,G,F,E) cuando estén presentes.
+- Modos de optimización (multistart/DE) con reparam log y early-stop.
+- Checkpoint incremental y reanudación.
+
+Completado recientemente:
+- Construcción automática de pulsos desde planilla química vía `calibration.pulses.build_pulses_from_chem` e integración en la CLI con `--chem-file`.
+- Exposición de pesos por variable (`WEIGHTS`) como flags (`--w-x --w-n --w-g --w-f --w-e`) y propagación hasta el objetivo.
+
+Completado también:
+- Visualización del ajuste por ensayo (plots) en `viz/plots.py` y opción `--plot` en la CLI.
+
+Riesgos/Notas:
+- Los defaults de `n_starts`, `maxiter` y tolerancias están acotados para tests rápidos. Para calibraciones reales conviene incrementarlos.
+- El jacobiano numérico es útil para validación; en producción usar el analítico para mejor estabilidad y performance.
+

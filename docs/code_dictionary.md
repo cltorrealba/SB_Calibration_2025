@@ -55,8 +55,17 @@ entrenado y los coeficientes.
 
 ## Columnas derivadas y convenciones internas
 
-- Internamente el modelo usa N en g/L (se aplica `N_SCALE = 1e-3` para convertir mg/L -> g/L).
+- Internamente el objetivo normaliza N a g/L (se aplica `N_SCALE = 1e-3` para convertir mg/L -> g/L).
 - `DEFAULT_X0` = [X0_biomass, N0_gL, G0, F0, E0] (valores por defecto para simulación).
+- SSE normalizada por std global por variable (X,N,G,F,E); cuando una variable no está disponible, no contribuye.
+
+## Modos de Jacobiano en la integración
+
+- analytic: usa `zenteno_jacobian` y sparsidad `J_SPARSE` (más rápido/estable).
+- numeric: calcula derivadas con complex-step y fallback a forward-diff (útil para validar).
+- none: integra sin jacobiano explícito (más robusto, algo más lento).
+
+Control desde CLI: `--jacobian analytic|numeric|none` y método `--method Radau|BDF`.
 
 ## Códigos de insumos / adiciones químicas
 
@@ -67,6 +76,15 @@ Durante el preprocesado / extracción de `chem_df` se buscan insumos relevantes:
 
 Los parsers intentan extraer `time_h` y `valor` (cantidad, convertida a mg o g/L
 según volumen). Si la hoja no contiene `time_h`, se intenta inferir desde `timestamp`.
+
+Builder de pulsos (nuevo):
+- `calibration.pulses.build_pulses_from_chem(chem_df)` devuelve `{assay: [(t_h, dN_gL), ...]}`
+  detectando columnas flexibles (código con `SBxxx`, `YAN`, `time_h` o `timestamp`).
+  Calcula deltas por fila (no negativos) en mg/L y los convierte a g/L para las integraciones.
+
+Pesos por variable (nuevo):
+- La función objetivo acepta `weights={"X":wX,"N":wN,"G":wG,"F":wF,"E":wE}`.
+- La CLI expone flags `--w-x --w-n --w-g --w-f --w-e` y los propaga al optimizador/objetivo.
 
 ## Notas sobre naming inconsistent y consejos
 
