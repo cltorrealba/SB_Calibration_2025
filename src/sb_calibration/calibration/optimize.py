@@ -2,7 +2,7 @@ import numpy as np
 from typing import Tuple
 import os
 from . import objective
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple as Tup
 import time
 import sys
 from scipy.optimize import minimize, differential_evolution
@@ -42,20 +42,21 @@ class Progress:
             sys.stdout.flush()
 
 
-def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
+def calibrate_full(mats: Dict[str, Any],
                     p0_real: np.ndarray,
                     bounds_real: list,
                     simulate_fn,
                     mode: str = "multistart",
                     pulses_by_assay: Optional[Dict[str, list]] = None,
                     x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
+                    weights: Optional[Dict[str, float]] = None,
                     n_starts: int = 8,
                     local_maxiter: int = 200,
                     patience_starts: int = 6,
                     patience_evals: int = 2000,
                     min_improvement_rel: float = 1e-3,
                     out_path: str = "mats/pbest_checkpoint.npz",
-                    verbose: bool = True) -> (np.ndarray, float, Dict[str, Any]):
+                    verbose: bool = True) -> Tup[np.ndarray, float, Dict[str, Any]]:
     """Port of the legacy calibrator with limited defaults for fast unit tests.
 
     The function expects a callable `simulate_fn(p_real, t_meas, temp_segments, pulses, x0)`.
@@ -68,14 +69,44 @@ def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
     best_sse_seen = np.inf
     last_improve_eval = 0
 
+    # resume if existing checkpoint available
+    best_sse_seen = np.inf
+    best_z_ckpt = None
+    if out_path and os.path.exists(out_path):
+        try:
+            data = np.load(out_path)
+            pbest_prev = data.get("pbest")
+            score_prev = float(data.get("score")) if "score" in data else np.inf
+            if pbest_prev is not None:
+                z_prev = z_from_real(pbest_prev)
+                if np.isfinite(score_prev):
+                    best_sse_seen = score_prev
+                    best_z_ckpt = z_prev
+                    if verbose:
+                        print(f"[RESUME] loaded previous best SSE={best_sse_seen:.4e}")
+        except Exception:
+            pass
+
+    def save_checkpoint_if_better(z_vec, sse_val):
+        nonlocal best_sse_seen, best_z_ckpt
+        if sse_val < (1.0 - min_improvement_rel) * best_sse_seen:
+            best_sse_seen = float(sse_val)
+            best_z_ckpt = np.asarray(z_vec, dtype=float).copy()
+            p_best_real = real_from_z(best_z_ckpt)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            np.savez(out_path, pbest=p_best_real, score=float(best_sse_seen))
+            if verbose:
+                print(f"[CKPT] best SSE improved to {best_sse_seen:.4e}")
+
     def obj_z(z):
         nonlocal best_sse_seen, last_improve_eval
         p = real_from_z(z)
-        sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, None, stds, verbose=False, simulate_fn=simulate_fn)
+        sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
         prog.mark_eval(sse, every=50)
         if sse < (1.0 - min_improvement_rel) * best_sse_seen:
             best_sse_seen = sse
             last_improve_eval = prog.eval_count
+            save_checkpoint_if_better(z, sse)
         if (prog.eval_count - last_improve_eval) >= patience_evals:
             raise RuntimeError("EARLY_STOP_EVALS")
         return sse
@@ -95,6 +126,8 @@ def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
         z_lo = np.array([b[0] for b in z_bounds]); z_hi = np.array([b[1] for b in z_bounds])
         Z = z_lo + U * (z_hi - z_lo)
         Z[0, :] = z0
+        if best_z_ckpt is not None:
+            Z[0, :] = best_z_ckpt
 
         local_runs = []
         no_improve_starts = 0
@@ -116,6 +149,7 @@ def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
                 sse_best = float(loc.fun)
                 z_best = loc.x.copy()
                 no_improve_starts = 0
+                save_checkpoint_if_better(z_best, sse_best)
             else:
                 no_improve_starts += 1
                 if no_improve_starts >= patience_starts:
@@ -127,7 +161,7 @@ def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
     elif mode == "de":
         def obj_z_de(z):
             p = real_from_z(z)
-            sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, None, stds, verbose=False, simulate_fn=simulate_fn)
+            sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
             prog.mark_eval(sse, every=50)
             return sse
 
@@ -137,10 +171,14 @@ def calibrate_full(mats: Dict[str, 'pd.DataFrame'],
             sys.stdout.flush()
             return False
 
-        de_res = differential_evolution(obj_z_de, bounds=z_bounds, maxiter=10, popsize=6, mutation=(0.5, 1.0), recombination=0.7, tol=1e-6, polish=False, updating='deferred', workers=1, disp=False, callback=cb_de)
+        de_res = differential_evolution(
+            obj_z_de, bounds=z_bounds, maxiter=10, popsize=6, mutation=(0.5, 1.0),
+            recombination=0.7, tol=1e-6, polish=False, updating='deferred', workers=1, disp=False, callback=cb_de
+        )
         loc = minimize(obj_z, de_res.x, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9))
         z_best = (loc.x if (loc.success and loc.fun < de_res.fun) else de_res.x).copy()
         sse_best = float(min(loc.fun, de_res.fun))
+        save_checkpoint_if_better(z_best, sse_best)
         result = {"de": de_res, "local": loc}
     else:
         raise ValueError("mode debe ser 'de' o 'multistart'")
@@ -178,12 +216,12 @@ def calibrate_dummy(y_meas: np.ndarray, initial_guess: np.ndarray = None, out_pa
     return pbest, score
 
 
-def calibrate_simple(mats: Dict[str, 'pd.DataFrame'],
+def calibrate_simple(mats: Dict[str, Any],
                      p0_real: np.ndarray,
                      simulate_fn,
                      bounds_real=None,
                      weights: Optional[Dict[str, float]] = None,
-                     out_path: str = "mats/pbest_checkpoint.npz") -> Tuple[np.ndarray, float, Dict[str, Any]]:
+                     out_path: str = "mats/pbest_checkpoint.npz") -> Tup[np.ndarray, float, Dict[str, Any]]:
     """A simplified calibrator that evaluates p0_real and returns it as 'best'.
 
     This is intentionally conservative: it computes stds, evaluates the SSE at p0_real

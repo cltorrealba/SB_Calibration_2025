@@ -295,7 +295,15 @@ def build_temp_profile_from_df(df):
     return segs
 
 
-def simulate_on_grid(p_real, time_h, temp_segments, pulses, x0=None, method="Radau"):
+def simulate_on_grid(p_real,
+                     time_h,
+                     temp_segments,
+                     pulses,
+                     x0=None,
+                     method: str = "Radau",
+                     rtol: float = 1e-6,
+                     atol_vec=None,
+                     jacobian: str = "analytic"):
     """Lightweight simulate_on_grid adapter used by the calibrator.
 
     - `temp_segments` may be a DataFrame (with time_h and temp column) or a list of (t_h, T_C).
@@ -314,26 +322,127 @@ def simulate_on_grid(p_real, time_h, temp_segments, pulses, x0=None, method="Rad
         segs = temp_segments
 
     tf = float(np.nanmax(time_h)) if np.isfinite(np.nanmax(time_h)) and np.nanmax(time_h) > 0 else 14 * 24.0
-    # control grid size: prefer fine grid but bounded for tests
-    n_u = max(int(np.ceil(tf / 0.25)), 200)
-    # use existing build_profiles to get T_profile and Nadd (Nadd will be zero because injections param handled differently)
-    try:
-        T_profile, Nadd_profile = build_profiles(tf, n_u, temp_segments=segs)
-    except Exception:
-        # fallback to uniform 20°C
-        T_profile = np.full(n_u + 1, 20.0 + 273.15)
-        Nadd_profile = np.zeros(n_u + 1, dtype=float)
 
-    u = np.vstack([T_profile, Nadd_profile]).T
-    # run RK4 integration
-    t_sim, Xsim = RK4_method(zenteno_model, tf, x0, n_u, u, p_real)
+    # prepare temperature segments arrays
+    if segs is None or len(segs) == 0:
+        segs = [(0.0, 20.0)]
+    seg_t = np.array([s[0] for s in segs], dtype=float)
+    seg_TK = np.array([s[1] + 273.15 for s in segs], dtype=float)
 
-    # apply instantaneous pulses approximately: add dN to the N state at nearest index
-    if pulses:
+    def T_of_t(t):
+        # piecewise-constant based on segments
+        idx = np.searchsorted(seg_t, float(t), side="right") - 1
+        if idx < 0:
+            idx = 0
+        elif idx >= len(seg_t):
+            idx = len(seg_t) - 1
+        return float(seg_TK[idx])
+
+    def u_of_t(t):
+        return np.array([T_of_t(t), 0.0], dtype=float)
+
+    # stiff integration by segments with pulses
+    from scipy.integrate import solve_ivp
+    J_sparse = J_SPARSE
+    ATOL_VEC = np.array([1e-3, 1e-2, 1e-2, 1e-2, 1e-3], dtype=float) if atol_vec is None else np.asarray(atol_vec, dtype=float)
+
+    def f_ivp(t, x):
+        return np.asarray(zenteno_model(t, x, u_of_t(t), p_real), dtype=float)
+
+    def j_ivp(t, x):
+        return np.asarray(zenteno_jacobian(t, x, u_of_t(t), p_real), dtype=float)
+
+    def make_jacobian_num(zenteno_model_fn, u_of_t_fn, p, h_c=1e-20, h_fd=1e-6):
+        n = 5
+        def f_real(t, x):
+            return np.asarray(zenteno_model_fn(t, x, u_of_t_fn(t), p), dtype=float)
+        def try_complex(t, x):
+            _ = np.asarray(zenteno_model_fn(t, x, u_of_t_fn(t), p), dtype=complex)
+            J = np.zeros((n, n), dtype=float)
+            for j in range(n):
+                if not J_SPARSE[:, j].any():
+                    continue
+                xh = x.astype(complex) + 0j
+                xh[j] += 1j * h_c
+                fj = np.asarray(zenteno_model_fn(t, xh, u_of_t_fn(t), p), dtype=complex)
+                J[J_SPARSE[:, j], j] = (fj[J_SPARSE[:, j]].imag) / h_c
+            return J
+        def forward_diff(t, x):
+            fx = f_real(t, x)
+            J = np.zeros((n, n), dtype=float)
+            for j in range(n):
+                if not J_SPARSE[:, j].any():
+                    continue
+                xh = x.copy()
+                step = h_fd * max(1.0, abs(xh[j]))
+                xh[j] += step
+                fj = f_real(t, xh)
+                J[J_SPARSE[:, j], j] = (fj[J_SPARSE[:, j]] - fx[J_SPARSE[:, j]]) / step
+            return J
+        def jac(t, x):
+            try:
+                return try_complex(t, x)
+            except Exception:
+                return forward_diff(t, x)
+        return jac
+
+    # sanitize pulses
+    pulses = [(float(max(0.0, min(tf, t))), float(dN)) for (t, dN) in (pulses or [])]
+    pulses = sorted(list({(t, dN) for (t, dN) in pulses}), key=lambda z: z[0])
+    breakpoints = [0.0] + [t for (t, _) in pulses if 0.0 < t < tf] + [tf]
+    x_curr = np.asarray(x0, dtype=float).copy()
+    t_all = [breakpoints[0]]
+    X_all = [x_curr.copy()]
+
+    for i in range(len(breakpoints) - 1):
+        ta, tb = breakpoints[i], breakpoints[i + 1]
+        if tb - ta >= 1e-9:
+            # choose jacobian mode
+            jac_func = None
+            jac_sparsity = None
+            if jacobian == "analytic":
+                jac_func = j_ivp
+                jac_sparsity = J_sparse
+            elif jacobian == "numeric":
+                jac_func = make_jacobian_num(zenteno_model, u_of_t, p_real)
+                jac_sparsity = J_sparse
+            else:  # "none"
+                jac_func = None
+                jac_sparsity = None
+
+            sol = solve_ivp(
+                f_ivp, (ta, tb), x_curr,
+                method=method, rtol=rtol, atol=ATOL_VEC,
+                dense_output=False, jac=jac_func, jac_sparsity=jac_sparsity
+            )
+            if not sol.success:
+                # relax tolerances and retry
+                sol = solve_ivp(
+                    f_ivp, (ta, tb), x_curr,
+                    method=method, rtol=max(rtol * 10, 1e-5), atol=np.maximum(ATOL_VEC * 10, 1e-2),
+                    dense_output=False, jac=jac_func, jac_sparsity=jac_sparsity
+                )
+            t_seg = sol.t
+            X_seg = sol.y.T
+            if len(t_seg) > 0:
+                if np.isclose(t_seg[0], t_all[-1]):
+                    t_seg = t_seg[1:]
+                    X_seg = X_seg[1:]
+                t_all.extend(t_seg.tolist())
+                X_all.extend(X_seg.tolist())
+                x_curr = X_seg[-1].copy()
+
+        # apply pulse(s) at tb
         for (tp, dN) in pulses:
-            if tp < 0 or tp > t_sim[-1]:
-                continue
-            idx = int(np.argmin(np.abs(t_sim - tp)))
-            Xsim[idx:, 1] = Xsim[idx:, 1] + dN
+            if np.isclose(tp, tb, atol=1e-12):
+                x_curr = x_curr.copy()
+                x_curr[1] = max(0.0, x_curr[1] + dN)
+                t_all.append(tb)
+                X_all.append(x_curr.copy())
 
-    return t_sim, Xsim
+    t_all = np.asarray(t_all, dtype=float)
+    X_all = np.asarray(X_all, dtype=float)
+    if t_all[-1] < tf:
+        t_all = np.append(t_all, tf)
+        X_all = np.vstack([X_all, X_all[-1]])
+    return t_all, X_all
