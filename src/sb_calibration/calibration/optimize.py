@@ -51,6 +51,8 @@ def calibrate_full(mats: Dict[str, Any],
                     pulses_by_assay: Optional[Dict[str, list]] = None,
                     x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
                     weights: Optional[Dict[str, float]] = None,
+                    sse_balance: str = "per_assay",
+                    sse_resample_dt_h: Optional[float] = None,
                     n_starts: int = 8,
                     local_maxiter: int = 200,
                     patience_starts: int = 6,
@@ -58,7 +60,12 @@ def calibrate_full(mats: Dict[str, Any],
                     min_improvement_rel: float = 1e-3,
                     out_path: str = "mats/pbest_checkpoint.npz",
                     verbose: bool = True,
-                    eval_print_every: int = 50) -> Tup[np.ndarray, float, Dict[str, Any]]:
+                    eval_print_every: int = 50,
+                    iter_print_every: int = 0,
+                    de_maxiter: int = 60,
+                    de_popsize: int = 12,
+                    de_tol: float = 1e-6,
+                    sim_progress: bool = False) -> Tup[np.ndarray, float, Dict[str, Any]]:
     """Port of the legacy calibrator with limited defaults for fast unit tests.
 
     The function expects a callable `simulate_fn(p_real, t_meas, temp_segments, pulses, x0)`.
@@ -67,7 +74,9 @@ def calibrate_full(mats: Dict[str, Any],
     z0 = np.clip(z_from_real(p0_real), [b[0] for b in z_bounds], [b[1] for b in z_bounds])
 
     stds = objective.compute_global_stds(mats)
-    prog = Progress(name=f"OPT-{mode.upper()}", verbose=verbose)
+    # Effective verbosity: enable progress if explicit flags request printing
+    v = bool(verbose or (eval_print_every and eval_print_every > 0) or (iter_print_every and iter_print_every > 0))
+    prog = Progress(name=f"OPT-{mode.upper()}", verbose=v)
     best_sse_seen = np.inf
     last_improve_eval = 0
 
@@ -84,8 +93,21 @@ def calibrate_full(mats: Dict[str, Any],
                 if np.isfinite(score_prev):
                     best_sse_seen = score_prev
                     best_z_ckpt = z_prev
-                    if verbose:
+                    if v:
                         print(f"[RESUME] loaded previous best SSE={best_sse_seen:.4e}")
+        except Exception:
+            pass
+
+    def _timestamp_suffix():
+        try:
+            return time.strftime(".%Y%m%d-%H%M%S")
+        except Exception:
+            return ""
+
+    def _ensure_dir(path: str):
+        try:
+            d = os.path.dirname(path) or "."
+            os.makedirs(d, exist_ok=True)
         except Exception:
             pass
 
@@ -95,16 +117,32 @@ def calibrate_full(mats: Dict[str, Any],
             best_sse_seen = float(sse_val)
             best_z_ckpt = np.asarray(z_vec, dtype=float).copy()
             p_best_real = real_from_z(best_z_ckpt)
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            _ensure_dir(out_path)
             np.savez(out_path, pbest=p_best_real, score=float(best_sse_seen))
-            if verbose:
+            if v:
                 dt = time.time() - prog.t0
                 print(f"[CKPT] best SSE improved to {best_sse_seen:.4e}  eval={prog.eval_count}  t={dt:6.1f}s")
+
+    def save_local_snapshot(z_vec, sse_val, tag: str = "snap"):
+        try:
+            p_real = real_from_z(z_vec)
+            root, _ext = os.path.splitext(out_path)
+            local_path = f"{root}.local.{tag}{_timestamp_suffix()}.npz"
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            np.savez(local_path, pbest=p_real, score=float(sse_val), eval=int(prog.eval_count))
+            if verbose:
+                print(f"[SNAP] wrote {local_path}")
+        except Exception:
+            pass
 
     def obj_z(z):
         nonlocal best_sse_seen, last_improve_eval
         p = real_from_z(z)
-        sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
+        sse = objective.sse_for_experiments_real(
+            p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False,
+            simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h,
+            sim_progress=sim_progress
+        )
         prog.mark_eval(sse, every=eval_print_every)
         if sse < (1.0 - min_improvement_rel) * best_sse_seen:
             best_sse_seen = sse
@@ -134,55 +172,130 @@ def calibrate_full(mats: Dict[str, Any],
 
         local_runs = []
         no_improve_starts = 0
-        for i, zi in enumerate(Z, start=1):
-            if verbose:
-                print(f"[MS] start {i}/{len(Z)}  (maxiter={local_maxiter})")
-            try:
-                loc = minimize(obj_z, zi, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9))
-            except RuntimeError as e:
-                if "EARLY_STOP_EVALS" in str(e):
-                    if verbose:
-                        print("[MS] :: early stop by evals ::")
-                    break
+        try:
+            for i, zi in enumerate(Z, start=1):
+                if v:
+                    print(f"[MS] start {i}/{len(Z)}  (maxiter={local_maxiter})")
+                # Per-iteration progress callback
+                local_iter_count = [0]
+                def _lbfgs_cb(_xk):
+                    if iter_print_every and iter_print_every > 0:
+                        local_iter_count[0] += 1
+                        if (local_iter_count[0] % iter_print_every) == 0:
+                            dt = time.time() - prog.t0
+                            print(f"[LBFGS] start {i}/{len(Z)}  iter={local_iter_count[0]}  eval={prog.eval_count}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
+                            sys.stdout.flush()
+                try:
+                    loc = minimize(obj_z, zi, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9, disp=False), callback=_lbfgs_cb)
+                except RuntimeError as e:
+                    if "EARLY_STOP_EVALS" in str(e):
+                        if v:
+                            print("[MS] :: early stop by evals ::")
+                        break
+                    else:
+                        raise
+                local_runs.append(loc)
+                if v:
+                    print(f"[MS] end   {i}/{len(Z)}  nit={getattr(loc, 'nit', '-') }  f={loc.fun:.4e}  success={loc.success}")
+                improved = loc.success and (loc.fun < (1.0 - min_improvement_rel) * sse_best)
+                if improved:
+                    sse_best = float(loc.fun)
+                    z_best = loc.x.copy()
+                    no_improve_starts = 0
+                    save_checkpoint_if_better(z_best, sse_best)
                 else:
-                    raise
-            local_runs.append(loc)
-            if verbose:
-                print(f"[MS] end   {i}/{len(Z)}  nit={getattr(loc, 'nit', '-') }  f={loc.fun:.4e}  success={loc.success}")
-            improved = loc.success and (loc.fun < (1.0 - min_improvement_rel) * sse_best)
-            if improved:
-                sse_best = float(loc.fun)
-                z_best = loc.x.copy()
-                no_improve_starts = 0
+                    no_improve_starts += 1
+                    if (i % max(1, (n_starts // 4))) == 0:
+                        # periodic snapshot even without improvement
+                        save_local_snapshot(loc.x, float(loc.fun), tag=f"ms{i}")
+                    if no_improve_starts >= patience_starts:
+                        if v:
+                            print(f"[MS] :: stopping after {no_improve_starts} starts without improvement ::")
+                        break
+        except KeyboardInterrupt:
+            if v:
+                print("\n[INTERRUPT] Ctrl+C detected. Saving best-so-far and exiting gracefully...")
+            if z_best is not None and np.isfinite(sse_best):
+                # ensure main checkpoint is up-to-date
                 save_checkpoint_if_better(z_best, sse_best)
-            else:
-                no_improve_starts += 1
-                if no_improve_starts >= patience_starts:
-                    if verbose:
-                        print(f"[MS] :: stopping after {no_improve_starts} starts without improvement ::")
-                    break
+                save_local_snapshot(z_best, sse_best, tag="interrupt")
+            elif best_z_ckpt is not None:
+                save_local_snapshot(best_z_ckpt, best_sse_seen, tag="interrupt")
+            # finalize and return current best
+            p_best_real = real_from_z(z_best if z_best is not None else (best_z_ckpt if best_z_ckpt is not None else z0))
+            _ensure_dir(out_path)
+            np.savez(out_path, pbest=p_best_real, score=float(sse_best if np.isfinite(sse_best) else best_sse_seen))
+            return p_best_real, float(sse_best if np.isfinite(sse_best) else best_sse_seen), {"multistart": local_runs}
         result = {"multistart": local_runs}
 
     elif mode == "de":
         def obj_z_de(z):
             p = real_from_z(z)
-            sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn)
+            sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h, sim_progress=False)
             prog.mark_eval(sse, every=eval_print_every)
             return sse
 
+        de_iter = [0]
         def cb_de(xk, convergence):
-            if verbose:
+            de_iter[0] += 1
+            # Evaluate SSE at current DE-best xk (in z-space)
+            try:
+                p_curr = real_from_z(xk)
+                sse_xk = objective.sse_for_experiments_real(p_curr, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h, sim_progress=sim_progress)
+                save_checkpoint_if_better(xk, sse_xk)
+                save_local_snapshot(xk, sse_xk, tag=f"de{de_iter[0]}")
+            except Exception:
+                pass
+            if v:
                 dt = time.time() - prog.t0
-                print(f"[DE] conv={convergence:.3e}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
+                print(f"[DE] iter={de_iter[0]}  conv={convergence:.3e}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
                 sys.stdout.flush()
             return False
 
-        de_res = differential_evolution(
-            obj_z_de, bounds=z_bounds, maxiter=10, popsize=6, mutation=(0.5, 1.0),
-            recombination=0.7, tol=1e-6, polish=False, updating='deferred', workers=1, disp=False, callback=cb_de
-        )
-        loc = minimize(obj_z, de_res.x, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9))
-        if verbose:
+        # Warmup/ETA for DE
+        if v:
+            dim = len(z_bounds); init_evals = int(de_popsize) * dim
+            print(f"[DE] starting: dim={dim}  popsize={int(de_popsize)}  init_evals≈{init_evals}")
+            try:
+                t0 = time.time(); _ = obj_z_de(z0); dt = time.time() - t0
+                eta0 = dt * init_evals
+                print(f"[DE] warmup eval≈{dt:0.2f}s  initial gen ETA≈{eta0/60.0:0.1f} min")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        try:
+            de_res = differential_evolution(
+                obj_z_de, bounds=z_bounds, maxiter=int(de_maxiter), popsize=int(de_popsize), mutation=(0.5, 1.0),
+                recombination=0.7, tol=float(de_tol), polish=False, updating='deferred', workers=1, disp=False, callback=cb_de
+            )
+        except KeyboardInterrupt:
+            if v:
+                print("\n[INTERRUPT] Ctrl+C during DE. Saving snapshot and exiting...")
+            # best available is in prog.best_sse; snapshot current random point z0 for reproducibility
+            save_local_snapshot(z0, prog.best_sse, tag="de_interrupt")
+            p_best_real = real_from_z(z0)
+            _ensure_dir(out_path)
+            np.savez(out_path, pbest=p_best_real, score=float(prog.best_sse))
+            return p_best_real, float(prog.best_sse), {"de": None}
+        try:
+            local_iter_count = [0]
+            def _lbfgs_cb(_xk):
+                if iter_print_every and iter_print_every > 0:
+                    local_iter_count[0] += 1
+                    if (local_iter_count[0] % iter_print_every) == 0:
+                        dt = time.time() - prog.t0
+                        print(f"[LBFGS] (DE->local) iter={local_iter_count[0]}  eval={prog.eval_count}  best_SSE={prog.best_sse:.4e}  t={dt:6.1f}s")
+                        sys.stdout.flush()
+            loc = minimize(obj_z, de_res.x, method="L-BFGS-B", bounds=z_bounds, options=dict(maxiter=local_maxiter, ftol=1e-9, disp=False), callback=_lbfgs_cb)
+        except KeyboardInterrupt:
+            if v:
+                print("\n[INTERRUPT] Ctrl+C during local search after DE. Saving snapshot and exiting...")
+            save_local_snapshot(de_res.x, float(de_res.fun), tag="de_local_interrupt")
+            p_best_real = real_from_z(de_res.x)
+            _ensure_dir(out_path)
+            np.savez(out_path, pbest=p_best_real, score=float(de_res.fun))
+            return p_best_real, float(de_res.fun), {"de": de_res}
+        if v:
             print(f"[DE->LBFGS] nit={getattr(loc, 'nit', '-') }  f={loc.fun:.4e}  success={loc.success}")
         z_best = (loc.x if (loc.success and loc.fun < de_res.fun) else de_res.x).copy()
         sse_best = float(min(loc.fun, de_res.fun))
@@ -200,8 +313,10 @@ def calibrate_full(mats: Dict[str, Any],
             z_best = z0.copy(); sse_best = float(obj_z(z0))
 
     p_best_real = real_from_z(z_best)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    _ensure_dir(out_path)
     np.savez(out_path, pbest=p_best_real, score=float(sse_best))
+    # final safety snapshot
+    save_local_snapshot(z_best, sse_best, tag="final")
     return p_best_real, float(sse_best), result
 
 

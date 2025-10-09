@@ -73,7 +73,14 @@ def moving_average_centered(a, w=3):
 
 
 def load_bdd(path=FILE_PATH, sheet=SHEET_BDD):
-    df = pd.read_excel(path, sheet_name=sheet)
+    # Handle both CSV and Excel files based on extension
+    if path.lower().endswith('.csv'):
+        df = pd.read_csv(path)
+        # CSV files may use 'assay' instead of 'Ensayo'
+        if 'assay' in df.columns and 'Ensayo' not in df.columns:
+            df['Ensayo'] = df['assay']
+    else:
+        df = pd.read_excel(path, sheet_name=sheet)
     df["Ensayo_norm"] = df["Ensayo"].apply(normalize_ensayo)
     return df
 
@@ -325,12 +332,14 @@ def process_one_assay(wide: pd.DataFrame, assay_code: str) -> pd.DataFrame:
     viable_adj = total_adj * frac_viab
     dead_adj = total_adj * frac_dead
 
+    # Apply inoculum override only if inoculum is defined for this assay.
     inoc_g = INOCULUM_G.get(assay_code, None)
-    inoc_gL = (inoc_g / REACTOR_VOL_L) if (inoc_g is not None and not pd.isna(inoc_g)) else 0.0
-    f0 = float(frac_viab[0]) if total_gL_raw[0] > 0 else 0.5
-    viable_adj[0] = inoc_gL * f0
-    dead_adj[0] = inoc_gL * (1.0 - f0)
-    total_adj[0] = viable_adj[0] + dead_adj[0]
+    if inoc_g is not None and not pd.isna(inoc_g):
+        inoc_gL = inoc_g / REACTOR_VOL_L
+        f0 = float(frac_viab[0]) if total_gL_raw[0] > 0 else 0.5
+        viable_adj[0] = inoc_gL * f0
+        dead_adj[0] = inoc_gL * (1.0 - f0)
+        total_adj[0] = viable_adj[0] + dead_adj[0]
 
     out = wide.copy()
     out["total_gL_raw"] = total_gL_raw

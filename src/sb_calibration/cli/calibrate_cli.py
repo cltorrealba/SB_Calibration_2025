@@ -98,16 +98,34 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
                     method: str = "Radau", jacobian: str = "analytic", exclude: list[str] | None = None,
                     chem_file: str | None = None, weights: dict[str, float] | None = None,
                     plot: bool = False, plots_dir: str = "mats/plots",
+                    plot_from: str | None = None,
+                    write_summary: bool = False,
+                    summary_out: str | None = None,
                     split: str | None = None, split_file: str | None = None,
                     cache_2024: bool = True,
                     preview_p0_before: bool = False,
                     p0_excel: str | None = None,
                     p0_set: int = 3,
                     pulses_csv_path: str | None = None,
-                    verbose: bool = False):
+                    verbose: bool = False,
+                    eval_print_every: int | None = None,
+                    iter_print_every: int | None = None,
+                    de_maxiter: int | None = None,
+                    de_popsize: int | None = None,
+                    de_tol: float | None = None,
+                    # Optional bounds overrides for yields
+                    yxg_lb: float | None = None,
+                    yxg_ub: float | None = None,
+                    yxf_lb: float | None = None,
+                    yxf_ub: float | None = None,
+                    yxn_lb: float | None = None,
+                    yxn_ub: float | None = None,
+                    sim_progress: bool | None = None):
     """Run calibration using the real simulator. If `mats` is None, a small
     synthetic mats dict will be used for a quick smoke run.
     """
+    import time as _time, json as _json, sys as _sys, platform as _platform
+    t_start = _time.time()
     pulses_by_assay = None
     built_2024_cached: list[str] = []
     # helper to map a generic pulses table (CSV/DF) into {assay: [(t_h, dN_gL), ...]}
@@ -267,17 +285,57 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
             import pandas as pd
             mats = {"A": pd.DataFrame({"time_h": np.linspace(0, 10, 6), "biomass_viable_gL": np.linspace(0.5, 1.0, 6)})}
 
-    # Load p0 from excel if available; fallback to ones
+    # Load p0 from excel if available; fallback to ones. Also expose helper to read pbest from checkpoint if needed elsewhere.
+    def _load_params_from_checkpoint(path: str):
+        try:
+            if path and os.path.exists(path):
+                data = np.load(path)
+                parr = data.get("pbest")
+                if parr is None:
+                    parr = data.get("p") or data.get("params")
+                return parr
+        except Exception:
+            return None
+        return None
     try:
         src_excel = p0_excel or "zenteno_parameters.xlsx"
         p0 = load_parameters_from_excel(src_excel, param_set=p0_set)
         if verbose:
             print(f"[P0] loaded from {src_excel} (set={p0_set})")
-    except Exception:
-        p0 = np.ones(14)
-        if verbose:
-            print("[P0] using ones(14)")
-    bounds = [(1e-6, 1e3)] * 14
+    except Exception as e:
+        raise RuntimeError(f"No se pudo cargar p0 desde Excel ({src_excel}, set={p0_set}). Corrige la ruta o set. Detalle: {e}")
+    # Physical-ish bounds per parameter (order must match zenteno_model unpacking):
+    # 1) mu0, 2) betaG0, 3) betaF0, 4) Kn0, 5) Kg0, 6) Kf0, 7) Kig0, 8) Kie0, 9) Kd0,
+    # 10) Yxn, 11) Yxg, 12) Yxf, 13) Yeg, 14) Yef
+    bounds = [
+        (1e-4, 2.0),   # mu0
+        (1e-6, 2.0),   # betaG0
+        (1e-6, 2.0),   # betaF0
+        (1e-4, 200.0), # Kn0
+        (1e-4, 200.0), # Kg0
+        (1e-4, 200.0), # Kf0
+        (1e-4, 200.0), # Kig0
+        (1e-4, 200.0), # Kie0
+        (1e-6, 1.0),   # Kd0
+        (1.0, 100.0),  # Yxn
+        (0.05, 10.0),  # Yxg
+        (0.05, 10.0),  # Yxf
+        (0.05, 20.0),  # Yeg
+        (0.05, 20.0),  # Yef
+    ]
+    # Apply optional overrides to yields bounds
+    def _apply_override(idx: int, lb: float | None, ub: float | None):
+        cur_lb, cur_ub = bounds[idx]
+        new_lb = cur_lb if lb is None else float(lb)
+        new_ub = cur_ub if ub is None else float(ub)
+        # ensure order
+        if new_lb > new_ub:
+            new_lb, new_ub = new_ub, new_lb
+        bounds[idx] = (new_lb, new_ub)
+    # indices: 9=Yxn, 10=Yxg, 11=Yxf
+    _apply_override(10, yxg_lb, yxg_ub)
+    _apply_override(11, yxf_lb, yxf_ub)
+    _apply_override(9, yxn_lb, yxn_ub)
     if cfg is None:
         cfg = CalibrationConfig()
         cfg.n_starts = 4
@@ -285,6 +343,79 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
     # wrap simulate_on_grid with tolerances
     def sim_wrapped(p, t_meas, temp_segs, pulses, x0):
         return simulate_on_grid(p, t_meas, temp_segs, pulses, x0, method=method, rtol=cfg.rtol, atol_vec=cfg.atol_vec(), jacobian=jacobian, verbose=verbose)
+
+    # Helper: derive X0 with sugar-from-density fallback for 24xxx (or any mat with Densidad)
+    def _derive_x0_with_density(code, df) -> np.ndarray:
+        import numpy as _np
+        # First valid values across the series (not strictly the first row)
+        def first_valid(col):
+            try:
+                s = _np.asarray(pd.to_numeric(df[col], errors="coerce"), dtype=float)
+                idx = _np.where(_np.isfinite(s))[0]
+                return float(s[idx[0]]) if idx.size > 0 else _np.nan
+            except Exception:
+                return _np.nan
+        # X
+        try:
+            import pandas as pd  # local to avoid global import issues
+        except Exception:
+            pd = None  # type: ignore
+        X0 = first_valid("biomass_viable_gL") if 'pd' in locals() and pd is not None else _np.nan
+        N0_mgL = first_valid("YAN") if 'pd' in locals() and pd is not None else _np.nan
+        G0 = first_valid("Glucose") if 'pd' in locals() and pd is not None else _np.nan
+        F0 = first_valid("Fructose") if 'pd' in locals() and pd is not None else _np.nan
+        E0 = first_valid("Ethanol") if 'pd' in locals() and pd is not None else _np.nan
+        # Convert YAN to g/L
+        N0 = (N0_mgL * 1e-3) if _np.isfinite(N0_mgL) else _np.nan
+        # If G/F missing or clearly zero while density exists, estimate total sugar from density and split 50/50
+        need_split = (not _np.isfinite(G0)) or (not _np.isfinite(F0)) or ((G0 + F0) <= 0)
+        is_numeric_assay = str(code).isdigit()
+        # For 24xxx (numeric IDs), Ethanol initial must be 0.0 (lab only provides final E).
+        if is_numeric_assay:
+            E0 = 0.0
+        if 'pd' in locals() and pd is not None and "Densidad" in getattr(df, 'columns', []):
+            try:
+                dens = pd.to_numeric(df["Densidad"], errors="coerce").to_numpy(dtype=float)
+                m = _np.isfinite(dens)
+                if m.any():
+                    # take earliest valid density
+                    j = int(_np.where(m)[0][0])
+                    d0 = float(dens[j])
+                    # load sugar-density dataset and fit cubic model globally
+                    import os as _os
+                    import pandas as _pd
+                    ds_path = _os.path.join("sugar_density_out", "sugar_density_dataset.csv")
+                    S0 = _np.nan
+                    if _os.path.exists(ds_path):
+                        dsd = _pd.read_csv(ds_path)
+                        if ("density" in dsd.columns) and ("total_sugar" in dsd.columns):
+                            den_global = _np.asarray(dsd["density"], dtype=float)
+                            sug_global = _np.asarray(dsd["total_sugar"], dtype=float)
+                            mg = _np.isfinite(den_global) & _np.isfinite(sug_global)
+                            if mg.any():
+                                coef = _np.polyfit(den_global[mg], sug_global[mg], deg=3)
+                                S0 = float(_np.polyval(coef, d0))
+                    if _np.isfinite(S0) and S0 > 0:
+                        mismatch = (_np.isfinite(G0) and _np.isfinite(F0)) and (abs((G0+F0) - S0) / max(S0, 1e-12) > 0.05)
+                        # Apply override for numeric (24xxx) on mismatch; for SB only when missing/zero
+                        if need_split or (is_numeric_assay and mismatch):
+                            G0 = S0 * 0.5
+                            F0 = S0 * 0.5
+            except Exception:
+                pass
+        # Fallbacks with DEFAULT_X0
+        try:
+            from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
+        except Exception:
+            _DEF = _np.array([1.0, 0.2, 200.0, 200.0, 0.0], dtype=float)
+        x0_vec = _np.array([
+            X0 if _np.isfinite(X0) and X0 >= 0 else _DEF[0],
+            N0 if _np.isfinite(N0) and N0 >= 0 else _DEF[1],
+            G0 if _np.isfinite(G0) and G0 >= 0 else _DEF[2],
+            F0 if _np.isfinite(F0) and F0 >= 0 else _DEF[3],
+            E0 if _np.isfinite(E0) and E0 >= 0 else _DEF[4],
+        ], dtype=float)
+        return x0_vec
 
     # Optional: generate preview plots with p0 before running optimization
     if preview_p0_before and plot_fit_for_assay is not None and file_path is not None and mats is not None:
@@ -298,63 +429,202 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
             for code, df in mats.items():
                 pulses = (pulses_by_assay or {}).get(code)
                 try:
-                    plot_fit_for_assay(code, df, p0, sim_wrapped, pulses=pulses, x0=None, out_path=f"{prev_dir}/{code}.png")
+                    # use the same X0 logic as calibration
+                    try:
+                        x0_vec = _derive_x0_with_density(code, df)
+                    except Exception:
+                        from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
+                        x0_vec = _DEF
+                    plot_fit_for_assay(code, df, p0, sim_wrapped, pulses=pulses, x0=x0_vec, out_path=f"{prev_dir}/{code}.png")
                 except Exception:
                     pass
         except Exception:
             pass
 
-    pbest, score, meta = calibrate_full(
-        mats,
-        p0,
-        bounds,
-        sim_wrapped,
-        mode=cfg.mode,
-        pulses_by_assay=pulses_by_assay,
-        x0_by_assay=(lambda _m: {
-            k: (lambda r: __import__('numpy').array([
-                float(r.get('biomass_viable_gL', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('biomass_viable_gL', __import__('numpy').nan))) else __import__('numpy').nan,
-                (float(r.get('YAN', __import__('numpy').nan))*1e-3) if __import__('numpy').isfinite(float(r.get('YAN', __import__('numpy').nan))) else __import__('numpy').nan,
-                float(r.get('Glucose', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Glucose', __import__('numpy').nan))) else __import__('numpy').nan,
-                float(r.get('Fructose', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Fructose', __import__('numpy').nan))) else __import__('numpy').nan,
-                float(r.get('Ethanol', __import__('numpy').nan)) if __import__('numpy').isfinite(float(r.get('Ethanol', __import__('numpy').nan))) else __import__('numpy').nan,
-            ], dtype=float)) (v.iloc[0] if len(v)>0 else {})
-            for k, v in _m.items()
-        })(mats),
-        weights=weights,
-        n_starts=cfg.n_starts,
-        local_maxiter=cfg.local_maxiter,
-        patience_starts=cfg.patience_starts,
-        patience_evals=cfg.patience_evals,
-        min_improvement_rel=cfg.min_improvement_rel,
-        out_path=out_path,
-        verbose=verbose,
-    )
-    if verbose:
+    # If plot_from is provided, load pbest from NPZ and skip optimization
+    if plot_from is not None:
+        try:
+            data = np.load(plot_from)
+            pbest = data.get("pbest")
+            score = float(data.get("score")) if "score" in data else float("nan")
+            if pbest is None:
+                raise ValueError("El archivo NPZ no contiene 'pbest'")
+            if verbose:
+                print(f"[PLOT-FROM] Loaded pbest from {plot_from} (score={score if np.isfinite(score) else 'NA'})")
+        except Exception as e:
+            raise RuntimeError(f"No se pudo cargar pbest desde {plot_from}: {e}")
+    else:
+        pbest, score, meta = calibrate_full(
+            mats,
+            p0,
+            bounds,
+            sim_wrapped,
+            mode=cfg.mode,
+            pulses_by_assay=pulses_by_assay,
+            x0_by_assay={k: _derive_x0_with_density(k, v) for k, v in mats.items()},
+            weights=weights,
+            sse_balance=getattr(cfg, 'sse_balance', 'per_assay'),
+            sse_resample_dt_h=getattr(cfg, 'sse_resample_dt_h', None),
+            n_starts=cfg.n_starts,
+            local_maxiter=cfg.local_maxiter,
+            patience_starts=cfg.patience_starts,
+            patience_evals=cfg.patience_evals,
+            min_improvement_rel=cfg.min_improvement_rel,
+            out_path=out_path,
+            verbose=verbose,
+            eval_print_every=(eval_print_every if eval_print_every is not None else 50),
+            iter_print_every=(iter_print_every if iter_print_every is not None else 0),
+            de_maxiter=(de_maxiter if de_maxiter is not None else 60),
+            de_popsize=(de_popsize if de_popsize is not None else 12),
+            de_tol=(de_tol if de_tol is not None else 1e-6),
+            sim_progress=bool(sim_progress) if sim_progress is not None else False,
+        )
+    if verbose and plot_from is None:
         print(f"[RESULT] SSE={score:.4e}  out={out_path}")
+
+    # Optional: write a JSON summary of the run (works for optimize and plot-from)
+    if write_summary:
+        try:
+            # choose npz path and json output path
+            npz_path = (plot_from if plot_from is not None else out_path)
+            base = (summary_out if (summary_out and len(str(summary_out))>0) else (str(npz_path).rsplit('.',1)[0] + ".json"))
+            # collect basic environment
+            env = {
+                "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                "duration_s": round(_time.time() - t_start, 3),
+                "python": _sys.version.split('\n')[0],
+                "platform": _platform.platform(),
+            }
+            try:
+                import numpy as _np
+                env["numpy"] = str(_np.__version__)
+            except Exception:
+                pass
+            # simulation config
+            sim_cfg = {
+                "method": method,
+                "jacobian": jacobian,
+                "rtol": getattr(cfg, 'rtol', None),
+                "atol": {
+                    "X": getattr(cfg, 'atol_x', None),
+                    "N": getattr(cfg, 'atol_n', None),
+                    "G": getattr(cfg, 'atol_g', None),
+                    "F": getattr(cfg, 'atol_f', None),
+                    "E": getattr(cfg, 'atol_e', None),
+                }
+            }
+            # optimizer config (when applicable)
+            opt_cfg = {
+                "mode": getattr(cfg, 'mode', None),
+                "n_starts": getattr(cfg, 'n_starts', None),
+                "local_maxiter": getattr(cfg, 'local_maxiter', None),
+                "patience_starts": getattr(cfg, 'patience_starts', None),
+                "patience_evals": getattr(cfg, 'patience_evals', None),
+                "min_improvement_rel": getattr(cfg, 'min_improvement_rel', None),
+                "de_maxiter": (de_maxiter if de_maxiter is not None else 60),
+                "de_popsize": (de_popsize if de_popsize is not None else 12),
+                "de_tol": (de_tol if de_tol is not None else 1e-6),
+                "eval_print_every": (eval_print_every if eval_print_every is not None else 50),
+                "iter_print_every": (iter_print_every if iter_print_every is not None else 0),
+                "sim_progress": bool(sim_progress) if sim_progress is not None else False,
+            }
+            # data context
+            assays_list = sorted([str(k) for k in (mats or {}).keys()])
+            data_ctx = {
+                "file": file_path,
+                "split": split,
+                "split_file": split_file,
+                "assays_used": assays_list,
+                "n_assays": len(assays_list),
+                "exclude": exclude,
+                "temps_dir": temps_dir,
+                "pulses_present_for": sorted(list((pulses_by_assay or {}).keys())),
+            }
+            # weights and bounds
+            wb = {
+                "weights": weights,
+                "bounds": bounds,
+                "sse_balance": getattr(cfg, 'sse_balance', 'per_assay'),
+                "sse_resample_dt_h": getattr(cfg, 'sse_resample_dt_h', None),
+                "overrides": {
+                    "lb_yxg": yxg_lb,
+                    "ub_yxg": yxg_ub,
+                    "lb_yxf": yxf_lb,
+                    "ub_yxf": yxf_ub,
+                    "lb_yxn": yxn_lb,
+                    "ub_yxn": yxn_ub,
+                }
+            }
+            # parameter names in the expected order
+            param_names = [
+                "mu0","betaG0","betaF0","Kn0","Kg0","Kf0","Kig0","Kie0",
+                "Kd0","Yxn","Yxg","Yxf","Yeg","Yef"
+            ]
+
+            # result section
+            # try to load score/pbest from npz when plotting-from
+            score_out = None
+            pbest_out = pbest
+            try:
+                import numpy as _np
+                if plot_from is not None and npz_path is not None:
+                    with _np.load(npz_path) as _d:
+                        if 'score' in _d:
+                            _s = _d['score']
+                            try:
+                                score_out = float(_s)
+                            except Exception:
+                                score_out = None
+                        if (pbest_out is None) and ('pbest' in _d):
+                            pbest_out = _d['pbest']
+                else:
+                    score_out = float(score)
+            except Exception:
+                pass
+
+            result = {
+                "npz_path": npz_path,
+                "score": score_out,
+                "pbest": (
+                    [float(x) for x in (pbest_out.tolist() if hasattr(pbest_out, 'tolist') else list(pbest_out))]
+                    if pbest_out is not None else None
+                ),
+            }
+
+            # attach parameter mapping when available
+            if result["pbest"] is not None and len(result["pbest"]) == len(param_names):
+                result["params"] = {
+                    "names": param_names,
+                    "values": {n: result["pbest"][i] for i, n in enumerate(param_names)},
+                    "bounds": {n: list(bounds[i]) if bounds and i < len(bounds) else None for i, n in enumerate(param_names)},
+                }
+            summary = {
+                "env": env,
+                "simulation": sim_cfg,
+                "optimizer": opt_cfg,
+                "data": data_ctx,
+                "objective": wb,
+                "result": result,
+                "source": ("plot-from" if plot_from is not None else "optimize"),
+            }
+            # write JSON
+            import os as _os
+            _os.makedirs(_os.path.dirname(base) or ".", exist_ok=True)
+            with open(base, "w", encoding="utf-8") as f:
+                _json.dump(summary, f, indent=2, ensure_ascii=False)
+            if verbose:
+                print(f"[SUMMARY] wrote {base}")
+        except Exception as e:
+            if verbose:
+                print(f"[SUMMARY] failed: {e}")
     # optional plotting
     if plot and plot_fit_for_assay is not None:
         for code, df in mats.items():
             pulses = (pulses_by_assay or {}).get(code)
             try:
-                # Build x0 from first experimental row (like preview)
-                import numpy as _np
+                # Build x0 using the same density-based logic
                 try:
-                    t0_row = df.iloc[0]
-                    X0 = float(t0_row.get("biomass_viable_gL", _np.nan))
-                    N0_mgL = float(t0_row.get("YAN", _np.nan))
-                    G0 = float(t0_row.get("Glucose", _np.nan))
-                    F0 = float(t0_row.get("Fructose", _np.nan))
-                    E0 = float(t0_row.get("Ethanol", _np.nan))
-                    N0 = (N0_mgL * 1e-3) if _np.isfinite(N0_mgL) else _np.nan
-                    from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
-                    x0_vec = _np.array([
-                        X0 if _np.isfinite(X0) else _DEF[0],
-                        N0 if _np.isfinite(N0) else _DEF[1],
-                        G0 if _np.isfinite(G0) else _DEF[2],
-                        F0 if _np.isfinite(F0) else _DEF[3],
-                        E0 if _np.isfinite(E0) else _DEF[4],
-                    ], dtype=float)
+                    x0_vec = _derive_x0_with_density(code, df)
                 except Exception:
                     from sb_calibration.model.zenteno import DEFAULT_X0 as _DEF
                     x0_vec = _DEF
@@ -386,6 +656,8 @@ if __name__ == "__main__":
     parser.add_argument("--jacobian", default="analytic", choices=["analytic","numeric","none"], help="Tipo de jacobiano a usar en la integración")
     parser.add_argument("--exclude", default=None, help="Lista separada por comas de ensayos a excluir (e.g., SB001,SB002)")
     parser.add_argument("--mode", default="multistart", choices=["multistart","de"])
+    parser.add_argument("--sse-balance", default="per_assay", choices=["per_assay","per_point","none"], help="Modo de balance para la SSE (por defecto: per_assay)")
+    parser.add_argument("--sse-resample-dt-h", type=float, default=None, help="Submuestreo temporal (horas) para la SSE; e.g., 6.0. Por defecto: None")
     parser.add_argument("--split", default=None, choices=["train","valid"], help="Seleccionar ensayos según splits precomputados si --assays no se entrega")
     parser.add_argument("--split-file", default="splits/assay_split.csv", help="Ruta al CSV de splits para --split")
     parser.add_argument("--n-starts", type=int, default=8)
@@ -398,6 +670,12 @@ if __name__ == "__main__":
     parser.add_argument("--atol-e", type=float, default=1e-3)
     parser.add_argument("--plot", action="store_true", help="Guardar gráficos sim vs. meas por ensayo")
     parser.add_argument("--plots-dir", default="mats/plots", help="Carpeta de salida para los gráficos")
+    parser.add_argument("--plot-from", default=None, help="Ruta a un .npz con pbest para generar gráficos sin recalibrar")
+    # Summary flags: default ON for optimizer runs, OFF for plot-from
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument("--write-summary", action="store_true", help="Forzar escritura de resumen JSON (también en plot-from)")
+    summary_group.add_argument("--no-summary", action="store_true", help="Desactivar la escritura del resumen JSON")
+    parser.add_argument("--summary-out", default=None, help="Ruta del JSON de salida (por defecto, junto al .npz)")
     parser.add_argument("--preview-p0-before", action="store_true", help="Generar plots con p0 antes de calibrar (preview)")
     parser.add_argument("--p0-excel", default="zenteno_parameters.xlsx", help="Excel con parámetros base para p0 (por defecto: zenteno_parameters.xlsx)")
     parser.add_argument("--p0-set", type=int, default=3, help="Set de parámetros dentro del Excel de p0 (por defecto: 3)")
@@ -411,12 +689,28 @@ if __name__ == "__main__":
     parser.add_argument("--w-g", type=float, default=1.0, help="Peso para G en la SSE")
     parser.add_argument("--w-f", type=float, default=1.0, help="Peso para F en la SSE")
     parser.add_argument("--w-e", type=float, default=1.0, help="Peso para E en la SSE")
+    parser.add_argument("--w-s", type=float, default=1.0, help="Peso para S=G+F o SugarTotal_exp en la SSE (si existe)")
     parser.add_argument("--pulses-csv", default=os.path.join("mats", "pulses_YAN.csv"), help="Ruta a CSV de pulsos (assay,time_h,dN_gL) si no se usa --chem-file")
+    parser.add_argument("--eval-print-every", type=int, default=25, help="Imprimir progreso cada N evaluaciones de la SSE (default: 25)")
+    parser.add_argument("--iter-print-every", type=int, default=5, help="Imprimir progreso dentro de L-BFGS-B cada N iteraciones (default: 5; 0=off)")
+    parser.add_argument("--de-maxiter", type=int, default=120, help="Iteraciones máximas de Differential Evolution (default: 120)")
+    parser.add_argument("--de-popsize", type=int, default=18, help="Tamaño de población DE (default: 18)")
+    parser.add_argument("--de-tol", type=float, default=1e-6, help="Tolerancia de convergencia DE (default: 1e-6)")
+    # Bounds overrides for yields (optional, to constrain biomass growth)
+    parser.add_argument("--lb-yxg", type=float, default=None, help="Override lower bound for Yxg (biomass yield on glucose)")
+    parser.add_argument("--ub-yxg", type=float, default=None, help="Override upper bound for Yxg (biomass yield on glucose)")
+    parser.add_argument("--lb-yxf", type=float, default=None, help="Override lower bound for Yxf (biomass yield on fructose)")
+    parser.add_argument("--ub-yxf", type=float, default=None, help="Override upper bound for Yxf (biomass yield on fructose)")
+    parser.add_argument("--lb-yxn", type=float, default=None, help="Override lower bound for Yxn (biomass yield on nitrogen)")
+    parser.add_argument("--ub-yxn", type=float, default=None, help="Override upper bound for Yxn (biomass yield on nitrogen)")
+    parser.add_argument("--sim-progress", action="store_true", help="Imprimir [SIM] OK por ensayo tras cada simulación (más verboso)")
     args = parser.parse_args()
     cfg = CalibrationConfig(
         mode=args.mode,
         n_starts=args.n_starts,
         local_maxiter=args.local_maxiter,
+        sse_balance=args.sse_balance,
+        sse_resample_dt_h=args.sse_resample_dt_h,
         rtol=args.rtol,
         atol_x=args.atol_x,
         atol_n=args.atol_n,
@@ -426,7 +720,7 @@ if __name__ == "__main__":
     )
     assays = [s.strip() for s in args.assays.split(',')] if args.assays else None
     exclude = [s.strip() for s in args.exclude.split(',')] if args.exclude else None
-    weights = {"X": args.w_x, "N": args.w_n, "G": args.w_g, "F": args.w_f, "E": args.w_e}
+    weights = {"X": args.w_x, "N": args.w_n, "G": args.w_g, "F": args.w_f, "E": args.w_e, "S": args.w_s}
     # Optional prebuild step
     if args.prebuild_2024 or args.prebuild_only:
         split_choice = args.prebuild_split or (args.split if args.split else "all")
@@ -438,4 +732,14 @@ if __name__ == "__main__":
         if args.prebuild_only:
             raise SystemExit(0)
 
-    run_calibration(None, out_path=args.out, cfg=cfg, file_path=args.file, assays=assays, temps_dir=args.temps_dir, use_smoothed_biomass=args.use_smoothed_biomass, method=args.method, jacobian=args.jacobian, exclude=exclude, chem_file=args.chem_file, weights=weights, plot=args.plot, plots_dir=args.plots_dir, split=args.split, split_file=args.split_file, cache_2024=(not args.no_cache_2024), preview_p0_before=args.preview_p0_before, p0_excel=args.p0_excel, p0_set=args.p0_set, pulses_csv_path=args.pulses_csv, verbose=args.verbose)
+    # Effective summary behavior: default ON for optimizer (no --plot-from), OFF for plot-from.
+    if args.plot_from is None:
+        write_summary_effective = True
+    else:
+        write_summary_effective = False
+    if getattr(args, 'write_summary', False):
+        write_summary_effective = True
+    if getattr(args, 'no_summary', False):
+        write_summary_effective = False
+
+    run_calibration(None, out_path=args.out, cfg=cfg, file_path=args.file, assays=assays, temps_dir=args.temps_dir, use_smoothed_biomass=args.use_smoothed_biomass, method=args.method, jacobian=args.jacobian, exclude=exclude, chem_file=args.chem_file, weights=weights, plot=args.plot, plots_dir=args.plots_dir, plot_from=args.plot_from, write_summary=write_summary_effective, summary_out=args.summary_out, split=args.split, split_file=args.split_file, cache_2024=(not args.no_cache_2024), preview_p0_before=args.preview_p0_before, p0_excel=args.p0_excel, p0_set=args.p0_set, pulses_csv_path=args.pulses_csv, verbose=args.verbose, eval_print_every=args.eval_print_every, iter_print_every=args.iter_print_every, de_maxiter=args.de_maxiter, de_popsize=args.de_popsize, de_tol=args.de_tol, yxg_lb=args.lb_yxg, yxg_ub=args.ub_yxg, yxf_lb=args.lb_yxf, yxf_ub=args.ub_yxf, yxn_lb=args.lb_yxn, yxn_ub=args.ub_yxn, sim_progress=args.sim_progress)

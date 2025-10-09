@@ -1,5 +1,6 @@
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+import time
 
 
 def sse_for_experiment(y_meas: np.ndarray, y_sim: np.ndarray) -> float:
@@ -13,7 +14,7 @@ def sse_for_experiment(y_meas: np.ndarray, y_sim: np.ndarray) -> float:
     return float(np.nansum(diff * diff))
 
 
-def compute_global_stds(mats: Dict[str, 'pd.DataFrame']) -> Dict[str, float]:
+def compute_global_stds(mats: Dict[str, Any]) -> Dict[str, float]:
     """Compute global std per observable (X,N,G,F,E) from a dict of dataframes.
 
     This mirrors the legacy behaviour: collects values across assays and returns
@@ -21,7 +22,7 @@ def compute_global_stds(mats: Dict[str, 'pd.DataFrame']) -> Dict[str, float]:
     """
     import pandas as pd
 
-    vals = {"X": [], "N": [], "G": [], "F": [], "E": []}
+    vals = {"X": [], "N": [], "G": [], "F": [], "E": [], "S": []}
     N_SCALE = 1e-3
     for code, df in mats.items():
         if "biomass_viable_gL" in df:
@@ -34,6 +35,8 @@ def compute_global_stds(mats: Dict[str, 'pd.DataFrame']) -> Dict[str, float]:
             vals["F"].extend(pd.to_numeric(df["Fructose"], errors="coerce").dropna().astype(float).tolist())
         if "Ethanol" in df:
             vals["E"].extend(pd.to_numeric(df["Ethanol"], errors="coerce").dropna().astype(float).tolist())
+        if "SugarTotal_exp" in df:
+            vals["S"].extend(pd.to_numeric(df["SugarTotal_exp"], errors="coerce").dropna().astype(float).tolist())
 
     stds: Dict[str, float] = {}
     for k, arr in vals.items():
@@ -46,13 +49,16 @@ def compute_global_stds(mats: Dict[str, 'pd.DataFrame']) -> Dict[str, float]:
 
 
 def sse_for_experiments_real(p_real: np.ndarray,
-                             mats: Dict[str, 'pd.DataFrame'],
+                             mats: Dict[str, Any],
                              pulses_by_assay: Optional[Dict[str, List[Tuple[float, float]]]] = None,
                              x0_by_assay: Optional[Dict[str, np.ndarray]] = None,
                              weights: Optional[Dict[str, float]] = None,
                              stds: Optional[Dict[str, float]] = None,
                              verbose: bool = False,
-                             simulate_fn=None) -> float:
+                             simulate_fn=None,
+                             balance: str = "per_assay",
+                             resample_dt_h: Optional[float] = None,
+                             sim_progress: bool = False) -> float:
     """Compute normalized SSE across multiple assays.
 
     This is a lightweight port of the legacy function. The caller should pass
@@ -66,11 +72,32 @@ def sse_for_experiments_real(p_real: np.ndarray,
     if weights is None:
         weights = {"X": 1.0, "N": 1.0, "G": 1.0, "F": 1.0, "E": 1.0}
     if stds is None:
-        stds = {k: 1.0 for k in ["X", "N", "G", "F", "E"]}
+        stds = {k: 1.0 for k in ["X", "N", "G", "F", "E", "S"]}
 
     total = 0.0
     N_SCALE = 1e-3
+
+    def _maybe_resample(t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if resample_dt_h is None or len(t) <= 1:
+            return t, y
+        t = np.asarray(t, float); y = np.asarray(y, float)
+        if not np.isfinite(t).any():
+            return t, y
+        t0 = float(np.nanmin(t))
+        grid = np.arange(t0, float(np.nanmax(t)) + 1e-9, float(resample_dt_h))
+        idx = np.searchsorted(t, grid, side="left")
+        idx[idx == len(t)] = len(t) - 1
+        return t[idx], y[idx]
+
+    def _series_loss(sim: np.ndarray, y: np.ndarray, std: float, w: float) -> Optional[float]:
+        m = ~np.isnan(y)
+        if not m.any():
+            return None
+        err2 = ((sim[m] - y[m]) / (std if std > 0 else 1.0)) ** 2
+        # Use mean to avoid bias from number of points
+        return float(np.nanmean(err2) * w)
     for code, df in mats.items():
+        t_sim_start = time.time()
         t_meas = df["time_h"].astype(float).to_numpy()
         temp_segs_C = None
         # try to find temperature-like column
@@ -82,6 +109,12 @@ def sse_for_experiments_real(p_real: np.ndarray,
         x0 = (x0_by_assay or {}).get(code, None)
 
         t_sim, Xsim = simulate_fn(p_real, t_meas, temp_segs_C, pulses, x0)
+        if sim_progress:
+            try:
+                dt = time.time() - t_sim_start
+                print(f"[SIM] OK assay={code}  nT={len(t_sim)}  dt={dt:0.2f}s")
+            except Exception:
+                pass
         t_sim = np.asarray(t_sim, dtype=float)
 
         X_interp = np.vstack([
@@ -92,39 +125,80 @@ def sse_for_experiments_real(p_real: np.ndarray,
             np.interp(t_meas, t_sim, Xsim[:, 4]),
         ]).T
 
-        sse = 0.0
+        per_var_losses: List[float] = []
         # X
         if "biomass_viable_gL" in df.columns:
             y = df["biomass_viable_gL"].astype(float).to_numpy()
-            m = ~np.isnan(y)
-            if m.any():
-                sse += weights.get("X", 1.0) * np.nansum(((X_interp[m, 0] - y[m]) / stds["X"]) ** 2)
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 0])
+                per = _series_loss(sim_rs, y_rs, stds.get("X", 1.0), weights.get("X", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 0], y, stds.get("X", 1.0), weights.get("X", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
         # N
         if "YAN" in df.columns:
             y = pd_to_numeric_safe(df["YAN"]).astype(float) * N_SCALE
-            m = ~np.isnan(y)
-            if m.any():
-                sse += weights.get("N", 1.0) * np.nansum(((X_interp[m, 1] - y[m]) / stds["N"]) ** 2)
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 1])
+                per = _series_loss(sim_rs, y_rs, stds.get("N", 1.0), weights.get("N", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 1], y, stds.get("N", 1.0), weights.get("N", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
         # G
         if "Glucose" in df.columns:
             y = df["Glucose"].astype(float).to_numpy()
-            m = ~np.isnan(y)
-            if m.any():
-                sse += weights.get("G", 1.0) * np.nansum(((X_interp[m, 2] - y[m]) / stds["G"]) ** 2)
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 2])
+                per = _series_loss(sim_rs, y_rs, stds.get("G", 1.0), weights.get("G", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 2], y, stds.get("G", 1.0), weights.get("G", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
         # F
         if "Fructose" in df.columns:
             y = df["Fructose"].astype(float).to_numpy()
-            m = ~np.isnan(y)
-            if m.any():
-                sse += weights.get("F", 1.0) * np.nansum(((X_interp[m, 3] - y[m]) / stds["F"]) ** 2)
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 3])
+                per = _series_loss(sim_rs, y_rs, stds.get("F", 1.0), weights.get("F", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 3], y, stds.get("F", 1.0), weights.get("F", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
         # E
         if "Ethanol" in df.columns:
             y = df["Ethanol"].astype(float).to_numpy()
-            m = ~np.isnan(y)
-            if m.any():
-                sse += weights.get("E", 1.0) * np.nansum(((X_interp[m, 4] - y[m]) / stds["E"]) ** 2)
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 4])
+                per = _series_loss(sim_rs, y_rs, stds.get("E", 1.0), weights.get("E", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 4], y, stds.get("E", 1.0), weights.get("E", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
+        # Optional S = G+F when available
+        if "SugarTotal_exp" in df.columns:
+            y = df["SugarTotal_exp"].astype(float).to_numpy()
+            if resample_dt_h:
+                t_rs, y_rs = _maybe_resample(t_meas, y)
+                sim_rs = np.interp(t_rs, t_sim, Xsim[:, 2] + Xsim[:, 3])
+                per = _series_loss(sim_rs, y_rs, stds.get("S", 1.0), weights.get("S", 1.0))
+            else:
+                per = _series_loss(X_interp[:, 2] + X_interp[:, 3], y, stds.get("S", 1.0), weights.get("S", 1.0))
+            if per is not None:
+                per_var_losses.append(per)
 
-        total += sse
+        if not per_var_losses:
+            continue
+        if balance == "per_assay":
+            total += float(np.mean(per_var_losses))
+        else:  # "per_point" or fallback
+            total += float(np.sum(per_var_losses))
     if verbose:
         print(f"SSE={total:.4e}")
     return float(total)
