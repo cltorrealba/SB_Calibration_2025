@@ -3,7 +3,7 @@ import os
 from typing import Optional, Dict, Tuple
 import numpy as np
 import pandas as pd
-from sb_calibration.preprocess.calibration_preprocess import ETHANOL_DENSITY_G_ML
+from sb_calibration.preprocess.calibration_preprocess import ETHANOL_DENSITY_G_ML, SLOPE, INTERCEPT
 
 
 def _col_like(df: pd.DataFrame, *cands: str) -> Optional[str]:
@@ -117,6 +117,9 @@ def _read_signals_any(xlsx_path: str) -> Dict[str, pd.DataFrame]:
         'Glucose': ('glucose', 'glucosa'),
         'Fructose': ('fructose', 'fructosa'),
         'Ethanol': ('ethanol', 'alcohol'),
+        # Optional for initial biomass extraction (legacy-like)
+        'Concentration': ('concentration', 'conc'),
+        'Viability': ('viability', 'viable'),
     }
     for sheet in xl.sheet_names:
         try:
@@ -133,10 +136,21 @@ def _read_signals_any(xlsx_path: str) -> Dict[str, pd.DataFrame]:
             if col is None:
                 continue
             val = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
-            # Convert Alcohol % v/v to Ethanol g/L if needed
-            if key == 'Ethanol' and str(col).strip().lower() in ('alcohol',):
-                # % v/v to g/L: pct * density(g/mL) * 10
-                val = np.clip(val, a_min=0.0, a_max=None) * ETHANOL_DENSITY_G_ML * 10.0
+            # Convert Alcohol/Ethanol % v/v to Ethanol g/L if needed
+            if key == 'Ethanol':
+                col_l = str(col).strip().lower()
+                vm = val[np.isfinite(val)]
+                # Heuristics:
+                # 1) If column name suggests percent (alcohol, v/v, percent), convert
+                name_suggests_pct = (('alcohol' in col_l) and ('ethanol' not in col_l)) or any(tok in col_l for tok in ('v/v','vv','percent','porcentaje','%'))
+                # 2) If values look like fractions (<=1.1) -> fraction to percent
+                looks_fraction = (vm.size and np.nanmedian(vm) <= 1.1)
+                # 3) If values look like percent range (<=40) -> treat as percent
+                looks_percent = (vm.size and not looks_fraction and np.nanmedian(vm) <= 40.0)
+                if name_suggests_pct or looks_fraction or looks_percent:
+                    if looks_fraction:
+                        val = val * 100.0
+                    val = np.clip(val, a_min=0.0, a_max=None) * ETHANOL_DENSITY_G_ML * 10.0
             m = ~(np.isnan(t) | np.isnan(val))
             if not m.any():
                 continue
@@ -181,6 +195,20 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
         if not t_parts:
             return None
     base_t = np.unique(np.clip(np.concatenate(t_parts).astype(float), a_min=0.0, a_max=None))
+
+    # If there are lab measurements extending beyond the operational grid, extend the grid
+    lab_keys = ['YAN', 'Glucose', 'Fructose', 'Ethanol']
+    lab_max_t = None
+    for k in lab_keys:
+        if k in sigs and not sigs[k].empty:
+            tt = pd.to_numeric(sigs[k]['time_h'], errors='coerce').to_numpy(dtype=float)
+            vv = pd.to_numeric(sigs[k][k], errors='coerce').to_numpy(dtype=float)
+            m = ~(np.isnan(tt) | np.isnan(vv))
+            if m.any():
+                t_last = float(np.nanmax(tt[m]))
+                lab_max_t = t_last if lab_max_t is None else max(lab_max_t, t_last)
+    if lab_max_t is not None and (lab_max_t > (base_t.max() if base_t.size else -np.inf) + 1e-9):
+        base_t = np.unique(np.append(base_t, lab_max_t))
     mat = pd.DataFrame({'time_h': base_t})
 
     # Operational interpolation
@@ -192,6 +220,44 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
         mat['Densidad'] = np.interp(base_t, dfD['time_h'].to_numpy(dtype=float), dfD['Densidad'].to_numpy(dtype=float))
     else:
         mat['Densidad'] = np.nan
+
+    # Derive SugarTotal_exp (S from density) to be used in objective
+    try:
+        import pandas as _pd
+        ds_path = os.path.join('sugar_density_out', 'sugar_density_dataset.csv')
+        mat['SugarTotal_exp'] = np.nan
+        if os.path.exists(ds_path):
+            dsd = _pd.read_csv(ds_path)
+            # Preferred: use per-assay records if present
+            sub = None
+            if 'assay' in dsd.columns:
+                sub = dsd[dsd['assay'].astype(str) == str(assay_id)]
+            if sub is not None and not sub.empty and ('time_h' in sub.columns) and ('total_sugar' in sub.columns):
+                tds = _pd.to_numeric(sub['time_h'], errors='coerce').to_numpy(dtype=float)
+                sds = _pd.to_numeric(sub['total_sugar'], errors='coerce').to_numpy(dtype=float)
+                m = ~(np.isnan(tds) | np.isnan(sds))
+                if m.any():
+                    s_on_grid = np.interp(base_t, tds[m], sds[m])
+                    mat['SugarTotal_exp'] = s_on_grid
+            else:
+                # Fallback: fit global polynomial density->sugar and apply to Densidad column
+                if ('density' in dsd.columns) and ('total_sugar' in dsd.columns):
+                    den_global = _pd.to_numeric(dsd['density'], errors='coerce').to_numpy(dtype=float)
+                    sug_global = _pd.to_numeric(dsd['total_sugar'], errors='coerce').to_numpy(dtype=float)
+                    mg = ~(np.isnan(den_global) | np.isnan(sug_global))
+                    if mg.any():
+                        coef = np.polyfit(den_global[mg], sug_global[mg], deg=3)
+                        den_local = mat['Densidad'].to_numpy(dtype=float)
+                        sl = np.polyval(coef, den_local)
+                        mat['SugarTotal_exp'] = sl
+        # ensure non-negative
+        if 'SugarTotal_exp' in mat.columns:
+            mat['SugarTotal_exp'] = mat['SugarTotal_exp'].astype(float)
+            mat.loc[~np.isfinite(mat['SugarTotal_exp']), 'SugarTotal_exp'] = np.nan
+            mat['SugarTotal_exp'] = np.clip(mat['SugarTotal_exp'], a_min=0.0, a_max=None)
+    except Exception:
+        # leave SugarTotal_exp as NaN if anything fails
+        pass
 
     # Prepare lab columns (NaN except initial/final injections)
     for c in ['biomass_viable_gL', 'biomass_dead_gL', 'YAN', 'AMMONIA', 'PAN', 'Fructose', 'Glucose', 'Glycerol', 'Ethanol']:
@@ -209,7 +275,7 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
         if not m.any():
             return
         tt = tt[m]; vv = vv[m]
-        # choose initial >=0 and final <= t_end
+        # choose initial >=0 and final = latest available (do NOT restrict by t_end)
         t_init = None; v_init = None
         pos = tt[tt >= 0.0]
         if pos.size:
@@ -218,12 +284,10 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
             # value at that time
             v_init = float(vv[tt >= 0.0][idx])
         t_final = None; v_final = None
-        if np.isfinite(t_end):
-            le = tt[tt <= t_end]
-            if le.size:
-                idx2 = int(np.argmax(le))
-                t_final = float(le[idx2])
-                v_final = float(vv[tt <= t_end][idx2])
+        # final = last valid measurement time/value
+        idx2 = int(np.argmax(tt))
+        t_final = float(tt[idx2])
+        v_final = float(vv[idx2])
         # map to nearest grid indices and set values
         if t_init is not None:
             i0 = int(np.argmin(np.abs(base_t - t_init)))
@@ -236,25 +300,90 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
         if key in sigs:
             _inject_two_points(key, sigs[key])
 
+    # Derive and inject initial biomass viable using Concentration (+ Viability if available), legacy-like
+    try:
+        if 'Concentration' in sigs and not sigs['Concentration'].empty:
+            dC = sigs['Concentration']
+            tt = dC['time_h'].to_numpy(dtype=float)
+            vv = pd.to_numeric(dC['Concentration'], errors='coerce').to_numpy(dtype=float)
+            m = ~(np.isnan(tt) | np.isnan(vv))
+            if m.any():
+                tt = tt[m]; vv = vv[m]
+                # initial at earliest non-negative time
+                pos = tt[tt >= 0.0]
+                if pos.size:
+                    idx = int(np.argmin(pos))
+                    t_init = float(pos[idx])
+                    C0 = float(vv[tt >= 0.0][idx])
+                    # total biomass from calibration
+                    total_gL = max(0.0, SLOPE * C0 + INTERCEPT)
+                    # viability fraction if available
+                    f_viab = 0.5
+                    if 'Viability' in sigs and not sigs['Viability'].empty:
+                        dV = sigs['Viability']
+                        tv = dV['time_h'].to_numpy(dtype=float)
+                        vv2 = pd.to_numeric(dV['Viability'], errors='coerce').to_numpy(dtype=float)
+                        mv = ~(np.isnan(tv) | np.isnan(vv2))
+                        if mv.any():
+                            tv = tv[mv]; vv2 = vv2[mv]
+                            # nearest viability value to t_init
+                            j = int(np.argmin(np.abs(tv - t_init)))
+                            vraw = float(vv2[j])
+                            # interpret as fraction if <=1, else percent [0,100]
+                            f_viab = vraw if (0.0 <= vraw <= 1.0) else (max(0.0, min(100.0, vraw)) / 100.0)
+                    X0_viab = total_gL * f_viab
+                    # set at nearest grid point
+                    i0 = int(np.argmin(np.abs(base_t - t_init)))
+                    if np.isnan(mat.loc[i0, 'biomass_viable_gL']) or mat.loc[i0, 'biomass_viable_gL'] <= 0:
+                        mat.loc[i0, 'biomass_viable_gL'] = X0_viab
+    except Exception:
+        pass
+
     # Try to read explicit 'descube' endpoints from Laboratorio (legacy behavior)
     try:
         lab = pd.read_excel(xlsx_path, sheet_name='Laboratorio')
-        cols = {str(c).strip().lower(): c for c in lab.columns}
-        mcol = cols.get('muestreo_text') or cols.get('muestreo') or cols.get('etapa')
-        vname = cols.get('variable_text') or cols.get('template_variable_text') or cols.get('variable')
-        vnum = cols.get('valor_numeric') or cols.get('valor_num')
-        vtxt = cols.get('valor')
+        # Normalize column names (lowercase, remove accents, replace non-alnum by underscore)
+        def _norm_name(s: str) -> str:
+            s = (s or '').strip().lower()
+            try:
+                s = pd.Series([s]).str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('ascii').iloc[0]
+            except Exception:
+                pass
+            import re
+            s = re.sub(r"[^a-z0-9]+", "_", s)
+            s = s.strip('_')
+            return s
+        name_map = {_norm_name(c): c for c in lab.columns}
+        def _find_col(*cands):
+            for k in name_map.keys():
+                for c in cands:
+                    if c == k:
+                        return name_map[k]
+            # partial match
+            for k in name_map.keys():
+                for c in cands:
+                    if c in k:
+                        return name_map[k]
+            return None
+        mcol = _find_col('muestreo_text', 'muestreo', 'etapa')
+        vname = _find_col('variable_text', 'template_variable_text', 'variable')
+        vnum = _find_col('valor_numeric', 'valor_num', 'valor_numerico')
+        vtxt = _find_col('valor')
+        dcol = _find_col('create_fecha', 'fecha', 'fecha_muestra', 'datetime')
         if mcol and vname and (vnum or vtxt):
             m = lab[mcol].astype(str).str.lower().str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('ascii')
-            desc = lab.loc[m.str.contains('descube', na=False)].copy()
-            if not desc.empty:
-                # Take first occurrence like legacy
-                if 'create_fecha' in lab.columns or 'fecha' in lab.columns:
-                    # optional sort by time if present
-                    dtc = 'create_fecha' if 'create_fecha' in lab.columns else 'fecha'
-                    desc['_dt_'] = pd.to_datetime(desc[dtc], errors='coerce')
-                    desc = desc.sort_values('_dt_')
-                desc = desc.head(1)
+            desc_all = lab.loc[m.str.contains('descube', na=False)].copy()
+            if not desc_all.empty:
+                # If there's a datetime column, keep only the latest 'descube' batch
+                if dcol:
+                    desc_all['_dt_'] = pd.to_datetime(desc_all[dcol], errors='coerce')
+                    max_dt = desc_all['_dt_'].max()
+                    if pd.notna(max_dt):
+                        desc = desc_all.loc[desc_all['_dt_'] == max_dt]
+                    else:
+                        desc = desc_all
+                else:
+                    desc = desc_all
                 # Map spanish names to canonical
                 def _norm(s: str) -> str:
                     s = (s or '').strip().lower()
@@ -263,22 +392,29 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
                         s = s.replace(a,b)
                     s = s.replace('-', ' ')
                     return ' '.join(s.split())
-                MAP = {
-                    'yan': 'YAN', 'alcohol': 'Ethanol', 'ethanol': 'Ethanol',
-                    'glucosa': 'Glucose', 'glucose': 'Glucose', 'fructosa': 'Fructose', 'fructose': 'Fructose'
-                }
                 vals: Dict[str, float] = {}
+                # Track if Ethanol came as 'alcohol' (% v/v) to force conversion
+                ethanol_is_alcohol_flag = False
                 for _, r in desc.iterrows():
-                    nm = MAP.get(_norm(str(r[vname])), None)
+                    vlabel_norm = _norm(str(r[vname]))
+                    nm = None
+                    if any(tok in vlabel_norm for tok in ("alcohol","ethanol")):
+                        nm = 'Ethanol'
+                    elif any(tok in vlabel_norm for tok in ("glucosa","glucose")):
+                        nm = 'Glucose'
+                    elif any(tok in vlabel_norm for tok in ("fructosa","fructose")):
+                        nm = 'Fructose'
+                    elif 'yan' in vlabel_norm:
+                        nm = 'YAN'
                     if not nm:
                         continue
                     val = None
-                    if vnum and pd.notna(r.get(vnum)):
+                    if vnum and (vnum in r) and pd.notna(r[vnum]):
                         try:
                             val = float(r[vnum])
                         except Exception:
                             val = None
-                    if val is None and vtxt and pd.notna(r.get(vtxt)):
+                    if val is None and vtxt and (vtxt in r) and pd.notna(r[vtxt]):
                         import re
                         s = str(r[vtxt]).replace(',', '.')
                         m0 = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
@@ -290,20 +426,32 @@ def build_mats_for_assay_2024(assay_id: str, temps_dir: str = 'Datos Experimenta
                     if val is None:
                         continue
                     vals[nm] = float(val)
+                    if nm == 'Ethanol' and ('alcohol' in vlabel_norm):
+                        ethanol_is_alcohol_flag = True
                 if vals:
-                    # Write to last grid row; convert Alcohol% to Ethanol g/L if needed
+                    # Write to last grid row (descube cierre); overwrite to ensure correct units
                     i_last = len(mat) - 1
-                    if 'Ethanol' in vals and mat.loc[i_last, 'Ethanol'] != mat.loc[i_last, 'Ethanol']:
-                        # assume % v/v
-                        mat.loc[i_last, 'Ethanol'] = max(0.0, float(vals['Ethanol'])) * ETHANOL_DENSITY_G_ML * 10.0
+                    # Ethanol: if came as 'alcohol' treat as % v/v; handle fraction case
+                    if 'Ethanol' in vals:
+                        e_val = float(vals['Ethanol'])
+                        # Heuristics: convert to g/L if value looks like fraction (<=1.1) or percent (<=40),
+                        # regardless of label; if explicitly from 'alcohol', definitely convert.
+                        if ethanol_is_alcohol_flag or (e_val <= 1.1) or (e_val <= 40.0):
+                            if e_val <= 1.1:
+                                e_val *= 100.0  # fraction -> percent
+                            e_gl = max(0.0, e_val) * ETHANOL_DENSITY_G_ML * 10.0
+                        else:
+                            # assume already in g/L
+                            e_gl = max(0.0, e_val)
+                        mat.loc[i_last, 'Ethanol'] = e_gl
                     for k in ('YAN','Glucose','Fructose'):
-                        if k in vals and mat.loc[i_last, k] != mat.loc[i_last, k]:
+                        if k in vals:
                             mat.loc[i_last, k] = float(vals[k])
     except Exception:
         pass
 
     # Canonical column order (includes Densidad as in legacy examples)
-    cols = ['time_h', 'biomass_viable_gL', 'YAN', 'Glucose', 'Fructose', 'Ethanol', 'Temperature_C', 'Densidad']
+    cols = ['time_h', 'biomass_viable_gL', 'YAN', 'Glucose', 'Fructose', 'Ethanol', 'SugarTotal_exp', 'Temperature_C', 'Densidad']
     # Keep any extra columns at the end
     front = [c for c in cols if c in mat.columns]
     rest = [c for c in mat.columns if c not in front]

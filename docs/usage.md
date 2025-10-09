@@ -55,6 +55,24 @@ Flujos principales
 
    (Próxima versión: `python -m src.sb_calibration.cli.calibrate_cli --config configs/calibrate_dev.yaml`)
 
+Balance de la función objetivo (SSE)
+------------------------------------
+
+La SSE ahora soporta modos de balance para evitar que ensayos con más puntos dominen el ajuste.
+
+- --sse-balance: per_assay (por defecto), per_point o none
+   - per_assay: promedia la pérdida por variable dentro de cada ensayo; todos los ensayos pesan parecido.
+   - per_point: suma las pérdidas por punto (histórico por defecto en legacy).
+   - none: suma cruda de errores (no recomendado si hay distinta densidad temporal entre ensayos).
+
+- --sse-resample-dt-h: submuestreo temporal opcional (en horas) antes de calcular la SSE para igualar densidades temporales; p.ej. 6.0.
+
+Ejemplos (PowerShell):
+
+```powershell
+python -m src.sb_calibration.cli.calibrate_cli --file "Procesos_I+D_2025_3.xlsx" --sse-balance per_assay --sse-resample-dt-h 6.0 --plot --verbose
+```
+
 4) Validación
 
    - Tras calibrar, ejecutar validación opcional (se muestra desde el script principal).

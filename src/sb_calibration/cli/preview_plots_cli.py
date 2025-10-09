@@ -73,7 +73,18 @@ def main():
     if args.temps_dir:
         import sb_calibration.preprocess.calibration_preprocess as cpp
         cpp.TEMPS_DIR = args.temps_dir
-    results_dict, _ = pp_process_all(args.file, assays=assays)
+    # If --file es un CSV de metadata, intenta usar el Excel BDD por defecto para SBxxx
+    bdd_file = args.file
+    if str(args.file).lower().endswith('.csv'):
+        default_bdd = "Procesos_I+D_2025_3.xlsx"
+        if os.path.exists(default_bdd):
+            if args.verbose:
+                print(f"[INFO] Metadata CSV detectado. Usando BDD='{default_bdd}' para SBxxx y Data <ID>.xlsx para 24xxx")
+            bdd_file = default_bdd
+        else:
+            if args.verbose:
+                print("[WARN] Metadata CSV detectado pero no se encontró el Excel BDD por defecto. Intentando continuar con CSV (puede no incluir SBxxx)")
+    results_dict, _ = pp_process_all(bdd_file, assays=assays)
     results_T = pp_attach_T(results_dict)
     mats = pp_build_mats(results_T, use_smoothed_biomass=False)
 
@@ -117,24 +128,34 @@ def main():
                     if args.verbose:
                         print(f"[2024] no se pudo construir/cargar {code}: {e}")
 
-    # choose parameters (p0 or pbest)
-    p = None
-    if args.use_best and os.path.exists(args.checkpoint):
-        try:
-            data = np.load(args.checkpoint)
-            p = data.get("pbest")
-        except Exception:
-            p = None
-    if p is None:
-        # fallback to parameters from excel if available; else ones
-        try:
-            p = load_parameters_from_excel(args.p0_excel, param_set=args.p0_set)
-            if args.verbose:
-                print(f"[P0] cargado desde {args.p0_excel} (set={args.p0_set})")
-        except Exception:
-            p = np.ones(14, dtype=float)
-            if args.verbose:
-                print("[P0] usando vector de unos (14)")
+    # choose parameters (p0 or pbest) with robust checkpoint loading
+    def _load_params():
+        src = None
+        parr = None
+        # Prefer checkpoint if requested
+        if args.use_best and os.path.exists(args.checkpoint):
+            try:
+                data = np.load(args.checkpoint)
+                parr = data.get("pbest")
+                if parr is None:
+                    # backward compatibility with older checkpoints
+                    parr = data.get("p") or data.get("params")
+                if parr is not None:
+                    src = f"checkpoint:{args.checkpoint}"
+            except Exception as e:
+                parr = None
+        # Fallback to Excel (required if no checkpoint or checkpoint invalid)
+        if parr is None:
+            parr = load_parameters_from_excel(args.p0_excel, param_set=args.p0_set)
+            src = f"excel:{args.p0_excel}[set={args.p0_set}]"
+        return parr, src
+
+    try:
+        p, p_src = _load_params()
+    except Exception as e:
+        raise RuntimeError(f"No se pudieron cargar parámetros ni desde checkpoint ni desde Excel: {e}")
+    if args.verbose:
+        print(f"[PARAMS] source={p_src}")
 
     # build pulses from chem-file; fallback to CSV
     pulses_by_assay = {}
@@ -209,27 +230,88 @@ def main():
         atol_vec = np.array([args.atol_x, args.atol_n, args.atol_g, args.atol_f, args.atol_e], dtype=float)
         return simulate_on_grid(p_real, t_meas, temp_segs, pulses, x0, method=args.method, rtol=args.rtol, atol_vec=atol_vec, jacobian=args.jacobian, verbose=args.verbose)
 
+    # Helper: derive X0 with sugar-from-density fallback for 24xxx (or any mat with Densidad)
+    def _derive_x0_with_density(code, df) -> np.ndarray:
+        import numpy as _np
+        # First valid values across the series (not strictly the first row)
+        def first_valid(col):
+            try:
+                s = _np.asarray(pd.to_numeric(df[col], errors="coerce"), dtype=float)
+                idx = _np.where(_np.isfinite(s))[0]
+                return float(s[idx[0]]) if idx.size > 0 else _np.nan
+            except Exception:
+                return _np.nan
+        # X
+        try:
+            import pandas as pd  # local to avoid global import issues
+        except Exception:
+            pd = None
+        X0 = first_valid("biomass_viable_gL") if pd is not None else _np.nan
+        N0_mgL = first_valid("YAN") if pd is not None else _np.nan
+        G0 = first_valid("Glucose") if pd is not None else _np.nan
+        F0 = first_valid("Fructose") if pd is not None else _np.nan
+        E0 = first_valid("Ethanol") if pd is not None else _np.nan
+        # Convert YAN to g/L
+        N0 = (N0_mgL * 1e-3) if _np.isfinite(N0_mgL) else _np.nan
+        # If G/F missing or clearly zero while density exists, estimate total sugar from density and split 50/50
+        need_split = (not _np.isfinite(G0)) or (not _np.isfinite(F0)) or ((G0 + F0) <= 0)
+        is_numeric_assay = str(code).isdigit()
+        # IMPORTANT: For numeric 24xxx, Ethanol initial must start at 0.0 unless an explicit near-t0 lab value exists.
+        # Since 24xxx only inject a final lab E, the first_valid(E) is actually the final value. Force E0=0.0.
+        if is_numeric_assay:
+            E0 = 0.0
+        if pd is not None and "Densidad" in df.columns:
+            try:
+                dens = pd.to_numeric(df["Densidad"], errors="coerce").to_numpy(dtype=float)
+                t = pd.to_numeric(df.get("time_h", _np.arange(len(dens))), errors="coerce").to_numpy(dtype=float)
+                m = _np.isfinite(dens)
+                if m.any():
+                    # take earliest valid density
+                    j = int(_np.where(m)[0][0])
+                    d0 = float(dens[j])
+                    # load sugar-density dataset and fit cubic model globally
+                    import os as _os
+                    import pandas as _pd
+                    ds_path = _os.path.join("sugar_density_out", "sugar_density_dataset.csv")
+                    S0 = _np.nan
+                    if _os.path.exists(ds_path):
+                        dsd = _pd.read_csv(ds_path)
+                        if ("density" in dsd.columns) and ("total_sugar" in dsd.columns):
+                            den_global = _np.asarray(dsd["density"], dtype=float)
+                            sug_global = _np.asarray(dsd["total_sugar"], dtype=float)
+                            mg = _np.isfinite(den_global) & _np.isfinite(sug_global)
+                            if mg.any():
+                                coef = _np.polyfit(den_global[mg], sug_global[mg], deg=3)
+                                S0 = float(_np.polyval(coef, d0))
+                    if _np.isfinite(S0) and S0 > 0:
+                        # Apply override as follows:
+                        # - For numeric 24xxx assays: if missing OR if mismatch >5%, override to 50/50
+                        # - For SBxxx (non-numeric): only override when missing/zero (do NOT override measured values by mismatch)
+                        mismatch = (_np.isfinite(G0) and _np.isfinite(F0)) and (abs((G0+F0) - S0) / max(S0, 1e-12) > 0.05)
+                        if need_split or (is_numeric_assay and mismatch):
+                            G0 = S0 * 0.5
+                            F0 = S0 * 0.5
+            except Exception:
+                pass
+        # Fallbacks with DEFAULT_X0
+        x0_vec = _np.array([
+            X0 if _np.isfinite(X0) and X0 >= 0 else DEFAULT_X0[0],
+            N0 if _np.isfinite(N0) and N0 >= 0 else DEFAULT_X0[1],
+            G0 if _np.isfinite(G0) and G0 >= 0 else DEFAULT_X0[2],
+            F0 if _np.isfinite(F0) and F0 >= 0 else DEFAULT_X0[3],
+            E0 if _np.isfinite(E0) and E0 >= 0 else DEFAULT_X0[4],
+        ], dtype=float)
+        return x0_vec
+
     os.makedirs(args.outdir, exist_ok=True)
     count = 0
     for code, df in mats.items():
         out = os.path.join(args.outdir, f"{code}.png")
         pulses = pulses_by_assay.get(code)
-        # Build x0 from first experimental row when possible
+        # Build x0: first-valid strategy + sugar-from-density 50/50 split if needed
         try:
-            t0_row = df.iloc[0]
-            X0 = float(t0_row.get("biomass_viable_gL", np.nan))
-            N0_mgL = float(t0_row.get("YAN", np.nan))
-            G0 = float(t0_row.get("Glucose", np.nan))
-            F0 = float(t0_row.get("Fructose", np.nan))
-            E0 = float(t0_row.get("Ethanol", np.nan))
-            N0 = (N0_mgL * 1e-3) if np.isfinite(N0_mgL) else np.nan  # mg/L -> g/L
-            x0_vec = np.array([
-                X0 if np.isfinite(X0) else DEFAULT_X0[0],
-                N0 if np.isfinite(N0) else DEFAULT_X0[1],
-                G0 if np.isfinite(G0) else DEFAULT_X0[2],
-                F0 if np.isfinite(F0) else DEFAULT_X0[3],
-                E0 if np.isfinite(E0) else DEFAULT_X0[4],
-            ], dtype=float)
+            import pandas as pd  # ensure pandas available locally
+            x0_vec = _derive_x0_with_density(code, df)
         except Exception:
             x0_vec = DEFAULT_X0
         try:
