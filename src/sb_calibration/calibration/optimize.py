@@ -65,10 +65,16 @@ def calibrate_full(mats: Dict[str, Any],
                     de_maxiter: int = 60,
                     de_popsize: int = 12,
                     de_tol: float = 1e-6,
-                    sim_progress: bool = False) -> Tup[np.ndarray, float, Dict[str, Any]]:
+                    sim_progress: bool = False,
+                    # new objective options
+                    sugar_depletion_penalty_w: float = 0.0,
+                    sugar_threshold: float = 1.0,
+                    yan_offset_mgl: float = 20.0) -> Tup[np.ndarray, float, Dict[str, Any]]:
     """Port of the legacy calibrator with limited defaults for fast unit tests.
 
     The function expects a callable `simulate_fn(p_real, t_meas, temp_segments, pulses, x0)`.
+    New options (sugar_depletion_penalty_w, sugar_threshold, yan_offset_mgl) are forwarded to
+    the objective to penalize early/late sugar depletion and to apply a YAN offset correction.
     """
     real_from_z, z_from_real, z_bounds, s = make_internal_transform(p0_real, bounds_real)
     z0 = np.clip(z_from_real(p0_real), [b[0] for b in z_bounds], [b[1] for b in z_bounds])
@@ -141,7 +147,10 @@ def calibrate_full(mats: Dict[str, Any],
         sse = objective.sse_for_experiments_real(
             p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False,
             simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h,
-            sim_progress=sim_progress
+            sim_progress=sim_progress,
+            sugar_depletion_penalty_w=sugar_depletion_penalty_w,
+            sugar_threshold=sugar_threshold,
+            yan_offset_mgl=yan_offset_mgl
         )
         prog.mark_eval(sse, every=eval_print_every)
         if sse < (1.0 - min_improvement_rel) * best_sse_seen:
@@ -231,7 +240,14 @@ def calibrate_full(mats: Dict[str, Any],
     elif mode == "de":
         def obj_z_de(z):
             p = real_from_z(z)
-            sse = objective.sse_for_experiments_real(p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False, simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h, sim_progress=False)
+            sse = objective.sse_for_experiments_real(
+                p, mats, pulses_by_assay, x0_by_assay, weights, stds, verbose=False,
+                simulate_fn=simulate_fn, balance=sse_balance, resample_dt_h=sse_resample_dt_h,
+                sim_progress=False,
+                sugar_depletion_penalty_w=sugar_depletion_penalty_w,
+                sugar_threshold=sugar_threshold,
+                yan_offset_mgl=yan_offset_mgl
+            )
             prog.mark_eval(sse, every=eval_print_every)
             return sse
 

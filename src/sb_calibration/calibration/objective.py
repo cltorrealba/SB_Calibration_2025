@@ -58,7 +58,11 @@ def sse_for_experiments_real(p_real: np.ndarray,
                              simulate_fn=None,
                              balance: str = "per_assay",
                              resample_dt_h: Optional[float] = None,
-                             sim_progress: bool = False) -> float:
+                             sim_progress: bool = False,
+                             # New options
+                             sugar_depletion_penalty_w: float = 0.0,
+                             sugar_threshold: float = 1.0,
+                             yan_offset_mgl: float = 20.0) -> float:
     """Compute normalized SSE across multiple assays.
 
     This is a lightweight port of the legacy function. The caller should pass
@@ -137,9 +141,15 @@ def sse_for_experiments_real(p_real: np.ndarray,
                 per = _series_loss(X_interp[:, 0], y, stds.get("X", 1.0), weights.get("X", 1.0))
             if per is not None:
                 per_var_losses.append(per)
-        # N
+        # N (apply offset in mg/L then convert to g/L)
         if "YAN" in df.columns:
-            y = pd_to_numeric_safe(df["YAN"]).astype(float) * N_SCALE
+            y_mgl = pd_to_numeric_safe(df["YAN"]).astype(float)
+            if np.isfinite(yan_offset_mgl) and yan_offset_mgl != 0.0:
+                try:
+                    y_mgl = np.maximum(0.0, y_mgl - float(yan_offset_mgl))
+                except Exception:
+                    y_mgl = np.maximum(0.0, y_mgl)
+            y = y_mgl * N_SCALE
             if resample_dt_h:
                 t_rs, y_rs = _maybe_resample(t_meas, y)
                 sim_rs = np.interp(t_rs, t_sim, Xsim[:, 1])
@@ -192,6 +202,39 @@ def sse_for_experiments_real(p_real: np.ndarray,
                 per = _series_loss(X_interp[:, 2] + X_interp[:, 3], y, stds.get("S", 1.0), weights.get("S", 1.0))
             if per is not None:
                 per_var_losses.append(per)
+
+        # Optional sugar-depletion timing penalty
+        if sugar_depletion_penalty_w and sugar_depletion_penalty_w > 0.0:
+            try:
+                # Simulated sugar total and time of depletion (threshold crossing)
+                S_sim = Xsim[:, 2] + Xsim[:, 3]
+                idx_sim = np.where(S_sim <= float(sugar_threshold))[0]
+                if idx_sim.size > 0:
+                    t_zero_sim = float(t_sim[int(idx_sim[0])])
+                else:
+                    # no depletion within window; set beyond last time to penalize late depletion
+                    t_zero_sim = float(np.nanmax(t_sim)) * 1.25
+                # Target time from measurements: prefer SugarTotal_exp, else Glucose+Fructose, else last time
+                if "SugarTotal_exp" in df.columns:
+                    S_meas = df["SugarTotal_exp"].astype(float).to_numpy()
+                elif ("Glucose" in df.columns) and ("Fructose" in df.columns):
+                    S_meas = (df["Glucose"].astype(float) + df["Fructose"].astype(float)).to_numpy()
+                else:
+                    S_meas = None
+                if S_meas is not None:
+                    idx_meas = np.where(np.isfinite(S_meas) & (S_meas <= float(sugar_threshold)))[0]
+                    if idx_meas.size > 0:
+                        t_target = float(t_meas[int(idx_meas[0])])
+                    else:
+                        t_target = float(np.nanmax(t_meas))
+                else:
+                    t_target = float(np.nanmax(t_meas))
+                if np.isfinite(t_target) and t_target > 0:
+                    dt_norm = (t_target - t_zero_sim) / max(1.0, t_target)
+                    pen = float(dt_norm * dt_norm) * float(sugar_depletion_penalty_w)
+                    per_var_losses.append(pen)
+            except Exception:
+                pass
 
         if not per_var_losses:
             continue

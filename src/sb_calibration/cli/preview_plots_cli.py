@@ -50,6 +50,8 @@ def main():
     p.add_argument("--checkpoint", default="mats/pbest_checkpoint.npz", help="Ruta al checkpoint con pbest")
     p.add_argument("--p0-excel", default="zenteno_parameters.xlsx", help="Excel con parámetros base (por defecto: zenteno_parameters.xlsx)")
     p.add_argument("--p0-set", type=int, default=3, help="Set de parámetros a usar desde --p0-excel (por defecto: 3)")
+    p.add_argument("--yan-offset-mgl", type=float, default=20.0, help="Restar este offset (mg/L) a YAN para graficar (>=0)")
+    p.add_argument("--ignore-lag-param", action="store_true", help="Si el checkpoint trae 15 parámetros, descartar el último (lag_tau_h) y usar el valor por defecto para lag en el simulador")
     p.add_argument("--chem-file", default=None, help="Archivo de química (Excel/CSV) para inferir pulsos de YAN")
     p.add_argument("--pulses-csv", default=os.path.join("mats","pulses_YAN.csv"), help="CSV de pulsos si no hay planilla de química (assay,time_h,dN_gL)")
     p.add_argument("--outdir", default="mats/preview", help="Carpeta de salida para los plots")
@@ -141,6 +143,8 @@ def main():
                     # backward compatibility with older checkpoints
                     parr = data.get("p") or data.get("params")
                 if parr is not None:
+                    if args.ignore_lag_param and len(parr) >= 15:
+                        parr = parr[:14]
                     src = f"checkpoint:{args.checkpoint}"
             except Exception as e:
                 parr = None
@@ -228,7 +232,15 @@ def main():
     def sim_wrapped(p_real, t_meas, temp_segs, pulses, x0):
         from types import SimpleNamespace
         atol_vec = np.array([args.atol_x, args.atol_n, args.atol_g, args.atol_f, args.atol_e], dtype=float)
-        return simulate_on_grid(p_real, t_meas, temp_segs, pulses, x0, method=args.method, rtol=args.rtol, atol_vec=atol_vec, jacobian=args.jacobian, verbose=args.verbose)
+        # Read lag options via env (optional) for preview runs
+        lag_mode = os.environ.get("SB_LAG_MODE", "none")
+        try:
+            lag_tau_h = float(os.environ.get("SB_LAG_TAU_H", "12.0"))
+            lag_sens = float(os.environ.get("SB_LAG_SENS", "0.06"))
+            lag_floor = float(os.environ.get("SB_LAG_FLOOR", "0.0"))
+        except Exception:
+            lag_tau_h, lag_sens, lag_floor = 12.0, 0.06, 0.0
+        return simulate_on_grid(p_real, t_meas, temp_segs, pulses, x0, method=args.method, rtol=args.rtol, atol_vec=atol_vec, jacobian=args.jacobian, verbose=args.verbose, lag_mode=lag_mode, lag_tau_h=lag_tau_h, lag_sensitivity=lag_sens, lag_floor=lag_floor)
 
     # Helper: derive X0 with sugar-from-density fallback for 24xxx (or any mat with Densidad)
     def _derive_x0_with_density(code, df) -> np.ndarray:
@@ -252,7 +264,15 @@ def main():
         F0 = first_valid("Fructose") if pd is not None else _np.nan
         E0 = first_valid("Ethanol") if pd is not None else _np.nan
         # Convert YAN to g/L
-        N0 = (N0_mgL * 1e-3) if _np.isfinite(N0_mgL) else _np.nan
+        try:
+            yoff = float(args.yan_offset_mgl)
+        except Exception:
+            yoff = 0.0
+        if _np.isfinite(N0_mgL):
+            N0_corr_mgL = max(0.0, float(N0_mgL) - yoff)
+            N0 = N0_corr_mgL * 1e-3
+        else:
+            N0 = _np.nan
         # If G/F missing or clearly zero while density exists, estimate total sugar from density and split 50/50
         need_split = (not _np.isfinite(G0)) or (not _np.isfinite(F0)) or ((G0 + F0) <= 0)
         is_numeric_assay = str(code).isdigit()
@@ -315,7 +335,17 @@ def main():
         except Exception:
             x0_vec = DEFAULT_X0
         try:
-            plot_fit_for_assay(code, df, p, sim_wrapped, pulses=pulses, x0=x0_vec, out_path=out)
+            # Optional YAN correction for plotting
+            df_plot = df
+            try:
+                if args.yan_offset_mgl and (args.yan_offset_mgl != 0.0) and ("YAN" in df.columns):
+                    import pandas as pd
+                    df_plot = df.copy()
+                    yan = pd.to_numeric(df_plot["YAN"], errors="coerce").astype(float)
+                    df_plot["YAN"] = np.maximum(0.0, yan - float(args.yan_offset_mgl))
+            except Exception:
+                df_plot = df
+            plot_fit_for_assay(code, df_plot, p, sim_wrapped, pulses=pulses, x0=x0_vec, out_path=out)
             count += 1
             if args.verbose:
                 print(f"[PLOT] {out}")

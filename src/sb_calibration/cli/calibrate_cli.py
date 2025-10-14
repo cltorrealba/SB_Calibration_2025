@@ -113,6 +113,15 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
                     de_maxiter: int | None = None,
                     de_popsize: int | None = None,
                     de_tol: float | None = None,
+                    # Objective extras
+                    sugar_depletion_penalty_w: float = 0.0,
+                    sugar_threshold: float = 1.0,
+                    yan_offset_mgl: float = 20.0,
+                    # Lag-phase controls
+                    lag_mode: str = "none",
+                    lag_tau_h: float = 12.0,
+                    lag_sensitivity: float = 0.06,
+                    lag_floor: float = 0.0,
                     # Optional bounds overrides for yields
                     yxg_lb: float | None = None,
                     yxg_ub: float | None = None,
@@ -300,13 +309,23 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
     try:
         src_excel = p0_excel or "zenteno_parameters.xlsx"
         p0 = load_parameters_from_excel(src_excel, param_set=p0_set)
+        # Append lag_tau_h default (12 h) if not present in Excel p0 (older sheets)
+        try:
+            p0_arr = np.asarray(p0, dtype=float).ravel()
+            if p0_arr.size < 15:
+                p0_arr = np.concatenate([p0_arr, np.array([12.0], dtype=float)])  # lag_tau_h default
+            if p0_arr.size < 16:
+                p0_arr = np.concatenate([p0_arr, np.array([0.06], dtype=float)])  # lag_sensitivity default
+            p0 = p0_arr
+        except Exception:
+            p0 = np.asarray(p0, dtype=float)
         if verbose:
             print(f"[P0] loaded from {src_excel} (set={p0_set})")
     except Exception as e:
         raise RuntimeError(f"No se pudo cargar p0 desde Excel ({src_excel}, set={p0_set}). Corrige la ruta o set. Detalle: {e}")
     # Physical-ish bounds per parameter (order must match zenteno_model unpacking):
     # 1) mu0, 2) betaG0, 3) betaF0, 4) Kn0, 5) Kg0, 6) Kf0, 7) Kig0, 8) Kie0, 9) Kd0,
-    # 10) Yxn, 11) Yxg, 12) Yxf, 13) Yeg, 14) Yef
+    # 10) Yxn, 11) Yxg, 12) Yxf, 13) Yeg, 14) Yef, 15) lag_tau_h (h@20°C), 16) lag_sensitivity
     bounds = [
         (1e-4, 2.0),   # mu0
         (1e-6, 2.0),   # betaG0
@@ -322,6 +341,8 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
         (0.05, 10.0),  # Yxf
         (0.05, 20.0),  # Yeg
         (0.05, 20.0),  # Yef
+        (2.0, 96.0),   # lag_tau_h (hours)
+        (0.0, 0.25),   # lag_sensitivity
     ]
     # Apply optional overrides to yields bounds
     def _apply_override(idx: int, lb: float | None, ub: float | None):
@@ -342,7 +363,11 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
         cfg.local_maxiter = 20
     # wrap simulate_on_grid with tolerances
     def sim_wrapped(p, t_meas, temp_segs, pulses, x0):
-        return simulate_on_grid(p, t_meas, temp_segs, pulses, x0, method=method, rtol=cfg.rtol, atol_vec=cfg.atol_vec(), jacobian=jacobian, verbose=verbose)
+        return simulate_on_grid(
+            p, t_meas, temp_segs, pulses, x0,
+            method=method, rtol=cfg.rtol, atol_vec=cfg.atol_vec(), jacobian=jacobian, verbose=verbose,
+            lag_mode=lag_mode, lag_tau_h=lag_tau_h, lag_sensitivity=lag_sensitivity, lag_floor=lag_floor
+        )
 
     # Helper: derive X0 with sugar-from-density fallback for 24xxx (or any mat with Densidad)
     def _derive_x0_with_density(code, df) -> np.ndarray:
@@ -478,6 +503,10 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
             de_popsize=(de_popsize if de_popsize is not None else 12),
             de_tol=(de_tol if de_tol is not None else 1e-6),
             sim_progress=bool(sim_progress) if sim_progress is not None else False,
+            # new objective options
+            sugar_depletion_penalty_w=sugar_depletion_penalty_w,
+            sugar_threshold=sugar_threshold,
+            yan_offset_mgl=yan_offset_mgl,
         )
     if verbose and plot_from is None:
         print(f"[RESULT] SSE={score:.4e}  out={out_path}")
@@ -527,6 +556,11 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
                 "eval_print_every": (eval_print_every if eval_print_every is not None else 50),
                 "iter_print_every": (iter_print_every if iter_print_every is not None else 0),
                 "sim_progress": bool(sim_progress) if sim_progress is not None else False,
+                # extras
+                "sugar_penalty": sugar_depletion_penalty_w,
+                "sugar_threshold": sugar_threshold,
+                "yan_offset_mgl": yan_offset_mgl,
+                "lag": {"mode": lag_mode, "tau_h": lag_tau_h, "sensitivity": lag_sensitivity, "floor": lag_floor},
             }
             # data context
             assays_list = sorted([str(k) for k in (mats or {}).keys()])
@@ -558,7 +592,7 @@ def run_calibration(mats=None, out_path: str = "mats/pbest_checkpoint.npz", cfg:
             # parameter names in the expected order
             param_names = [
                 "mu0","betaG0","betaF0","Kn0","Kg0","Kf0","Kig0","Kie0",
-                "Kd0","Yxn","Yxg","Yxf","Yeg","Yef"
+                "Kd0","Yxn","Yxg","Yxf","Yeg","Yef","lag_tau_h","lag_sensitivity"
             ]
 
             # result section
@@ -704,6 +738,14 @@ if __name__ == "__main__":
     parser.add_argument("--lb-yxn", type=float, default=None, help="Override lower bound for Yxn (biomass yield on nitrogen)")
     parser.add_argument("--ub-yxn", type=float, default=None, help="Override upper bound for Yxn (biomass yield on nitrogen)")
     parser.add_argument("--sim-progress", action="store_true", help="Imprimir [SIM] OK por ensayo tras cada simulación (más verboso)")
+    # New objective/lag options
+    parser.add_argument("--sugar-penalty", type=float, default=0.0, help="Peso de penalización por depleción temprana/tardía de azúcar (0=off)")
+    parser.add_argument("--sugar-threshold", type=float, default=1.0, help="Umbral de azúcar total (g/L) para definir 'todo consumido'")
+    parser.add_argument("--yan-offset-mgl", type=float, default=20.0, help="Offset a restar a YAN medido (mg/L); truncado a 0 (default: 20 mg/L)")
+    parser.add_argument("--lag-mode", default="none", choices=["none","exp","logistic"], help="Modo de fase lag inicial")
+    parser.add_argument("--lag-tau-h", type=float, default=12.0, help="Escala base de tiempo de lag (h) a 20°C")
+    parser.add_argument("--lag-sensitivity", type=float, default=0.06, help="Sensibilidad de lag a temperatura (exp(s*(20-Tc)))")
+    parser.add_argument("--lag-floor", type=float, default=0.0, help="Mínimo multiplicador de reacción durante lag (0..1)")
     args = parser.parse_args()
     cfg = CalibrationConfig(
         mode=args.mode,
@@ -742,4 +784,48 @@ if __name__ == "__main__":
     if getattr(args, 'no_summary', False):
         write_summary_effective = False
 
-    run_calibration(None, out_path=args.out, cfg=cfg, file_path=args.file, assays=assays, temps_dir=args.temps_dir, use_smoothed_biomass=args.use_smoothed_biomass, method=args.method, jacobian=args.jacobian, exclude=exclude, chem_file=args.chem_file, weights=weights, plot=args.plot, plots_dir=args.plots_dir, plot_from=args.plot_from, write_summary=write_summary_effective, summary_out=args.summary_out, split=args.split, split_file=args.split_file, cache_2024=(not args.no_cache_2024), preview_p0_before=args.preview_p0_before, p0_excel=args.p0_excel, p0_set=args.p0_set, pulses_csv_path=args.pulses_csv, verbose=args.verbose, eval_print_every=args.eval_print_every, iter_print_every=args.iter_print_every, de_maxiter=args.de_maxiter, de_popsize=args.de_popsize, de_tol=args.de_tol, yxg_lb=args.lb_yxg, yxg_ub=args.ub_yxg, yxf_lb=args.lb_yxf, yxf_ub=args.ub_yxf, yxn_lb=args.lb_yxn, yxn_ub=args.ub_yxn, sim_progress=args.sim_progress)
+    run_calibration(
+        None,
+        out_path=args.out,
+        cfg=cfg,
+        file_path=args.file,
+        assays=assays,
+        temps_dir=args.temps_dir,
+        use_smoothed_biomass=args.use_smoothed_biomass,
+        method=args.method,
+        jacobian=args.jacobian,
+        exclude=exclude,
+        chem_file=args.chem_file,
+        weights=weights,
+        plot=args.plot,
+        plots_dir=args.plots_dir,
+        plot_from=args.plot_from,
+        write_summary=write_summary_effective,
+        summary_out=args.summary_out,
+        split=args.split,
+        split_file=args.split_file,
+        cache_2024=(not args.no_cache_2024),
+        preview_p0_before=args.preview_p0_before,
+        p0_excel=args.p0_excel,
+        p0_set=args.p0_set,
+        pulses_csv_path=args.pulses_csv,
+        verbose=args.verbose,
+        eval_print_every=args.eval_print_every,
+        iter_print_every=args.iter_print_every,
+        de_maxiter=args.de_maxiter,
+        de_popsize=args.de_popsize,
+        de_tol=args.de_tol,
+        # new objective/lag options
+        sugar_depletion_penalty_w=args.sugar_penalty,
+        sugar_threshold=args.sugar_threshold,
+        yan_offset_mgl=args.yan_offset_mgl,
+        lag_mode=args.lag_mode,
+        lag_tau_h=args.lag_tau_h,
+        lag_sensitivity=args.lag_sensitivity,
+        lag_floor=args.lag_floor,
+        # bounds overrides
+        yxg_lb=args.lb_yxg, yxg_ub=args.ub_yxg,
+        yxf_lb=args.lb_yxf, yxf_ub=args.ub_yxf,
+        yxn_lb=args.lb_yxn, yxn_ub=args.ub_yxn,
+        sim_progress=args.sim_progress,
+    )
