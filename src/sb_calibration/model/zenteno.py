@@ -304,7 +304,12 @@ def simulate_on_grid(p_real,
                      rtol: float = 1e-6,
                      atol_vec=None,
                      jacobian: str = "analytic",
-                     verbose: bool = False):
+                     verbose: bool = False,
+                     # Lag-phase controls (optional)
+                     lag_mode: str = "none",  # "none" | "exp" | "logistic"
+                     lag_tau_h: float = 12.0,
+                     lag_sensitivity: float = 0.06,
+                     lag_floor: float = 0.0):
     """Lightweight simulate_on_grid adapter used by the calibrator.
 
     - `temp_segments` may be a DataFrame (with time_h and temp column) or a list of (t_h, T_C).
@@ -351,11 +356,64 @@ def simulate_on_grid(p_real,
     J_sparse = J_SPARSE
     ATOL_VEC = np.array([1e-3, 1e-2, 1e-2, 1e-2, 1e-3], dtype=float) if atol_vec is None else np.asarray(atol_vec, dtype=float)
 
+    # If p_real includes an extra parameter (index 14), interpret it as lag_tau_h to be estimated.
+    try:
+        p_arr = np.asarray(p_real, dtype=float).ravel()
+        if p_arr.size >= 15:
+            p_model = p_arr[:14]
+            lag_tau_est = float(p_arr[14])
+        else:
+            p_model = p_arr
+            lag_tau_est = float(lag_tau_h)
+        # Optional 16th param as lag_sensitivity estimate
+        if p_arr.size >= 16:
+            lag_sens_est = float(p_arr[15])
+        else:
+            lag_sens_est = float(lag_sensitivity)
+    except Exception:
+        p_model = p_real
+        lag_tau_est = float(lag_tau_h)
+        lag_sens_est = float(lag_sensitivity)
+
+    def _lag_multiplier(t):
+        if lag_mode is None or str(lag_mode).lower() == "none":
+            return 1.0
+        # temperature-dependent lag timescale (colder -> larger tau)
+        Tc = (T_of_t(t) - 273.15)
+        try:
+            tau = float(lag_tau_est) * np.exp(float(lag_sens_est) * (20.0 - float(Tc)))
+        except Exception:
+            tau = float(lag_tau_est)
+        tau = max(1e-6, float(tau))
+        tt = max(0.0, float(t))
+        if str(lag_mode).lower() == "exp":
+            # classic approach: m(t) = 1 - exp(-t/tau)
+            m = 1.0 - np.exp(-tt / tau)
+        else:
+            # logistic: m(t) = 1/(1+exp(-(t - tau)/ (tau/4)))  with mid at tau
+            k = 4.0 / tau
+            m = 1.0 / (1.0 + np.exp(-k * (tt - tau)))
+        if lag_floor is not None:
+            try:
+                m = max(float(lag_floor), float(m))
+            except Exception:
+                m = max(0.0, float(m))
+        return float(np.clip(m, 0.0, 1.0))
+
     def f_ivp(t, x):
-        return np.asarray(zenteno_model(t, x, u_of_t(t), p_real), dtype=float)
+        v = np.asarray(zenteno_model(t, x, u_of_t(t), p_model), dtype=float)
+        mlag = _lag_multiplier(t)
+        if mlag >= 0.999:
+            return v
+        # scale all reaction rates by lag multiplier (conservative and simple)
+        return v * mlag
 
     def j_ivp(t, x):
-        return np.asarray(zenteno_jacobian(t, x, u_of_t(t), p_real), dtype=float)
+        J = np.asarray(zenteno_jacobian(t, x, u_of_t(t), p_model), dtype=float)
+        mlag = _lag_multiplier(t)
+        if mlag >= 0.999:
+            return J
+        return J * mlag
 
     def make_jacobian_num(zenteno_model_fn, u_of_t_fn, p, h_c=1e-20, h_fd=1e-6):
         n = 5
