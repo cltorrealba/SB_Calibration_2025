@@ -1,0 +1,43 @@
+name: sb-calibration-2025
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python version
+  - python>=3.9,<3.13
+  
+  # Core scientific computing
+  - numpy>=1.26,<2.0
+  - pandas>=2.2,<2.3
+  - scipy>=1.10
+  - matplotlib>=3.7
+  
+  # File I/O and data handling
+  - openpyxl>=3.1.2,<3.2
+  - xlrd
+  
+  # Machine learning (for sklearn usage found in sugar_density.py)
+  - scikit-learn
+  
+  # Development tools
+  - ipython
+  - jupyter
+  - notebook
+  
+  # Optional but useful for data science
+  - seaborn
+  - plotly
+  
+  # Additional utilities
+  - pathlib
+  - typing_extensions
+  
+  # Pip packages (if any are not available in conda)
+  - pip
+  - pip:
+    # Add any pip-only packages here if needed
+    []
+
+# Environment creation instructions:
+# conda env create -f environment.yml
+# conda activate sb-calibration-2025
