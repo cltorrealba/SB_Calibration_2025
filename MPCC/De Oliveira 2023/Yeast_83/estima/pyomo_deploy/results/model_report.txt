@@ -1,0 +1,20 @@
+activated:
+    binary_variables: 0
+    constraints: 362496
+    continuous_variables: 268026
+    disjunctions: 0
+    disjuncts: 0
+    integer_variables: 0
+    nonlinear_constraints: 94609
+    variables: 268026
+overall:
+    binary_variables: 0
+    constraints: 362496
+    continuous_variables: 268026
+    disjunctions: 0
+    disjuncts: 0
+    integer_variables: 0
+    nonlinear_constraints: 94609
+    variables: 268026
+warning:
+    unassociated_disjuncts: 0
