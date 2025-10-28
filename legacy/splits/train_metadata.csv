@@ -1,0 +1,15 @@
+assay,year,T_bin,tnut,condition_id,batch_id,replicate_id,split
+24018,2024,med,30.0,CCD_T17_tnut30h,lot20240322,1,train
+24019,2024,med,30.0,CCD_T17_tnut30h,lot20240322,2,train
+24021,2024,med,30.0,CCD_T17_tnut30h,lot20240322,3,train
+24022,2024,med,30.0,CCD_T17_tnut30h,lot20240322,4,train
+24023,2024,med,30.0,CCD_T16_tnut30h,lot20240322,1,train
+24024,2024,med,18.0,CCD_T17_tnut18h,lot20240322,1,train
+24026,2024,low,30.0,CCD_T15_tnut30h,lot20240322,1,train
+24027,2024,low,24.0,CCD_T14_tnut24h,lot20240322,1,train
+24031,2024,high,30.0,CCD_T20_tnut30h,lot20240322,1,train
+SB004,2025,med,40.833333333333336,RICH_T19_A42h,lot20250313,1,train
+SB006,2025,med,40.833333333333336,RICH_T19_A42h,lot20250313,2,train
+SB009,2025,high,42.0,RICH_T21_A42h,lot20250408,3,train
+SB010,2025,high,42.0,RICH_T21_A42h,lot20250408,4,train
+SB011,2025,low,39.5,RICH_T16_A42h,lot20250421,1,train
