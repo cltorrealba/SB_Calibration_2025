@@ -406,6 +406,12 @@ def build_model(S, lb, ub, data3d, nfe=12, ncp=3, th=22.0, var_h=True):
                                      for i in mdl.I )
     m.OBJ = pyo.Objective(rule=_obj, sense=pyo.minimize)
 
+    # Expose key reaction indices on the model for audits/plots
+    m.idx_eth = eth
+    m.idx_obj = obj
+    m.idx_glu = glu
+    m.idx_xyl = xyl
+
     return m
 
 
@@ -462,6 +468,9 @@ def main():
     ap.add_argument("--timings", action="store_true", help="Enable Ipopt timing statistics and print user options")
     ap.add_argument("--lbfgs", action="store_true", help="Use limited-memory Hessian approximation")
     ap.add_argument("--max_wall_time", type=float, default=None, help="Ipopt max wall time in seconds")
+    # Audit options
+    ap.add_argument("--audit", action="store_true", help="After solve, compute uptake activity fractions and export series CSV")
+    ap.add_argument("--audit_tol", type=float, default=1e-6, help="Tolerance to deem uptake constraint active (|slack|<=tol)")
     args = ap.parse_args()
 
     # Load inputs
@@ -559,6 +568,78 @@ def main():
             print(f"[PLOT] Saved {out_png}")
     except Exception as e:
         print(f"[WARN] Plotting failed: {e}")
+
+    # ========= Post-solve audit: uptake activity, slacks, and series export =========
+    try:
+        if args.audit:
+            nfe = args.nfe
+            # FE end times: variable hv may vary if var_h; compute cumulative
+            hv_vals = [float(pyo.value(m.hv[i])) for i in range(1, nfe + 1)]
+            t_end = np.cumsum(hv_vals)
+
+            idx_glu = int(m.idx_glu)
+            idx_xyl = int(m.idx_xyl)
+            idx_obj = int(m.idx_obj)
+            idx_eth = int(m.idx_eth)
+
+            rows = []
+            active_g = 0
+            active_z = 0
+            abs_slack_g = []
+            abs_slack_z = []
+            for i in range(1, nfe + 1):
+                t_i = float(t_end[i - 1])
+                vg_i = float(pyo.value(m.vg[i]))
+                vz_i = float(pyo.value(m.vz[i]))
+                v_glu_i = float(pyo.value(m.v[idx_glu, i]))
+                v_xyl_i = float(pyo.value(m.v[idx_xyl, i]))
+                mu_i = float(pyo.value(m.v[idx_obj, i]))
+                qeth_i = float(pyo.value(m.v[idx_eth, i]))
+                # Slack definitions consistent with constraints: -v[glu]-vg <= 0, -v[xyl]-vz <= 0
+                slack_g = -v_glu_i - vg_i
+                slack_z = -v_xyl_i - vz_i
+                abs_slack_g.append(abs(slack_g))
+                abs_slack_z.append(abs(slack_z))
+                if abs(slack_g) <= args.audit_tol:
+                    active_g += 1
+                if abs(slack_z) <= args.audit_tol:
+                    active_z += 1
+                # Complementarity product variables
+                try:
+                    fou_g = float(pyo.value(m.FO_upt[1, i]))
+                    fou_z = float(pyo.value(m.FO_upt[2, i]))
+                except Exception:
+                    fou_g = float('nan')
+                    fou_z = float('nan')
+
+                rows.append({
+                    "time": t_i,
+                    "mu": mu_i,
+                    "q_eth": qeth_i,
+                    "vg": vg_i,
+                    "vz": vz_i,
+                    "v_glu": v_glu_i,
+                    "v_xyl": v_xyl_i,
+                    "slack_glu": slack_g,
+                    "slack_xyl": slack_z,
+                    "FO_upt_glu": fou_g,
+                    "FO_upt_xyl": fou_z,
+                })
+
+            frac_g = 100.0 * active_g / nfe if nfe > 0 else float('nan')
+            frac_z = 100.0 * active_z / nfe if nfe > 0 else float('nan')
+            print(f"\n=== Uptake activity audit ===")
+            print(f"Active uptake (glu): {active_g}/{nfe}  ({frac_g:.1f}%) with tol={args.audit_tol:g}")
+            print(f"Active uptake (xyl): {active_z}/{nfe}  ({frac_z:.1f}%) with tol={args.audit_tol:g}")
+            print(f"Mean |slack_glu|: {np.mean(abs_slack_g):.3e},  Median: {np.median(abs_slack_g):.3e}")
+            print(f"Mean |slack_xyl|: {np.mean(abs_slack_z):.3e},  Median: {np.median(abs_slack_z):.3e}")
+
+            df_audit = pd.DataFrame(rows)
+            out_csv = os.path.join(RESULTS_DIR, "audit_series.csv")
+            df_audit.to_csv(out_csv, index=False)
+            print(f"[AUDIT] Saved time series to {out_csv}")
+    except Exception as e:
+        print(f"[WARN] Audit failed: {e}")
 
 if __name__ == "__main__":
     main()
