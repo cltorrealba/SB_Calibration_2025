@@ -288,7 +288,7 @@ DEFAULT_X0 = np.array([0.5, 0.140, 110.0, 110.0, 0.0])
 
 
 if __name__ == "__main__":
-    p = load_parameters_from_excel("zenteno_parameters.xlsx", "Hoja1", param_set=4)
+    p = load_parameters_from_excel("zenteno_parameters.xlsx", "Hoja1", param_set=5)
 
     # Opción A (legacy): tres tramos iguales
     temps = [25.0, 20.0, 15.0]  # °C
@@ -297,14 +297,14 @@ if __name__ == "__main__":
     # Formato 1: (t_start, t_end, T_C)
     
     temp_segments = [
-        (00.0,  24,    21.0),   # 0-24 h a 25°C - MODIFICAR AQUI
-        (24.0,  21*24, 23.0),   # 24-96 h a 20°C - MODIFICAR AQUI
+        (00.0,  24,    20.0),   # 0-24 h a 25°C - MODIFICAR AQUI
+        (24.0,  10*24, 20.0),   # 24-96 h a 20°C - MODIFICAR AQUI
         # (224.0, 21*24, 17.0),   # 96-168 h a 15°C - MODIFICAR AQUI
     ]
     # Alternativamente, puedes usar el Formato 2: (t_change, T_C), p. ej.:
     # temp_segments = [(0.0, 25.0), (24.0, 20.0), (96.0, 15.0)]
-    T_NUT = 48
-    pulsos = [(0.0, 0.02), (T_NUT, 0.066)]    # (hora, g/L) - MODIFICAR AQUI
+    T_NUT = 0
+    pulsos = [(0.0, 0.00), (T_NUT, 0.000)]    # (hora, g/L) - MODIFICAR AQUI
 
     t_proc, t, x, T_profile, Nadd_profile = simulate_process_time(
         p, DEFAULT_X0, temps, pulsos, tf=21*24.0, n=None, threshold=2.0, temp_segments=temp_segments
