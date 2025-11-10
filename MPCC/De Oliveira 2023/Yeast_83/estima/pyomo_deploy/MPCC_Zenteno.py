@@ -936,6 +936,58 @@ def main():
             except Exception as e:
                 print(f"[WARN] Pre-solve projection failed or ran out of memory: {e}")
 
+        # Initialize KKT multipliers (alpha_L/alpha_U for bounds, lambda for S·v=0) to help Ipopt
+        try:
+            bndtol = 1e-7
+            alpha_seed = max(1e-6, float(pyo.value(m.stat_w)) * 1e-2)
+            # Precompute transpose once for lambda least-squares
+            ST = S.T  # (nv x nm)
+            for i in range(1, nfe_local + 1):
+                # Snapshot current v after warm-start/pre-solve
+                v_i = np.zeros(nv, dtype=float)
+                for k in range(1, nv + 1):
+                    try:
+                        v_i[k - 1] = float(pyo.value(m.v[k, i]))
+                    except Exception:
+                        v_i[k - 1] = 0.0
+                # Initialize alpha based on bound activity
+                alpha_L_i = np.zeros(nv, dtype=float)
+                alpha_U_i = np.zeros(nv, dtype=float)
+                for k in range(1, nv + 1):
+                    lb_k = float(pyo.value(m.vlb[k])); ub_k = float(pyo.value(m.vub[k]))
+                    vk = v_i[k - 1]
+                    if vk - lb_k <= bndtol:
+                        alpha_L_i[k - 1] = -alpha_seed  # alpha_L <= 0
+                    if ub_k - vk <= bndtol:
+                        alpha_U_i[k - 1] = +alpha_seed  # alpha_U >= 0
+                    # Write initial values
+                    try:
+                        m.alpha_L[k, i].set_value(alpha_L_i[k - 1])
+                        m.alpha_U[k, i].set_value(alpha_U_i[k - 1])
+                    except Exception:
+                        pass
+                # Least-squares initialize lambda: S^T lambda ≈ -(stat_w*v + alpha_L + alpha_U)
+                try:
+                    stat_w_val = float(pyo.value(m.stat_w))
+                except Exception:
+                    stat_w_val = float(args.stat_w)
+                b = -(stat_w_val * v_i + alpha_L_i + alpha_U_i)  # shape (nv,)
+                try:
+                    # Solve min || ST * lam - b ||_2
+                    lam, *_ = np.linalg.lstsq(ST, b, rcond=None)
+                except Exception:
+                    # Fallback to zeros if linalg fails
+                    lam = np.zeros(S.shape[0], dtype=float)
+                # Apply to model
+                for r in range(1, S.shape[0] + 1):
+                    try:
+                        m.lmbda[r, i].set_value(float(lam[r - 1]))
+                    except Exception:
+                        pass
+            print("[INIT] Multipliers initialized: alpha (by activity) and lambda (LSQ)")
+        except Exception as e:
+            print(f"[WARN] Multiplier initialization failed: {e}")
+
         # Objetivo: si estamos en simulate_mpcc, penalizaciones con pesos configurables; si no, mantener SSE + penalizaciones
         # Eliminar OBJ previo para evitar el warning de reemplazo implícito
         try:
