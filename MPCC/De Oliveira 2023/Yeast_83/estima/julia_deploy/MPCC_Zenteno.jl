@@ -30,6 +30,7 @@ using DelimitedFiles
 using FileIO, JLD2
 using Dates
 using Printf
+using Statistics: mean
 # Optional ODE integration and plotting
 try
     using DifferentialEquations
@@ -45,6 +46,39 @@ const BASE_DIR = @__DIR__
 const ESTIMA_DIR = normpath(joinpath(BASE_DIR, ".."))
 const RESULTS_DIR = joinpath(BASE_DIR, "results")
 isdir(RESULTS_DIR) || mkpath(RESULTS_DIR)
+
+# Synthetic data integration (will be used for future SSE objective)
+# Expected file: synthetic_data.jld2 with variables:
+#   states :: Matrix{Float64} of size (nc, n_time)
+#   time   :: Vector{Float64} length n_time
+# Only used for plotting now; does NOT affect objective yet.
+const SYN_DATA_PATH = joinpath(BASE_DIR, "synthetic_data.jld2")
+mutable struct SyntheticData
+    t::Vector{Float64}
+    Y::Matrix{Float64}   # (nc x n_time) rows match [X,N,G,F,E]
+end
+function load_synthetic_data(path::String, nc::Int)
+    if isfile(path)
+        try
+            d = FileIO.load(path)
+            if all(k -> k in keys(d), ["states","time"])
+                Y = d["states"]
+                t = d["time"]
+                if size(Y,1) == nc && length(t) == size(Y,2)
+                    return SyntheticData(t, Y)
+                else
+                    @warn "Synthetic data dimensions mismatch; ignoring" size(Y), length(t)
+                end
+            else
+                @warn "synthetic_data.jld2 missing expected keys 'states' and 'time'" keys(d)
+            end
+        catch err
+            @warn "Failed loading synthetic_data.jld2" err
+        end
+    end
+    return nothing
+end
+syn_data = load_synthetic_data(SYN_DATA_PATH, 5)
 
 S = readdlm(joinpath(ESTIMA_DIR, "S.csv"), ',')
 lb_raw = readdlm(joinpath(ESTIMA_DIR, "lb.csv"), ',')
@@ -92,11 +126,20 @@ end
 # Collocation and run configuration
 # ---------------------------------------------
 nc = 5              # X,N,G,F,E
+# Test configuration: 240 h horizon, 12 finite elements (20 h per element)
 nfe = 12            # number of finite elements
 ncp = 3             # collocation points (Radau-3)
-th = 22.0           # total horizon
+th = 240.0          # total horizon (hours)
+
+# Toggle adaptivity via ENV["HV_ADAPTIVE"] == "1" (default fixed uniform)
+const HV_ADAPTIVE = get(ENV, "HV_ADAPTIVE", "0") == "1"
+var_h = HV_ADAPTIVE ? 1.0 : 0.0
 hm = fill(th / nfe, nfe)  # nominal element length
-var_h = 1.0         # allow hv ∈ [(1-var_h)h, (1+var_h)h]
+println("[CFG] th=", th, ", nfe=", nfe, ", hv_mode=", (HV_ADAPTIVE ? "adaptive" : "fixed"))
+
+# Default kinetics temperature and constants (overridable via ENV["T_CONST"])
+T_const = try parse(Float64, get(ENV, "T_CONST", "296.15")) catch; 296.15 end
+println("[CFG] T_const=", T_const)
 
 # Radau-3 collocation matrix (same as Python)
 colmat = [
@@ -105,8 +148,7 @@ colmat = [
     0.37640306270047    0.51248582618842   0.11111111111111
 ]
 
-# Default kinetics temperature and constants
-T_const = 293.15
+# Default kinetics constants
 R = 8.314
 
 # pFBA ridge (in stationarity) and linear penalty weights (mirror relaxed Pyomo)
@@ -128,7 +170,7 @@ up_fru = zeros(nv); up_fru[fru] = 1.0
 X0, N0, G0, F0, E0 = 0.5, 0.14, 110.0, 110.0, 0.0
 c0 = [X0, N0, G0, F0, E0]
 
-# Nominal parameters (log-parametrized with [0.5x, 2x] bounds)
+# Nominal parameters (log-parametrized). Bounds will be set based on identifiability/estimation set.
 const Pnames = (
     :mu0, :betaG0, :betaF0, :Kn0, :Kg0, :Kf0, :Kig0, :Kie0, :Kd0,
     :Yxn, :Yxg, :Yxf, :Yeg, :Yef
@@ -140,14 +182,52 @@ const Pnom = Dict(
 )
 np = length(Pnames)
 LB = similar(zeros(np)); UB = similar(zeros(np)); T0 = similar(zeros(np))
+
+# Parse estimable parameters from ENV (comma-separated symbols). Default to a small set.
+function _parse_est_params()::Vector{Symbol}
+    # Default now only mu0 for initial verification run
+    s = get(ENV, "EST_PARAMS", "mu0")
+    parts = filter(!isempty, split(s, [',',';',' ']))
+    syms = Symbol[]
+    for p in parts
+        push!(syms, Symbol(strip(p)))
+    end
+    # keep only valid names
+    valid = Set(Pnames)
+    return [x for x in syms if x in valid]
+end
+const EST_SET = _parse_est_params()
+println("[CFG] Estimable params=", EST_SET)
+
+# Bounds: estimables in [0.1x, 10x] (one log cycle); fixed at nominal (lb=ub)
 for (i, k) in enumerate(Pnames)
-    LB[i] = log(max(1e-12, 0.5 * Pnom[k]))
-    UB[i] = log(max(2e-12, 2.0 * Pnom[k]))
     T0[i] = log(Pnom[k])
+    if k in EST_SET
+        LB[i] = log(max(1e-12, 0.1 * Pnom[k]))
+        UB[i] = log(max(1e-12, 10.0 * Pnom[k]))
+    else
+        LB[i] = T0[i]
+        UB[i] = T0[i]
+    end
+end
+
+# Override narrower bounds for mu0 if estimable (diagnostic refinement)
+if :mu0 in EST_SET
+    i_mu = findfirst(==( :mu0), Pnames)
+    LB[i_mu] = log(max(1e-12, 0.5 * Pnom[:mu0]))
+    UB[i_mu] = log(max(1e-12, 2.0 * Pnom[:mu0]))
 end
 
 # Load data for FO (nc x ph x ncp)
 data = load_data_default(nc, nfe, ncp)
+
+# Measurement selection: use only X(1), G(3), F(4), E(5) in SSE
+const MEAS_IDX = [1,3,4,5]
+
+# Weights for objective terms
+const W_SSE = 1.0
+const W_PEN = 0.2
+const W_REG = 1e-8
 
 # ---------------------------------------------
 # JuMP model
@@ -163,8 +243,10 @@ set_optimizer_attribute(m, "acceptable_tol", 1e-2)
 set_optimizer_attribute(m, "linear_solver", "mumps")
 set_optimizer_attribute(m, "mu_strategy", "adaptive")
 set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based")
-# Use exact Hessian (removed LBFGS approximation) and cap wall-clock at 300 s
-set_optimizer_attribute(m, "max_wall_time", 300.0)
+# Wall-clock time configurable via ENV["WALL_TIME"] (default 600 s). Use 60 for quick diagnostic runs.
+wall_time = try parse(Float64, get(ENV, "WALL_TIME", "600")) catch; 600.0 end
+set_optimizer_attribute(m, "max_wall_time", wall_time)
+println("[CFG] Ipopt wall_time=", wall_time)
 
 # ---------------------------------------------
 # Variables
@@ -199,11 +281,16 @@ for i in 1:nfe
 end
 
 # ---------------------------------------------
-# Objective: linear complementarity penalties (relaxed Pyomo style, no SSE)
+# Objective: SSE over measured states + penalties + small parameter regularization
 # ---------------------------------------------
-@NLobjective(m, Min, sum( sum( -phi1 * FO_L[k,i] - phi3 * FO_U[k,i] for k in 1:nv )
+@NLexpression(m, SSE, sum( (c[l,i,j] - data[l,i,j])^2 for l in MEAS_IDX, i in 1:nfe, j in 1:ncp ))
+@NLexpression(m, PEN, sum( sum( -phi1 * FO_L[k,i] - phi3 * FO_U[k,i] for k in 1:nv )
                         +  phi2 * FO_upt[1,i] + phi2 * FO_upt[2,i]
                     for i in 1:nfe ))
+# Regularize only estimable params around nominal
+const EST_POS = [findfirst(==(k), Pnames) for k in EST_SET]
+@NLexpression(m, REG, sum( (teta[p] - T0[p])^2 for p in EST_POS ))
+@NLobjective(m, Min, W_SSE * SSE + W_PEN * PEN + W_REG * REG)
 
 # ---------------------------------------------
 # Start values
@@ -217,9 +304,15 @@ function Pidx(sym)
     error("Parameter $sym not found")
 end
 
-# Parameter starts (log-space)
-for p in 1:np
-    set_start_value(teta[p], T0[p])
+# Parameter starts (log-space). For estimables, perturb away from nominal within bounds.
+for (i,k) in enumerate(Pnames)
+    if k in EST_SET
+        # deterministic offset: 1.5x, clipped to [LB, UB]
+        vstart = log(clamp(Pnom[k] * 1.5, exp(LB[i]), exp(UB[i])))
+        set_start_value(teta[i], vstart)
+    else
+        set_start_value(teta[i], T0[i])
+    end
 end
 
 # Temperature scalars
@@ -284,20 +377,34 @@ end
     coll_c_0[l=1:nc, j=1:ncp],        c[l, 1, j]   == c0[l] + hv[1] * sum(colmat[j, k] * cdot[l, 1, k] for k in 1:ncp)
 end)
 
-@constraints(m, begin
-    # Time partitioning for hv
-    MFE1, sum(hv[i] for i in 1:nfe) == th
-    MFE3[i=1:nfe], hv[i]  >= 0.0
-    MFE4[i=1:nfe], hv[i]  >= (1.0 - var_h) * hm[1]
-    MFE5[i=1:nfe], hv[i]  <= (1.0 + var_h) * hm[1]
+if HV_ADAPTIVE
+    @constraints(m, begin
+        # Adaptive time partitioning
+        MFE1, sum(hv[i] for i in 1:nfe) == th
+        MFE3[i=1:nfe], hv[i]  >= 0.0
+        MFE4[i=1:nfe], hv[i]  >= (1.0 - var_h) * hm[1]
+        MFE5[i=1:nfe], hv[i]  <= (1.0 + var_h) * hm[1]
 
-    # State nonnegativity
-    c_LB[l=1:nc, i=1:nfe, j=1:ncp], -c[l, i, j] <= 0
+        # State nonnegativity
+        c_LB[l=1:nc, i=1:nfe, j=1:ncp], -c[l, i, j] <= 0
 
-    # Bounds on parameters (log-space)
-    teta_LB[p=1:np], teta[p] >= LB[p]
-    teta_UB[p=1:np], teta[p] <= UB[p]
-end)
+        # Bounds on parameters (log-space)
+        teta_LB[p=1:np], teta[p] >= LB[p]
+        teta_UB[p=1:np], teta[p] <= UB[p]
+    end)
+else
+    @constraints(m, begin
+        # Uniform time partitioning: fix each hv[i] to hm[i]
+        MFE_fix[i=1:nfe], hv[i] == hm[i]
+
+        # State nonnegativity
+        c_LB[l=1:nc, i=1:nfe, j=1:ncp], -c[l, i, j] <= 0
+
+        # Bounds on parameters (log-space)
+        teta_LB[p=1:np], teta[p] >= LB[p]
+        teta_UB[p=1:np], teta[p] <= UB[p]
+    end)
+end
 
 # ODEs (Zenteno core)
 @NLconstraints(m, begin
@@ -434,7 +541,122 @@ end
 # ---------------------------------------------
 # Solve
 # ---------------------------------------------
-println("[INFO] Starting solve @ ", Dates.now())
+println("[INFO] Pre-optimization ODE simulation @ ", Dates.now())
+
+# ---------------------------------------------
+# Pre-optimization ODE simulation (nominal for fixed params, start values for estimables)
+# Saves plot: zenteno_pre_ode_vs_data_*.png (continuous ODE line + synthetic data scatter)
+# ---------------------------------------------
+try
+    function param_start_exp(sym)
+        i = Pidx(sym)
+        st = try start_value(teta[i]) catch; nothing end
+        if st === nothing
+            return exp(T0[i])
+        end
+        return exp(st)
+    end
+    mu0_s   = param_start_exp(:mu0)
+    betaG0_s= param_start_exp(:betaG0)
+    betaF0_s= param_start_exp(:betaF0)
+    Kn0_s   = param_start_exp(:Kn0)
+    Kg0_s   = param_start_exp(:Kg0)
+    Kf0_s   = param_start_exp(:Kf0)
+    Kig0_s  = param_start_exp(:Kig0)
+    Kie0_s  = param_start_exp(:Kie0)
+    Kd0_s   = param_start_exp(:Kd0)
+    Yxn_s   = param_start_exp(:Yxn)
+    Yxg_s   = param_start_exp(:Yxg)
+    Yxf_s   = param_start_exp(:Yxf)
+    Yeg_s   = param_start_exp(:Yeg)
+    Yef_s   = param_start_exp(:Yef)
+
+    mu_T0 = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
+    Kg_T0 = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
+    b_T0  = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
+    mrate0 = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
+
+    function zenteno_rhs_pre!(du,u,p,t)
+        X,N,G,F,E = u
+        mu   = mu0_s * mu_T0 * (N / (N + Kn0_s * Kg_T0 + 1e-9))
+        betaG = betaG0_s * b_T0 * (G / (G + Kg0_s * Kg_T0 + 1e-9)) * ((Kie0_s * Kg_T0) / (E + Kie0_s * Kg_T0 + 1e-9))
+        betaF = betaF0_s * b_T0 * (F / (F + Kf0_s * Kg_T0 + 1e-9)) * ((Kig0_s * Kg_T0) / (G + Kig0_s * Kg_T0 + 1e-9)) * ((Kie0_s * Kg_T0) / (E + Kie0_s * Kg_T0 + 1e-9))
+        Td   = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+        sw   = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
+        Kd   = Kd0_s * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * sw
+        denom = G + F + 1e-9
+        phiG = G / denom
+        phiF = F / denom
+        du[1] = (mu - Kd) * X
+        du[2] = -(mu / Yxn_s) * X
+        du[3] = -((mu / Yxg_s) + (betaG / Yeg_s) + mrate0 * phiG) * X
+        du[4] = -((mu / Yxf_s) + (betaF / Yef_s) + mrate0 * phiF) * X
+        du[5] = (betaG + betaF) * X
+        return nothing
+    end
+    u0 = copy(c0)
+    prob_pre = DifferentialEquations.ODEProblem(zenteno_rhs_pre!, u0, (0.0, th))
+    sol_pre = DifferentialEquations.solve(prob_pre, DifferentialEquations.Tsit5(), reltol=1e-6, abstol=1e-8)
+
+    # Synthetic data filtering (prefer synthetic_data.jld2; fallback to data.jld2 at FE-end times)
+    t_syn = Float64[]; Y_syn = Matrix{Float64}(undef, 0, 0)
+    if syn_data !== nothing
+        idx = findall(t -> (t >= 0.0) && (t <= th + 1e-9), syn_data.t)
+        if !isempty(idx)
+            t_syn = syn_data.t[idx]
+            Y_syn = syn_data.Y[:, idx]
+        end
+    end
+    if isempty(t_syn)
+        # Fallback: use FE-end grid (uniform pre-solve) and data at j=ncp
+        t_syn = cumsum(hm)
+        Y_syn = zeros(nc, length(t_syn))
+        for i in 1:nfe
+            for l in 1:nc
+                Y_syn[l, i] = data[l, i, ncp]
+            end
+        end
+        # If fallback is all zeros, keep but use a distinct marker to avoid confusion
+    end
+    # Plot only measured states [X,G,F,E] as requested
+    plt_pre = Plots.plot(layout=(4,1), size=(1000,1000))
+    # X (1)
+    Plots.plot!(plt_pre[1], sol_pre.t, sol_pre[1,:], label="ODE X (start)", color=:navy, lw=2)
+    if !isempty(t_syn); Plots.scatter!(plt_pre[1], t_syn, Y_syn[1,:], label="DATA X", color=:orange, m=:xcross); end
+    Plots.ylabel!(plt_pre[1], "X")
+    # G (3)
+    Plots.plot!(plt_pre[2], sol_pre.t, sol_pre[3,:], label="ODE G (start)", color=:navy, lw=2)
+    if !isempty(t_syn); Plots.scatter!(plt_pre[2], t_syn, Y_syn[3,:], label="DATA G", color=:orange, m=:xcross); end
+    Plots.ylabel!(plt_pre[2], "G")
+    # F (4)
+    Plots.plot!(plt_pre[3], sol_pre.t, sol_pre[4,:], label="ODE F (start)", color=:navy, lw=2)
+    if !isempty(t_syn); Plots.scatter!(plt_pre[3], t_syn, Y_syn[4,:], label="DATA F", color=:orange, m=:xcross); end
+    Plots.ylabel!(plt_pre[3], "F")
+    # E (5)
+    Plots.plot!(plt_pre[4], sol_pre.t, sol_pre[5,:], label="ODE E (start)", color=:navy, lw=2)
+    if !isempty(t_syn); Plots.scatter!(plt_pre[4], t_syn, Y_syn[5,:], label="DATA E", color=:orange, m=:xcross); end
+    Plots.ylabel!(plt_pre[4], "E"); Plots.xlabel!(plt_pre[4], "time")
+    pre_path = joinpath(RESULTS_DIR, "zenteno_pre_ode_vs_data_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".png")
+    # R² diagnostics (ODE vs synthetic data) for measured states
+    if !isempty(t_syn)
+        _r2(y_obs, y_pred) = (length(y_obs) <= 1 ? NaN : (1 - sum((y_obs .- y_pred).^2) / sum((y_obs .- mean(y_obs)).^2)))
+        predX = [sol_pre(t)[1] for t in t_syn]
+        predG = [sol_pre(t)[3] for t in t_syn]
+        predF = [sol_pre(t)[4] for t in t_syn]
+        predE = [sol_pre(t)[5] for t in t_syn]
+        r2X = _r2(Y_syn[1,:], predX); r2G = _r2(Y_syn[3,:], predG); r2F = _r2(Y_syn[4,:], predF); r2E = _r2(Y_syn[5,:], predE)
+        Plots.title!(plt_pre[1], @sprintf("X (R²=%.3f)", r2X))
+        Plots.title!(plt_pre[2], @sprintf("G (R²=%.3f)", r2G))
+        Plots.title!(plt_pre[3], @sprintf("F (R²=%.3f)", r2F))
+        Plots.title!(plt_pre[4], @sprintf("E (R²=%.3f)", r2E))
+    end
+    Plots.png(plt_pre, pre_path)
+    println("[PLOT] Saved pre-optimization ODE plot ", pre_path)
+catch err
+    @warn "Pre-optimization ODE simulation failed" err
+end
+
+println("[INFO] Starting optimization @ ", Dates.now())
 optimize!(m)
 status = termination_status(m)
 pr_status = primal_status(m)
@@ -460,159 +682,168 @@ catch err
 end
 
 # ---------------------------------------------
-# ODE integration (Zenteno) and overlay plot with MPCC FE-end points
-# - Continuous lines: ODE solution (X,N,G,F,E)
-# - Scatter points: MPCC FE-end values for X, G, F, E
-# Saved under results/ as zenteno_ode_vs_mpcc_*.png
+# Estimation report (parameters, bounds, starts, solution, metrics)
 # ---------------------------------------------
 try
-    # Extract parameter values: prefer optimized values, fallback to starts
-    function param_exp(sym)
-        i = Pidx(sym)
-        try
-            v = value(teta[i])
-            return exp((v === nothing || !isfinite(v)) ? T0[i] : v)
-        catch
-            return exp(T0[i])
+    rep_path = joinpath(RESULTS_DIR, "zenteno_estimation_report_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+    open(rep_path, "w") do io
+        println(io, "th=", th, ", nfe=", nfe, ", hv_mode=", (HV_ADAPTIVE ? "adaptive" : "fixed"))
+        println(io, "measured_states=", MEAS_IDX)
+        println(io, "estimable_params=", EST_SET)
+        # Metrics
+        sse_val = try value(SSE) catch; NaN end
+        pen_val = try value(PEN) catch; NaN end
+        reg_val = try value(REG) catch; NaN end
+        println(io, @sprintf("SSE=%.6e", sse_val))
+        println(io, @sprintf("PEN=%.6e", pen_val))
+        println(io, @sprintf("REG=%.6e", reg_val))
+        println(io, @sprintf("OBJ=%.6e", try objective_value(m) catch; NaN end))
+        # Complementarity diagnostics (FO products magnitude summaries)
+        foL_max = try maximum(abs(value(FO_L[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+        foU_max = try maximum(abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+        foupt_max = try maximum(abs(value(FO_upt[u,i])) for u in 1:2, i in 1:nfe) catch; NaN end
+        fo_sum = try sum(abs(value(FO_L[k,i])) + abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+        foupt_sum = try sum(abs(value(FO_upt[u,i])) for u in 1:2, i in 1:nfe) catch; NaN end
+        println(io, @sprintf("FO_L_max=%.6e", foL_max))
+        println(io, @sprintf("FO_U_max=%.6e", foU_max))
+        println(io, @sprintf("FO_upt_max=%.6e", foupt_max))
+        println(io, @sprintf("FO_LU_sum=%.6e", fo_sum))
+        println(io, @sprintf("FO_upt_sum=%.6e", foupt_sum))
+        println(io)
+        println(io, "# Parameters (name, nominal, lb, ub, start, opt_log, opt_real)")
+        for (i,k) in enumerate(Pnames)
+            lb_i = LB[i]; ub_i = UB[i]; t0_i = T0[i]
+            st_i = try start_value(teta[i]) catch; t0_i end
+            opt_i = try value(teta[i]) catch; NaN end
+            @printf(io, "%8s  nom=% .6e  lb=% .6e  ub=% .6e  start=% .6e  opt_log=% .6e  opt=%.6e\n",
+                   String(k), exp(t0_i), exp(lb_i), exp(ub_i), exp(st_i), opt_i, (isfinite(opt_i) ? exp(opt_i) : NaN))
         end
     end
-
-    mu0   = param_exp(:mu0)
-    betaG0= param_exp(:betaG0)
-    betaF0= param_exp(:betaF0)
-    Kn0   = param_exp(:Kn0)
-    Kg0   = param_exp(:Kg0)
-    Kf0   = param_exp(:Kf0)
-    Kig0  = param_exp(:Kig0)
-    Kie0  = param_exp(:Kie0)
-    Kd0   = param_exp(:Kd0)
-    Yxn   = param_exp(:Yxn)
-    Yxg   = param_exp(:Yxg)
-    Yxf   = param_exp(:Yxf)
-    Yeg   = param_exp(:Yeg)
-    Yef   = param_exp(:Yef)
-
-    # Temperature scalars (reuse definitions)
-    mu_T0 = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
-    Kg_T0 = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
-    b_T0  = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
-    mrate0 = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
-
-    # ODE RHS
-    function zenteno_rhs!(du, u, p, t)
-        X, N, G, F, E = u
-        mu   = mu0 * mu_T0 * (N / (N + Kn0 * Kg_T0 + 1e-9))
-        betaG = betaG0 * b_T0 * (G / (G + Kg0 * Kg_T0 + 1e-9)) * ((Kie0 * Kg_T0) / (E + Kie0 * Kg_T0 + 1e-9))
-        betaF = betaF0 * b_T0 * (F / (F + Kf0 * Kg_T0 + 1e-9)) * ((Kig0 * Kg_T0) / (G + Kig0 * Kg_T0 + 1e-9)) * ((Kie0 * Kg_T0) / (E + Kie0 * Kg_T0 + 1e-9))
-        Td   = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
-        sw   = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
-        Kd   = Kd0 * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * sw
-        denom = G + F + 1e-9
-        phiG = G / denom
-        phiF = F / denom
-
-        du[1] = (mu - Kd) * X
-        du[2] = -(mu / Yxn) * X
-        du[3] = -((mu / Yxg) + (betaG / Yeg) + mrate0 * phiG) * X
-        du[4] = -((mu / Yxf) + (betaF / Yef) + mrate0 * phiF) * X
-        du[5] = (betaG + betaF) * X
-        return nothing
-    end
-
-    # Integrate ODE
-    u0 = copy(c0)
-    tspan = (0.0, th)
-    prob = DifferentialEquations.ODEProblem(zenteno_rhs!, u0, tspan)
-    sol = DifferentialEquations.solve(prob, DifferentialEquations.Tsit5(), reltol=1e-6, abstol=1e-8)
-
-    # Extract MPCC FE-end points and time grid from hv
-    hv_val = [try value(hv[i]) catch; hm[i] end for i in 1:nfe]
-    t_nodes = cumsum(hv_val)
-    # FE-end states
-    function safe_val(x)
-        try
-            return value(x)
-        catch
-            v = start_value(x)
-            return v === nothing ? 0.0 : v
-        end
-    end
-    X_fe = [safe_val(c[1, i, ncp]) for i in 1:nfe]
-    N_fe = [safe_val(c[2, i, ncp]) for i in 1:nfe]
-    G_fe = [safe_val(c[3, i, ncp]) for i in 1:nfe]
-    F_fe = [safe_val(c[4, i, ncp]) for i in 1:nfe]
-    E_fe = [safe_val(c[5, i, ncp]) for i in 1:nfe]
-
-    # Compute ODE values at FE-end times and R^2 for X,G,F,E (MPCC vs ODE)
-    function r2_score(y::Vector{<:Real}, yhat::Vector{<:Real})
-        n = length(y)
-        if n == 0
-            return NaN
-        end
-        ȳ = sum(y) / n
-        sst = sum((yi - ȳ)^2 for yi in y)
-        sse = sum((y[i] - yhat[i])^2 for i in 1:n)
-        return sst <= 1e-16 ? (sse <= 1e-16 ? 1.0 : 0.0) : 1 - sse / sst
-    end
-    # Interpolate ODE at FE times
-    X_hat = [DifferentialEquations.solve(sol.prob, sol.alg, save_everystep=false, tstops=[t]).u[end][1] for t in t_nodes]  # robust single-step
-    G_hat = [DifferentialEquations.solve(sol.prob, sol.alg, save_everystep=false, tstops=[t]).u[end][3] for t in t_nodes]
-    F_hat = [DifferentialEquations.solve(sol.prob, sol.alg, save_everystep=false, tstops=[t]).u[end][4] for t in t_nodes]
-    E_hat = [DifferentialEquations.solve(sol.prob, sol.alg, save_everystep=false, tstops=[t]).u[end][5] for t in t_nodes]
-    # Prefer fast interpolation if available
-    try
-        X_hat = [sol(t)[1] for t in t_nodes]
-        G_hat = [sol(t)[3] for t in t_nodes]
-        F_hat = [sol(t)[4] for t in t_nodes]
-        E_hat = [sol(t)[5] for t in t_nodes]
-    catch
-    end
-    r2_X = r2_score(X_fe, X_hat)
-    r2_G = r2_score(G_fe, G_hat)
-    r2_F = r2_score(F_fe, F_hat)
-    r2_E = r2_score(E_fe, E_hat)
-
-    # Build plot with subplots (5 rows), include R^2 in titles
-    plt = Plots.plot(layout=(5,1), size=(1000,1200))
-    # X
-    Plots.plot!(plt[1], sol.t, sol[1,:], label="ODE X", color=:blue, lw=2)
-    Plots.scatter!(plt[1], t_nodes, X_fe, label="MPCC X", color=:black, m=:circle)
-    Plots.title!(plt[1], @sprintf("X (R^2=%.3f)", r2_X))
-    Plots.ylabel!(plt[1], "X")
-    # N
-    Plots.plot!(plt[2], sol.t, sol[2,:], label="ODE N", color=:blue, lw=2)
-    # (sin puntos MPCC, no requerido)
-    Plots.ylabel!(plt[2], "N")
-    # G
-    Plots.plot!(plt[3], sol.t, sol[3,:], label="ODE G", color=:blue, lw=2)
-    Plots.scatter!(plt[3], t_nodes, G_fe, label="MPCC G", color=:red, m=:diamond)
-    Plots.title!(plt[3], @sprintf("G (R^2=%.3f)", r2_G))
-    Plots.ylabel!(plt[3], "G")
-    # F
-    Plots.plot!(plt[4], sol.t, sol[4,:], label="ODE F", color=:blue, lw=2)
-    Plots.scatter!(plt[4], t_nodes, F_fe, label="MPCC F", color=:green, m=:utriangle)
-    Plots.title!(plt[4], @sprintf("F (R^2=%.3f)", r2_F))
-    Plots.ylabel!(plt[4], "F")
-    # E
-    Plots.plot!(plt[5], sol.t, sol[5,:], label="ODE E", color=:blue, lw=2)
-    Plots.scatter!(plt[5], t_nodes, E_fe, label="MPCC E", color=:purple, m=:star5)
-    Plots.title!(plt[5], @sprintf("E (R^2=%.3f)", r2_E))
-    Plots.ylabel!(plt[5], "E")
-    Plots.xlabel!(plt[5], "time")
-
-    fig_path = joinpath(RESULTS_DIR, "zenteno_ode_vs_mpcc_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".png")
-    Plots.png(plt, fig_path)
-    println("[PLOT] Saved ", fig_path)
-
-    # Save R^2 metrics
-    r2_path = joinpath(RESULTS_DIR, "zenteno_r2_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
-    open(r2_path, "w") do io
-        println(io, @sprintf("R2_X=%.6f", r2_X))
-        println(io, @sprintf("R2_G=%.6f", r2_G))
-        println(io, @sprintf("R2_F=%.6f", r2_F))
-        println(io, @sprintf("R2_E=%.6f", r2_E))
-    end
-    println("[METRICS] Saved ", r2_path)
+    println("[REPORT] Saved ", rep_path)
 catch err
-    @warn "ODE integration/plotting failed. Install required packages?" err
+    @warn "Failed to save estimation report" err
 end
+
+    # ---------------------------------------------
+    # Post-optimization ODE simulation (optimized for estimables, nominal for fixed)
+    # Saves plot: zenteno_post_ode_vs_data_*.png (continuous ODE line + synthetic data scatter)
+    # ---------------------------------------------
+    try
+        function param_opt_exp(sym)
+            i = Pidx(sym)
+            v = try value(teta[i]) catch; nothing end
+            if v === nothing || !isfinite(v)
+                return exp(T0[i])
+            end
+            return exp(v)
+        end
+        mu0_o   = param_opt_exp(:mu0)
+        betaG0_o= param_opt_exp(:betaG0)
+        betaF0_o= param_opt_exp(:betaF0)
+        Kn0_o   = param_opt_exp(:Kn0)
+        Kg0_o   = param_opt_exp(:Kg0)
+        Kf0_o   = param_opt_exp(:Kf0)
+        Kig0_o  = param_opt_exp(:Kig0)
+        Kie0_o  = param_opt_exp(:Kie0)
+        Kd0_o   = param_opt_exp(:Kd0)
+        Yxn_o   = param_opt_exp(:Yxn)
+        Yxg_o   = param_opt_exp(:Yxg)
+        Yxf_o   = param_opt_exp(:Yxf)
+        Yeg_o   = param_opt_exp(:Yeg)
+        Yef_o   = param_opt_exp(:Yef)
+
+        mu_T0 = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
+        Kg_T0 = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
+        b_T0  = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
+        mrate0 = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
+
+        function zenteno_rhs_post!(du,u,p,t)
+            X,N,G,F,E = u
+            mu   = mu0_o * mu_T0 * (N / (N + Kn0_o * Kg_T0 + 1e-9))
+            betaG = betaG0_o * b_T0 * (G / (G + Kg0_o * Kg_T0 + 1e-9)) * ((Kie0_o * Kg_T0) / (E + Kie0_o * Kg_T0 + 1e-9))
+            betaF = betaF0_o * b_T0 * (F / (F + Kf0_o * Kg_T0 + 1e-9)) * ((Kig0_o * Kg_T0) / (G + Kig0_o * Kg_T0 + 1e-9)) * ((Kie0_o * Kg_T0) / (E + Kie0_o * Kg_T0 + 1e-9))
+            Td   = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+            sw   = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
+            Kd   = Kd0_o * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * sw
+            denom = G + F + 1e-9
+            phiG = G / denom
+            phiF = F / denom
+            du[1] = (mu - Kd) * X
+            du[2] = -(mu / Yxn_o) * X
+            du[3] = -((mu / Yxg_o) + (betaG / Yeg_o) + mrate0 * phiG) * X
+            du[4] = -((mu / Yxf_o) + (betaF / Yef_o) + mrate0 * phiF) * X
+            du[5] = (betaG + betaF) * X
+            return nothing
+        end
+        u0 = copy(c0)
+        prob_post = DifferentialEquations.ODEProblem(zenteno_rhs_post!, u0, (0.0, th))
+        sol_post = DifferentialEquations.solve(prob_post, DifferentialEquations.Tsit5(), reltol=1e-6, abstol=1e-8)
+
+        # Synthetic data filtering (prefer synthetic_data; fallback to data on FE grid)
+        t_syn = Float64[]; Y_syn = Matrix{Float64}(undef, 0, 0)
+        if syn_data !== nothing
+            idx = findall(t -> (t >= 0.0) && (t <= th + 1e-9), syn_data.t)
+            if !isempty(idx)
+                t_syn = syn_data.t[idx]
+                Y_syn = syn_data.Y[:, idx]
+            end
+        end
+        if isempty(t_syn)
+            t_syn = cumsum([try value(hv[i]) catch; hm[i] end for i in 1:nfe])
+            Y_syn = zeros(nc, length(t_syn))
+            for i in 1:nfe
+                for l in 1:nc
+                    Y_syn[l, i] = data[l, i, ncp]
+                end
+            end
+        end
+        # Extract MPCC FE-end solution snapshots for measured states.
+        # Define time nodes (FE ends) and corresponding state values. Handles infeasible/partial solutions.
+        t_nodes = cumsum([try value(hv[i]) catch; hm[i] end for i in 1:nfe])
+        X_fe = [try value(c[1,i,ncp]) catch; NaN end for i in 1:nfe]
+        G_fe = [try value(c[3,i,ncp]) catch; NaN end for i in 1:nfe]
+        F_fe = [try value(c[4,i,ncp]) catch; NaN end for i in 1:nfe]
+        E_fe = [try value(c[5,i,ncp]) catch; NaN end for i in 1:nfe]
+        # Build combined plot for measured states [X,G,F,E]: data scatter + ODE line + MPCC FE-end markers
+        plt_post = Plots.plot(layout=(4,1), size=(1100,1100))
+        # X (1)
+        Plots.plot!(plt_post[1], sol_post.t, sol_post[1,:], label="ODE X (opt)", color=:navy, lw=2)
+        if !isempty(t_syn); Plots.scatter!(plt_post[1], t_syn, Y_syn[1,:], label="DATA X", color=:orange, m=:xcross); end
+        Plots.scatter!(plt_post[1], t_nodes, X_fe, label="MPCC X", color=:black, m=:circle)
+        Plots.ylabel!(plt_post[1], "X")
+        # G (3)
+        Plots.plot!(plt_post[2], sol_post.t, sol_post[3,:], label="ODE G (opt)", color=:navy, lw=2)
+        if !isempty(t_syn); Plots.scatter!(plt_post[2], t_syn, Y_syn[3,:], label="DATA G", color=:orange, m=:xcross); end
+        Plots.scatter!(plt_post[2], t_nodes, G_fe, label="MPCC G", color=:red, m=:diamond)
+        Plots.ylabel!(plt_post[2], "G")
+        # F (4)
+        Plots.plot!(plt_post[3], sol_post.t, sol_post[4,:], label="ODE F (opt)", color=:navy, lw=2)
+        if !isempty(t_syn); Plots.scatter!(plt_post[3], t_syn, Y_syn[4,:], label="DATA F", color=:orange, m=:xcross); end
+        Plots.scatter!(plt_post[3], t_nodes, F_fe, label="MPCC F", color=:green, m=:utriangle)
+        Plots.ylabel!(plt_post[3], "F")
+        # E (5)
+        Plots.plot!(plt_post[4], sol_post.t, sol_post[5,:], label="ODE E (opt)", color=:navy, lw=2)
+        if !isempty(t_syn); Plots.scatter!(plt_post[4], t_syn, Y_syn[5,:], label="DATA E", color=:orange, m=:xcross); end
+        Plots.scatter!(plt_post[4], t_nodes, E_fe, label="MPCC E", color=:purple, m=:star5)
+        Plots.ylabel!(plt_post[4], "E"); Plots.xlabel!(plt_post[4], "time")
+        post_path = joinpath(RESULTS_DIR, "zenteno_post_ode_vs_data_mpcc_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".png")
+        # R² diagnostics post (ODE opt vs data)
+        if !isempty(t_syn)
+            _r2(y_obs, y_pred) = (length(y_obs) <= 1 ? NaN : (1 - sum((y_obs .- y_pred).^2) / sum((y_obs .- mean(y_obs)).^2)))
+            predX = [sol_post(t)[1] for t in t_syn]
+            predG = [sol_post(t)[3] for t in t_syn]
+            predF = [sol_post(t)[4] for t in t_syn]
+            predE = [sol_post(t)[5] for t in t_syn]
+            r2X = _r2(Y_syn[1,:], predX); r2G = _r2(Y_syn[3,:], predG); r2F = _r2(Y_syn[4,:], predF); r2E = _r2(Y_syn[5,:], predE)
+            Plots.title!(plt_post[1], @sprintf("X (R²=%.3f)", r2X))
+            Plots.title!(plt_post[2], @sprintf("G (R²=%.3f)", r2G))
+            Plots.title!(plt_post[3], @sprintf("F (R²=%.3f)", r2F))
+            Plots.title!(plt_post[4], @sprintf("E (R²=%.3f)", r2E))
+        end
+        Plots.png(plt_post, post_path)
+        println("[PLOT] Saved post-optimization ODE plot ", post_path)
+    catch err
+        @warn "Post-optimization ODE simulation failed" err
+    end
+
+## (Removed standalone ODE vs MPCC plot; now integrated into the post-optimization plot.)
