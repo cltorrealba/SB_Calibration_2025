@@ -1,0 +1,3 @@
+status=TIME_LIMIT
+primal_status=INFEASIBLE_POINT
+objective=776571.5573725629
