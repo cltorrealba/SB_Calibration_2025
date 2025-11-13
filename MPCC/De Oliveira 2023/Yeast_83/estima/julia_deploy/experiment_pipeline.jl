@@ -53,16 +53,17 @@ function mode_seed_reduced()
     else
         println("[SEED_REDUCED] Using existing reduced sets at ", reduced_sets_path)
     end
+    wall = get(ENV, "SEED_REDUCED_WALL_TIME", "720")
     env = Dict(
         "HOMOTOPY" => "1",
-        "HOM_PHI" => "1e-2,1e-1,1",
-        "HOM_W" => "1e-4,1e-5,1e-6",
-        "HOM_WEIGHTS" => "1,1,2",
-        "WALL_TIME" => "720",
-        "INIT_FROM_ODE" => "1",
-        "INIT_DUAL_FE" => "1",
+        "HOM_PHI" => get(ENV, "SEED_REDUCED_HOM_PHI", "1e-2,1e-1,1"),
+        "HOM_W" => get(ENV, "SEED_REDUCED_HOM_W", "1e-4,1e-5,1e-6"),
+        "HOM_WEIGHTS" => get(ENV, "SEED_REDUCED_HOM_WEIGHTS", "1,1,2"),
+        "WALL_TIME" => wall,
+        "INIT_FROM_ODE" => get(ENV, "SEED_REDUCED_INIT_FROM_ODE", "1"),
+        "INIT_DUAL_FE" => get(ENV, "SEED_REDUCED_INIT_DUAL_FE", "1"),
         "HANDOFF_FULL" => "1",
-        "HANDOFF_STAGE" => "3",
+        "HANDOFF_STAGE" => get(ENV, "SEED_REDUCED_HANDOFF_STAGE", "3"),
         "REDUCED_MODE" => "1"
     )
     run_cmd(env; tag="seed_reduced")
@@ -131,17 +132,21 @@ end
 
 function mode_seed()
     # 3-stage homotopy 180/180/360 via weights 1,1,2 and total WALL_TIME=720
+    wall = get(ENV, "SEED_WALL_TIME", "720")
     env = Dict(
         "HOMOTOPY" => "1",
-        "HOM_PHI" => "1e-2,1e-1,1",
-        "HOM_W" => "1e-4,1e-5,1e-6",
-        "HOM_WEIGHTS" => "1,1,2",
-        "WALL_TIME" => "720",
-        "INIT_FROM_ODE" => "1",
-        "INIT_DUAL_FE" => "1",
+        "HOM_PHI" => get(ENV, "SEED_HOM_PHI", "1e-2,1e-1,1"),
+        "HOM_W" => get(ENV, "SEED_HOM_W", "1e-4,1e-5,1e-6"),
+        "HOM_WEIGHTS" => get(ENV, "SEED_HOM_WEIGHTS", "1,1,2"),
+        "WALL_TIME" => wall,
+        "INIT_FROM_ODE" => get(ENV, "SEED_INIT_FROM_ODE", "1"),
+        "INIT_DUAL_FE" => get(ENV, "SEED_INIT_DUAL_FE", "1"),
         "HANDOFF_FULL" => "1",
-        "HANDOFF_STAGE" => "3",
-        "REDUCED_MODE" => "0"
+        "HANDOFF_STAGE" => get(ENV, "SEED_HANDOFF_STAGE", "3"),
+        "REDUCED_MODE" => "0",
+        "FROZEN_BOUNDS" => get(ENV, "FROZEN_BOUNDS", "0"),
+        "FROZEN_REL_WIDTH" => get(ENV, "FROZEN_REL_WIDTH", "0.05"),
+        "P_FROZEN_mu0" => get(ENV, "P_FROZEN_mu0", "0.3006891")
     )
     run_cmd(env; tag="seed")
     # Rename checkpoint for clarity
@@ -214,8 +219,60 @@ function main()
         mode_seed()
     elseif mode == "seed_reduced"
         mode_seed_reduced()
+    elseif mode == "seed_frozen"
+        # Use frozen bounds inside seeding (activate via ENV overrides)
+        ENV["FROZEN_BOUNDS"] = "1"
+        mode_seed()
     elseif mode == "seed_run"
         mode_seed_run()
+    elseif mode == "seed_run_frozen"
+        # Seeded run keeping frozen bounds active
+        ck = joinpath(RESULTS_DIR, "zenteno_seed_checkpoint.jld2")
+        if !isfile(ck)
+            error("Seed checkpoint missing: $(ck). Run 'seed_frozen' first.")
+        end
+        wall = get(ENV, "SEED_RUN_WALL_TIME", "360")
+        env = Dict(
+            "HOMOTOPY" => "0",
+            "INIT_FROM_CHECKPOINT" => "1",
+            "CHECKPOINT_PATH" => ck,
+            "INIT_FROM_ODE" => "0",
+            "INIT_DUAL_FE" => "0",
+            "REDUCED_MODE" => "0",
+            "WALL_TIME" => wall,
+            "FROZEN_BOUNDS" => get(ENV, "FROZEN_BOUNDS", "1"),
+            "FROZEN_REL_WIDTH" => get(ENV, "FROZEN_REL_WIDTH", "0.05"),
+            "P_FROZEN_mu0" => get(ENV, "P_FROZEN_mu0", "0.3006891")
+        )
+        run_cmd(env; tag="seed_run_frozen")
+        rep = latest("zenteno_estimation_report_")
+        if rep !== nothing
+            SSE = PEN = REG = OBJ = FO_L_max = FO_U_max = FO_upt_max = NaN
+            for ln in eachline(joinpath(RESULTS_DIR, basename(rep)))
+                if startswith(ln, "SSE="); SSE = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "PEN="); PEN = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "REG="); REG = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "OBJ="); OBJ = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "FO_L_max="); FO_L_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "FO_U_max="); FO_U_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+                if startswith(ln, "FO_upt_max="); FO_upt_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+            end
+            comp_max = maximum([FO_L_max, FO_U_max, FO_upt_max])
+            metrics_path = joinpath(RESULTS_DIR, "zenteno_metrics_seeded_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+            open(metrics_path, "w") do io
+                println(io, "tag=seeded_frozen")
+                println(io, @sprintf("SSE=%.6e", SSE))
+                println(io, @sprintf("PEN=%.6e", PEN))
+                println(io, @sprintf("REG=%.6e", REG))
+                println(io, @sprintf("OBJ=%.6e", OBJ))
+                println(io, @sprintf("comp_max=%.6e", comp_max))
+                println(io, @sprintf("stationarity_residual=%.6e", NaN))
+                println(io, @sprintf("comp_sum=%.6e", NaN))
+            end
+            println("[SEED_RUN_FROZEN] Saved seeded metrics: ", metrics_path)
+        else
+            println("[SEED_RUN_FROZEN] No estimation report found; metrics skipped")
+        end
     elseif mode == "compare"
         mode_compare()
     else
