@@ -1,0 +1,10 @@
+tag=hom_s1
+phi=0.01, w=0.0001
+status=TIME_LIMIT
+primal_status=INFEASIBLE_POINT
+objective=146741.3082723547
+comp_max=7.745882e+02
+stationarity_residual=NaN
+SSE=1.443732e+05
+PEN=1.184040e+04
+REG=6.209357e-02

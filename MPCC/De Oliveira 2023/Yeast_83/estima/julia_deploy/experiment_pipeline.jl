@@ -146,7 +146,15 @@ function mode_seed()
         "REDUCED_MODE" => "0",
         "FROZEN_BOUNDS" => get(ENV, "FROZEN_BOUNDS", "0"),
         "FROZEN_REL_WIDTH" => get(ENV, "FROZEN_REL_WIDTH", "0.05"),
-        "P_FROZEN_mu0" => get(ENV, "P_FROZEN_mu0", "0.3006891")
+        "P_FROZEN_mu0" => get(ENV, "P_FROZEN_mu0", "0.3006891"),
+        # Default BV hybrid: ON for S1–S2, OFF for S3; uptake-only; mild bounds for uptakes
+        "BV_ON" => get(ENV, "BV_ON", "1"),
+        "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
+        "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
+        "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
+        "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
+        # Explicit 3-stage mask by default (matches default HOM lists here)
+        "BV_PHASES" => get(ENV, "BV_PHASES", "1,1,0")
     )
     run_cmd(env; tag="seed")
     # Rename checkpoint for clarity
@@ -275,18 +283,24 @@ function main()
         end
         mode_seed()
     elseif mode == "seed180"
-        # 3-stage homotopy compressed into 180s (weights 1,1,1). No BV.
+        # 3-stage homotopy compressed into 180s (weights 1,1,1).
         for (k,v) in Dict(
             "SEED_WALL_TIME" => "180",
             "SEED_HOM_PHI" => get(ENV, "SEED_HOM_PHI", "1e-2,1e-1,1"),
             "SEED_HOM_W" => get(ENV, "SEED_HOM_W", "1e-4,1e-5,1e-6"),
             "SEED_HOM_WEIGHTS" => "1,1,1",
             "FROZEN_BOUNDS" => "0",
-            "BV_ON" => "0"
+            # Default hybrid BV (uptake-only)
+            "BV_ON" => get(ENV, "BV_ON", "1"),
+            "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
+            "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
+            "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
+            "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
+            "BV_PHASES" => get(ENV, "BV_PHASES", "1,1,0")
         )
             ENV[k] = v
         end
-        println("[SEED180] Running 180s multi-stage homotopy without BV")
+        println("[SEED180] Running 180s multi-stage homotopy with default hybrid BV (S1–S2 on, S3 off)")
         mode_seed()
     elseif mode == "seed180_bv"
         # 3-stage homotopy 180s with BV uptake constraints.
@@ -300,73 +314,106 @@ function main()
             "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
             "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
             "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
-            "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0")
+            "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
+            "BV_PHASES" => get(ENV, "BV_PHASES", "1,1,0")
         )
             ENV[k] = v
         end
         println("[SEED180_BV] Running 180s multi-stage homotopy with BV constraints (scope=$(ENV["BV_SCOPE"]))")
         mode_seed()
+    elseif mode == "seed180_cf"
+        # Coarse->Fine pipeline with total wall < direct 180s (default: 60s coarse, 100s fine)
+        cf = get(ENV, "COARSE_TO_FINE", "6,12")
+        parts = split(cf, [',',';',' '])
+        if length(parts) < 2
+            error("COARSE_TO_FINE must be like '6,12'")
+        end
+        coarse_nfe = parse(Int, strip(parts[1])); fine_nfe = parse(Int, strip(parts[2]))
+        # Coarse stage
+        local t0 = Dates.now()
+        for (k,v) in Dict(
+            "NFE" => string(coarse_nfe),
+            "SEED_WALL_TIME" => get(ENV, "COARSE_WALL_TIME", "60"),
+            "SEED_HOM_PHI" => get(ENV, "SEED_HOM_PHI", "1e-2,1e-1,1"),
+            "SEED_HOM_W" => get(ENV, "SEED_HOM_W", "1e-4,1e-5,1e-6"),
+            "SEED_HOM_WEIGHTS" => "1,1,1",
+            # BV hybrid on coarse as well
+            "BV_ON" => get(ENV, "BV_ON", "1"),
+            "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
+            "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
+            "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
+            "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
+            "BV_PHASES" => get(ENV, "BV_PHASES", "1,1,0")
+        )
+            ENV[k] = v
+        end
+        println("[CF] Coarse stage: NFE=$(ENV["NFE"]) wall=$(ENV["SEED_WALL_TIME"])s")
+        mode_seed()
+        ck_coarse = joinpath(RESULTS_DIR, "zenteno_handoff_full_checkpoint.jld2")
+        if !isfile(ck_coarse)
+            error("Coarse checkpoint missing: " * ck_coarse)
+        end
+        # Fine stage
+        for (k,v) in Dict(
+            "NFE" => string(fine_nfe),
+            "SEED_WALL_TIME" => get(ENV, "FINE_WALL_TIME", "100"),
+            "SEED_HOM_PHI" => get(ENV, "SEED_HOM_PHI", "1e-2,1e-1,1"),
+            "SEED_HOM_W" => get(ENV, "SEED_HOM_W", "1e-4,1e-5,1e-6"),
+            "SEED_HOM_WEIGHTS" => "1,1,1",
+            "BV_ON" => get(ENV, "BV_ON", "1"),
+            "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
+            "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
+            "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
+            "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
+            "BV_PHASES" => get(ENV, "BV_PHASES", "1,1,0"),
+            # coarse→fine mapping flags
+            "INIT_FROM_COARSE_CHECKPOINT" => "1",
+            "CHECKPOINT_PATH" => ck_coarse,
+            # trim overhead on fine stage
+            "SKIP_PRE_ODE" => get(ENV, "SKIP_PRE_ODE_FINE", "1"),
+            "SKIP_PLOTS" => get(ENV, "SKIP_PLOTS_FINE", "1"),
+            "BASELINE_WRITE" => get(ENV, "BASELINE_WRITE_FINE", "0"),
+            # prefer preserving warm start instead of re-running ODE seeding
+            "SEED_INIT_FROM_ODE" => get(ENV, "SEED_INIT_FROM_ODE_FINE", "0")
+        )
+            ENV[k] = v
+        end
+        println("[CF] Fine stage: NFE=$(ENV["NFE"]) wall=$(ENV["SEED_WALL_TIME"])s with coarse→fine mapping")
+        mode_seed()
+        local t1 = Dates.now()
+        local dt = convert(Int, Dates.value(t1 - t0) ÷ 1000)
+        println("[CF] Total wall coarse→fine ≈ ", dt, " s")
+        # Save quick comparison vs direct fine 180s
+        # Run direct fine 180s (or use existing) only if explicitly requested via ENV CF_COMPARE
+        if get(ENV, "CF_COMPARE", "0") == "1"
+            for (k,v) in Dict("NFE"=>string(fine_nfe)) ENV[k]=v; end
+            println("[CF] Running direct fine 180s for comparison…")
+            for (k,v) in Dict("SEED_WALL_TIME"=>"180") ENV[k]=v; end
+            mode_seed()
+        end
+    elseif mode == "seed_cf"
+        # Alias to seed180_cf
+        ARGS[1] = "seed180_cf"
+        main()
     elseif mode == "seed180_bv12"
-        # Hybrid: 120s for stages 1–2 with BV uptake constraints, then 60s for stage 3 without BV from checkpoint.
-        # Part 1: S1–S2 with BV
-        env1 = Dict(
-            "HOMOTOPY" => "1",
-            "HOM_PHI" => "1e-2,1e-1",
-            "HOM_W" => "1e-4,1e-5",
-            # With nst=2, default weights resolve to 2,2; give 60s per stage when WALL_TIME=120
-            "HOM_WEIGHTS" => get(ENV, "SEED_HOM_WEIGHTS", "2,2"),
-            "WALL_TIME" => "120",
-            "INIT_FROM_ODE" => get(ENV, "SEED_INIT_FROM_ODE", "1"),
-            "INIT_DUAL_FE" => get(ENV, "SEED_INIT_DUAL_FE", "1"),
-            "HANDOFF_FULL" => "1",
-            "HANDOFF_STAGE" => "2",
-            "REDUCED_MODE" => "0",
+        # Explicit hybrid BV: S1–S2 ON, S3 OFF (uptake-only), 180s
+        for (k,v) in Dict(
+            "SEED_WALL_TIME" => "180",
+            "SEED_HOM_PHI" => get(ENV, "SEED_HOM_PHI", "1e-2,1e-1,1"),
+            "SEED_HOM_W" => get(ENV, "SEED_HOM_W", "1e-4,1e-5,1e-6"),
+            "SEED_HOM_WEIGHTS" => "1,1,1",
             "FROZEN_BOUNDS" => "0",
-            # BV settings (uptake only by default)
             "BV_ON" => "1",
             "BV_SCOPE" => get(ENV, "BV_SCOPE", "uptake"),
             "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
             "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
             "DV_MAX_COMMON" => get(ENV, "DV_MAX_COMMON", "50.0"),
-            # Pass-through Ipopt/MUMPS memory tuning if set
-            "IPOPT_MUMPS_MEM_PERCENT" => get(ENV, "IPOPT_MUMPS_MEM_PERCENT", "")
+            "BV_PHASES" => "1,1,0"
         )
-        println("[SEED180_BV12] Part 1/2: 120s, BV_ON=1 (scope=$(get(env1, "BV_SCOPE", "uptake"))) for stages 1–2")
-        run_cmd(env1; tag="seed_bv12_part1")
-        # Copy/confirm checkpoint
-        ck = joinpath(RESULTS_DIR, "zenteno_handoff_full_checkpoint.jld2")
-        if isfile(ck)
-            new_ck = joinpath(RESULTS_DIR, "zenteno_seed_checkpoint.jld2")
-            cp(ck, new_ck; force=true)
-            println("[SEED_BV12] Copied checkpoint to ", new_ck)
-        else
-            println("[SEED_BV12] Warning: checkpoint not found at ", ck)
+            ENV[k] = v
         end
-        # Part 2: S3 only without BV from checkpoint (60s)
-        ck2 = joinpath(RESULTS_DIR, "zenteno_seed_checkpoint.jld2")
-        if !isfile(ck2)
-            error("Seed checkpoint missing: $(ck2). Part 1 must succeed before Part 2.")
-        end
-        env2 = Dict(
-            "HOMOTOPY" => "1",
-            "HOM_PHI" => "1.0",
-            "HOM_W" => "1e-6",
-            "HOM_WEIGHTS" => "1",
-            "WALL_TIME" => "60",
-            "INIT_FROM_CHECKPOINT" => "1",
-            "CHECKPOINT_PATH" => ck2,
-            # Ensure we don't override checkpoint starts
-            "INIT_FROM_ODE" => "0",
-            "INIT_DUAL_FE" => "0",
-            "INIT_PIPELINE" => "0",
-            "REDUCED_MODE" => "0",
-            "FROZEN_BOUNDS" => "0",
-            # BV off for closing stage
-            "BV_ON" => "0",
-            # Pass-through memory tuning if set
-            "IPOPT_MUMPS_MEM_PERCENT" => get(ENV, "IPOPT_MUMPS_MEM_PERCENT", "")
-        )
-        run_cmd(env2; tag="seed_bv12_part2")
+        println("[SEED180_BV12] Running 180s homotopy with BV in S1–S2 and off in S3 (uptake-only)")
+        mode_seed()
     elseif mode == "seed_reduced"
         mode_seed_reduced()
     elseif mode == "seed_frozen"

@@ -40,6 +40,11 @@ catch err
     @warn "Plot/ODE packages missing; run Pkg.add([\"DifferentialEquations\",\"Plots\"]) to enable ODE simulation and plotting" err
 end
 
+# Optional runtime flags to trim overhead in orchestration
+const SKIP_PRE_ODE = get(ENV, "SKIP_PRE_ODE", "0") == "1"
+const SKIP_PLOTS   = get(ENV, "SKIP_PLOTS", "0") == "1"
+const BASELINE_WRITE = get(ENV, "BASELINE_WRITE", "1") == "1"
+
 # ---------------------------------------------
 # Paths and IO
 # ---------------------------------------------
@@ -127,8 +132,8 @@ end
 # Collocation and run configuration
 # ---------------------------------------------
 nc = 5              # X,N,G,F,E
-# Test configuration: 240 h horizon, 12 finite elements (20 h per element)
-nfe = 12            # number of finite elements
+# Test configuration: 240 h horizon, finite elements from ENV (default 12)
+nfe = try parse(Int, get(ENV, "NFE", "12")) catch; 12 end            # number of finite elements
 ncp = 3             # collocation points (Radau-3)
 th = 240.0          # total horizon (hours)
 
@@ -376,10 +381,11 @@ set_optimizer_attribute(m, "acceptable_tol", 1e-2)
 set_optimizer_attribute(m, "linear_solver", "mumps")
 set_optimizer_attribute(m, "mu_strategy", "adaptive")
 set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based")
-# Optional MUMPS memory percent; default to a safer 150 unless overridden via ENV
-let mm = try parse(Int, get(ENV, "IPOPT_MUMPS_MEM_PERCENT", "150")) catch; 150 end
-    set_optimizer_attribute(m, "mumps_mem_percent", mm)
-    println("[CFG] Ipopt mumps_mem_percent=", mm)
+# Optional MUMPS memory percent override to mitigate out-of-memory or oversubscription
+if haskey(ENV, "IPOPT_MUMPS_MEM_PERCENT")
+    mumps_mem = try parse(Int, ENV["IPOPT_MUMPS_MEM_PERCENT"]) catch; 100 end
+    set_optimizer_attribute(m, "mumps_mem_percent", mumps_mem)
+    println("[CFG] Ipopt mumps_mem_percent=", mumps_mem)
 end
 # Wall-clock time configurable via ENV["WALL_TIME"] (default 600 s). Use 60 for quick diagnostic runs.
 wall_time = try parse(Float64, get(ENV, "WALL_TIME", "600")) catch; 600.0 end
@@ -510,6 +516,109 @@ if INIT_FROM_CHECKPOINT
         end
     catch err
         @warn "Failed to load checkpoint warm start" err
+    end
+end
+
+# Optional coarse→fine warm start mapping
+if get(ENV, "INIT_FROM_COARSE_CHECKPOINT", "0") == "1"
+    try
+        if isfile(CHECKPOINT_PATH)
+            JLD2.jldopen(CHECKPOINT_PATH, "r") do f
+                # Expect arrays from a coarse run
+                local Cc = haskey(f, "c") ? read(f, "c") : nothing
+                local HVc = haskey(f, "hv") ? read(f, "hv") : nothing
+                local Vc = haskey(f, "v") ? read(f, "v") : nothing
+                local ALc = haskey(f, "alpha_L") ? read(f, "alpha_L") : nothing
+                local AUc = haskey(f, "alpha_U") ? read(f, "alpha_U") : nothing
+                local LMCo = haskey(f, "lambda_") ? read(f, "lambda_") : nothing
+                local AUptc = haskey(f, "alpha_upt") ? read(f, "alpha_upt") : nothing
+                if Cc === nothing || HVc === nothing
+                    @warn "Coarse checkpoint missing required keys hv/c" keys(f)
+                else
+                    local nfe_c = size(Cc, 2)
+                    local nfe_f = nfe
+                    # Build time nodes for coarse and fine
+                    local t_coarse = cumsum(HVc)
+                    local HVf = [try value(hv[i]) catch; hm[i] end for i in 1:nfe_f]
+                    local t_fine = cumsum(HVf)
+                    # Linear interpolation helper on endpoints
+                    function lin_interp(x::Vector{Float64}, y::Vector{Float64}, xq::Float64)
+                        if xq <= x[1]; return y[1]; end
+                        if xq >= x[end]; return y[end]; end
+                        # find interval
+                        local j = findfirst(i -> x[i] >= xq, 1:length(x))
+                        if j === nothing || j == 1; return y[1]; end
+                        local i1 = j - 1; local i2 = j
+                        local w = (xq - x[i1]) / max(x[i2] - x[i1], 1e-12)
+                        return (1 - w) * y[i1] + w * y[i2]
+                    end
+                    println("[INIT] Coarse→fine mapping: coarse_nfe=", nfe_c, " → fine_nfe=", nfe_f)
+                    # States: interpolate FE-end c[:,i,ncp] over time; set all collocation points to same start
+                    for i_f in 1:nfe_f
+                        local tf = t_fine[i_f]
+                        for l in 1:nc
+                            # Gather coarse FE-end series for state l
+                            local y_c = [Cc[l, i_c, ncp] for i_c in 1:nfe_c]
+                            local val = lin_interp(t_coarse, y_c, tf)
+                            for j in 1:ncp
+                                set_start_value(c[l, i_f, j], val)
+                                # Approximate cdot as finite diff between neighboring FE ends (constant per FE)
+                                local prev_t = (i_f == 1 ? 0.0 : t_fine[i_f-1])
+                                local prev_val = lin_interp(t_coarse, y_c, prev_t)
+                                local slope = (val - prev_val) / max(t_fine[i_f] - prev_t, 1e-12)
+                                set_start_value(cdot[l, i_f, j], slope)
+                            end
+                        end
+                    end
+                    # Fluxes: interpolate per reaction across FE
+                    if Vc !== nothing
+                        for k in 1:nv
+                            local y_c = [Vc[k, i_c] for i_c in 1:nfe_c]
+                            for i_f in 1:nfe_f
+                                set_start_value(v[k, i_f], lin_interp(t_coarse, y_c, t_fine[i_f]))
+                            end
+                        end
+                    end
+                    # Alphas/Lambdas/Uptake alphas: nearest-neighbor by time
+                    function nn_index(x::Vector{Float64}, xq::Float64)
+                        local j = findfirst(i -> x[i] >= xq, 1:length(x))
+                        if j === nothing; return length(x); end
+                        if j == 1; return 1; end
+                        return (xq - x[j-1] <= x[j] - xq) ? (j-1) : j
+                    end
+                    if ALc !== nothing && AUc !== nothing
+                        for i_f in 1:nfe_f
+                            local idx = nn_index(t_coarse, t_fine[i_f])
+                            for k in 1:nv
+                                try set_start_value(alpha_L[k, i_f], ALc[k, idx]) catch; end
+                                try set_start_value(alpha_U[k, i_f], AUc[k, idx]) catch; end
+                            end
+                        end
+                    end
+                    if LMCo !== nothing
+                        for i_f in 1:nfe_f
+                            local idx = nn_index(t_coarse, t_fine[i_f])
+                            for r in 1:nm
+                                try set_start_value(lambda_[r, i_f], LMCo[r, idx]) catch; end
+                            end
+                        end
+                    end
+                    if AUptc !== nothing
+                        for i_f in 1:nfe_f
+                            local idx = nn_index(t_coarse, t_fine[i_f])
+                            for u in 1:2
+                                try set_start_value(alpha_upt[u, i_f], AUptc[u, idx]) catch; end
+                            end
+                        end
+                    end
+                    println("[INIT] Applied coarse→fine warm start mapping from ", CHECKPOINT_PATH)
+                end
+            end
+        else
+            @warn "INIT_FROM_COARSE_CHECKPOINT=1 but file not found" CHECKPOINT_PATH
+        end
+    catch err
+        @warn "Failed coarse→fine mapping" err
     end
 end
 
@@ -899,14 +1008,15 @@ end
 # Separate dv_max for glucose/fructose uptake vs common reactions.
 # ENV defaults (override as needed):
 #   BV_ON (0/1), DV_MAX_GLU, DV_MAX_FRU, DV_MAX_COMMON
+# Additionally, allow stage-wise activation via BV_PHASES (comma-separated 0/1),
+# implemented by scaling bounds with a fixed parameter bv_scale_param per stage
+# (1.0 = active; large value ~1e6 = effectively off).
 # -----------------------------------------------------------
 const BV_ON = get(ENV, "BV_ON", "0") == "1"
-# Default scope now 'uptake' to match recommended usage; when BV_ON=0 this has no effect
-const BV_SCOPE = lowercase(get(ENV, "BV_SCOPE", "uptake"))  # 'all' or 'uptake'
-# Tighter default uptake variation caps based on trials; common left moderate unless explicitly scoping 'all'
-const DV_MAX_GLU   = try parse(Float64, get(ENV, "DV_MAX_GLU", "0.5")) catch; 0.5 end
-const DV_MAX_FRU   = try parse(Float64, get(ENV, "DV_MAX_FRU", "0.5")) catch; 0.5 end
-const DV_MAX_COMMON= try parse(Float64, get(ENV, "DV_MAX_COMMON", "50.0")) catch; 50.0 end
+const BV_SCOPE = lowercase(get(ENV, "BV_SCOPE", "all"))  # 'all' or 'uptake'
+const DV_MAX_GLU   = try parse(Float64, get(ENV, "DV_MAX_GLU", "1.0")) catch; 1.0 end
+const DV_MAX_FRU   = try parse(Float64, get(ENV, "DV_MAX_FRU", "1.0")) catch; 1.0 end
+const DV_MAX_COMMON= try parse(Float64, get(ENV, "DV_MAX_COMMON", "1e3")) catch; 1e3 end
 const BV_RXN_SET_RAW = strip(get(ENV, "BV_RXN_SET", ""))  # optional comma-separated list of reaction indices for BV
 BV_RXN_SET = BV_RXN_SET_RAW == "" ? Int[] : begin
     parsed = Int[]
@@ -920,6 +1030,9 @@ BV_RXN_SET = BV_RXN_SET_RAW == "" ? Int[] : begin
     parsed
 end
 if BV_ON
+    # Stage-wise scale (fixed variable) to enable/disable BV per homotopy stage
+    @variable(m, bv_scale_param >= 0.0)
+    fix(bv_scale_param, 1.0; force=true)
     println("[CFG] BV_ON=1; scope=$(BV_SCOPE); dv_max_glu=$(DV_MAX_GLU), dv_max_fru=$(DV_MAX_FRU), dv_max_common=$(DV_MAX_COMMON); BV_RXN_SET_RAW='" * BV_RXN_SET_RAW * "'")
     # Determine base candidate set (respect reduced mode)
     base_set = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
@@ -940,8 +1053,8 @@ if BV_ON
     for k in rxn_set
         dvk = (k == glu) ? DV_MAX_GLU : (k == fru ? DV_MAX_FRU : DV_MAX_COMMON)
         for i in 2:nfe
-            @constraint(m, v[k, i] - v[k, i-1] <= dvk * hv[i])
-            @constraint(m, v[k, i] - v[k, i-1] >= -dvk * hv[i])
+            @constraint(m, v[k, i] - v[k, i-1] <= dvk * hv[i] * bv_scale_param)
+            @constraint(m, v[k, i] - v[k, i-1] >= -dvk * hv[i] * bv_scale_param)
         end
     end
     println("[CFG] BV constraints added: reactions=", rxn_set)
@@ -1066,6 +1179,7 @@ end
 # ---------------------------------------------
 # Baseline metrics harness (before optimization / homotopy)
 # ---------------------------------------------
+if BASELINE_WRITE
 try
     base_path = joinpath(RESULTS_DIR, "zenteno_metrics_baseline_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
     n_v_axes = (!REDUCED_MODE || reduced_sets === nothing) ? nv : length(K_AX)
@@ -1217,10 +1331,14 @@ try
 catch err
     @warn "Baseline metrics harness failed" err
 end
+else
+    println("[BASE] Skipping baseline metrics write (BASELINE_WRITE=0)")
+end
 
 # ---------------------------------------------
 # Solve
 # ---------------------------------------------
+if !SKIP_PRE_ODE
 println("[INFO] Pre-optimization ODE simulation @ ", Dates.now())
 
 # ---------------------------------------------
@@ -1331,9 +1449,17 @@ try
         Plots.title!(plt_pre[4], @sprintf("E (R²=%.3f)", r2E))
     end
     Plots.png(plt_pre, pre_path)
-    println("[PLOT] Saved pre-optimization ODE plot ", pre_path)
+    if SKIP_PLOTS
+        println("[PLOT] SKIP_PLOTS=1, skipping save of pre-optimization plot")
+    else
+        Plots.png(plt_pre, pre_path)
+        println("[PLOT] Saved pre-optimization ODE plot ", pre_path)
+    end
 catch err
     @warn "Pre-optimization ODE simulation failed" err
+end
+else
+    println("[INFO] Skipping pre-optimization ODE simulation (SKIP_PRE_ODE=1)")
 end
 
 println("[INFO] Starting optimization @ ", Dates.now())
@@ -1357,6 +1483,22 @@ if HOMOTOPY
         HOM_WEIGHTS = fill(1, nst)
     end
     total_w = max(sum(HOM_WEIGHTS), 1)
+    # Determine BV activation per stage: parse ENV BV_PHASES (e.g., "1,1,0").
+    # Default when BV_ON: activate all but the last stage (1,...,1,0).
+    bv_mask = Int[]
+    if BV_ON
+        bv_phases_str = get(ENV, "BV_PHASES", "")
+        if !isempty(bv_phases_str)
+            bv_mask = _parse_int_list(bv_phases_str)
+        end
+        if isempty(bv_mask) || length(bv_mask) != nst
+            bv_mask = fill(1, nst)
+            if nst >= 1
+                bv_mask[end] = 0
+            end
+        end
+        println("[BV] Stage mask (1=on,0=off): ", bv_mask)
+    end
     for idx in 1:nst
         local per_stage_wall = wall_time * (HOM_WEIGHTS[idx] / total_w)
         local phi_i = HOM_PHI[idx]
@@ -1367,6 +1509,16 @@ if HOMOTOPY
         fix(phi2_param, phi_i; force=true)
         fix(phi3_param, phi_i; force=true)
         fix(w_param,   w_i;   force=true)
+        # Toggle BV per stage via bv_scale_param (1.0 on, 1e6 off)
+        try
+            if BV_ON
+                local on = (bv_mask[idx] != 0)
+                fix(bv_scale_param, on ? 1.0 : 1e6; force=true)
+                println("[BV] Stage $(idx) active=", on)
+            end
+        catch
+            # bv_scale_param not defined (BV_OFF)
+        end
         # Adjust Ipopt wall clock for this stage
         set_optimizer_attribute(m, "max_wall_time", per_stage_wall)
         optimize!(m)
@@ -1546,6 +1698,7 @@ end
     # Post-optimization ODE simulation (optimized for estimables, nominal for fixed)
     # Saves plot: zenteno_post_ode_vs_data_*.png (continuous ODE line + synthetic data scatter)
     # ---------------------------------------------
+    if !SKIP_PLOTS
     try
         function param_opt_exp(sym)
             i = Pidx(sym)
@@ -1662,6 +1815,9 @@ end
         println("[PLOT] Saved post-optimization ODE plot ", post_path)
     catch err
         @warn "Post-optimization ODE simulation failed" err
+    end
+    else
+        println("[PLOT] Skipping post-optimization ODE and plot (SKIP_PLOTS=1)")
     end
 
 ## (Removed standalone ODE vs MPCC plot; now integrated into the post-optimization plot.)
