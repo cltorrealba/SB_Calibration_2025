@@ -1,0 +1,10 @@
+tag=hom_s3
+phi=1.0, w=1.0e-6
+status=TIME_LIMIT
+primal_status=NEARLY_FEASIBLE_POINT
+objective=363347.0317930178
+comp_max=4.208449e+01
+stationarity_residual=4.618528e-14
+SSE=2.547835e+05
+PEN=5.428177e+05
+REG=4.800469e-01

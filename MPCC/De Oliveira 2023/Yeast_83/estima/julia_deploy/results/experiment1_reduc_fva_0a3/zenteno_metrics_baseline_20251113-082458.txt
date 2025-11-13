@@ -1,0 +1,8 @@
+tag=baseline
+SSE=2.955780e+05
+PEN=2.079424e+06
+REG=4.792294e-01
+OBJ=7.114629e+05
+comp_max=1.883810e+02
+stationarity_residual=NaN
+comp_sum=NaN

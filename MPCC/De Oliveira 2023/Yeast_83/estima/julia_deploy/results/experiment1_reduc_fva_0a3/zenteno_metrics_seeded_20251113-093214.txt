@@ -1,0 +1,8 @@
+tag=seeded
+SSE=2.563243e+05
+PEN=1.545989e+06
+REG=8.712845e-02
+OBJ=5.655221e+05
+comp_max=4.026590e+01
+stationarity_residual=NaN
+comp_sum=NaN

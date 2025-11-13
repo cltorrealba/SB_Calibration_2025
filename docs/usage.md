@@ -181,4 +181,150 @@ from sb_calibration.preprocess import sugar_density as sd
 pipeline, coefs = sd.run_from_csv('data/sugar_density_dataset.csv', 'sugar_density_model_coeffs.txt')
 ```
 
+# Calibración dinámica MPCC (Julia) — Modo reducido, homotopía e inicialización
+
+Esta sección documenta el flujo Julia (`MPCC_Zenteno.jl`) usado para una calibración relajada tipo MPCC con reducción estructural y homotopía en penalizaciones de complementariedad.
+
+## Objetivos del pipeline
+
+1. Disminuir tamaño (reacciones y filas de S) vía conjuntos pFBA/FVA (A, C, F) → modo reducido.
+2. Sembrar valores iniciales consistentes (estados, flujos, multiplicadores, productos FO) para mejorar robustez.
+3. Aplicar homotopía multi–etapa sobre (φ, w) para tensar la complementariedad gradualmente.
+4. Registrar métricas basales y por etapa para comparar configuraciones y justificar parámetros.
+
+## Archivos clave
+
+| Archivo | Descripción |
+|---------|-------------|
+| `pfba_preprocess.jl` | Genera `results/reduced_sets.jld2` con A, C, F por FE. Debe ejecutarse antes si `REDUCED_MODE=1`. |
+| `MPCC_Zenteno.jl` | Modelo JuMP: estados, flujos, penalizaciones, homotopía, escritura de métricas y plots. |
+| `results/zenteno_metrics_baseline_*.txt` | Métricas antes de optimizar (tamaños, SSE0, PEN0, OBJ0, comp_max0, flags). |
+| `results/zenteno_metrics_hom_sX_*.txt` | Métricas por etapa homotopía (phi, w, SSE, PEN, comp_max, stationarity_residual). |
+| `results/zenteno_estimation_report_*.txt` | Resumen final (parámetros, FO_* stats, objetivo). |
+| `zenteno_pre_ode_vs_data_*.png` / `zenteno_post_ode_vs_data_mpcc_*.png` | Comparación ODE inicial y final vs datos. |
+
+## Variables de entorno (ENV)
+
+| Var | Tipo | Default | Función |
+|-----|------|---------|---------|
+| `REDUCED_MODE` | {0,1} | 0 | Activa reconstrucción de un submodelo con sólo reacciones candidatas (A∪C) y filas activas de S. |
+| `REDUCED_DISABLE_UPTAKE` | {0,1} | 0 | Elimina (si=1) desigualdades de uptake y sus FO asociados (para aislar comportamiento). |
+| `PEN_REDUCED` | {0,1} | 1 | Si=1 suma penalizaciones sólo sobre candidatos C por FE; si=0 (legado) todas las reacciones. |
+| `PEN_NONNEG` | {0,1} | 1 | Penalización suave no negativa sqrt(FO^2+ε) en lugar de lineal con signo. |
+| `INIT_PIPELINE` | {0,1} | 1 | Activa bloque general de inicialización. |
+| `INIT_FROM_ODE` | {0,1} | 0 | Corre una ODE forward nominal y siembra estados (c, cdot) en los FE. |
+| `INIT_DUAL_FE` | {0,1} | hereda INIT_PIPELINE | Siembra v, α, λ, y FO_* por FE (heurísticas pFBA). |
+| `HOMOTOPY` | {0,1} | 0 | Activa homotopía multi–etapa. |
+| `HOM_PHI` | lista | 1e-2,1e-1,1,10 (si HOMOTOPY=1) | Escala de penalización φ por etapa (aplica a FO_L/FO_U/FO_upt). |
+| `HOM_W` | lista | 1e-4,1e-5,1e-6,1e-8 | Ridge pFBA w en stationarity por etapa. |
+| `HOM_WEIGHTS` | lista int | 1,1,2,4 | Distribución de wall-time relativo por etapa. |
+| `W_SSE` | float | 1.0 | Peso SSE en objetivo. |
+| `W_PEN` | float | 0.2 (cambiado típicamente a 0.1) | Peso global de la penalización de complementariedad. |
+| `WALL_TIME` | seg | 600 | Límite muro total (se reparte si hay homotopía). |
+
+## Flujo recomendado (módulos 0–3)
+
+1. (Mód 0) Preprocesar reducción: ejecutar `pfba_preprocess.jl` ⇒ `reduced_sets.jld2`.
+2. (Mód 1) Inicialización primal: `INIT_FROM_ODE=1` para estados coherentes dinámicamente.
+3. (Mód 2) Inicialización dual / FO: `INIT_DUAL_FE=1` (por defecto si INIT_PIPELINE=1).
+4. (Mód 3) Homotopía: `HOMOTOPY=1` con schedule recomendado (abajo). Se generan métricas por etapa.
+
+## Schedule de homotopía recomendado
+
+| Etapa | φ | w | Peso tiempo | Justificación |
+|-------|---|---|-------------|---------------|
+| 1 | 1e-2 | 1e-4 | 1 | Penalización suave mínima; favorece ajuste SSE inicial. |
+| 2 | 1e-1 | 1e-5 | 1 | Incrementa presión complementaria manteniendo exploración. |
+| 3 | 1 | 1e-6 | 2 | Fase de refinamiento SSE con tightening moderado. |
+| 4 | 10 | 1e-8 | 4 | Fase de pulido: apretar FO manteniendo estabilidad (evitamos φ=100 por explosión PEN). |
+
+### Racional para pesos 1,1,2,4
+
+Damos más tiempo a etapas donde la no linealidad y rigidez aumentan (φ alto y w bajo) para permitir convergencia parcial antes de forzar límites de tiempo.
+
+### Selección de `W_PEN`
+
+Se observó inflación de PEN y degradación de SSE al subir φ sin ajustar peso. Rango útil: 0.05–0.2. Usar 0.1 como punto de partida. Si `comp_max` baja pero SSE empeora >5–10% respecto a etapa previa, reducir `W_PEN` o frenar en etapa 3.
+
+## Métricas clave
+
+| Métrica | Fuente | Interpretación |
+|---------|--------|---------------|
+| `SSE` | Expresión JuMP | Ajuste datos (medidos: X,G,F,E). |
+| `PEN` | Expresión JuMP | Suma penalizaciones FO ponderadas por φ. |
+| `comp_max` | Archivo etapa | Máximo |FO| (incluye uptake); objetivo: decrecer al final (<1e3 en runs reducidos actuales). |
+| `stationarity_residual` | Archivo etapa | Máx |LHS stationarity| en reacciones candidatas (proxy optimalidad). Ideal ↓. |
+| `OBJ` | Archivo etapa | Objetivo total ponderado. |
+| `SSE0`, `PEN0`, `OBJ0` | Baseline | Pre-optimización (para juzgar ganancia relativa). |
+
+### Archivos de métricas
+
+Ejemplo de nombres:
+
+```
+results/zenteno_metrics_baseline_20251112-153458.txt
+results/zenteno_metrics_hom_s1_20251112-153526.txt
+...
+```
+
+Campos típicos (etapa):
+
+```
+tag=hom_s3
+phi=1.0, w=1.0e-6
+SSE=2.500000e+05
+PEN=4.990000e+06
+comp_max=1.880000e+04
+stationarity_residual=2.930000e-02
+```
+
+### Criterios prácticos de avance / parada
+
+1. Si `stationarity_residual` ≳ 1e-1 y `comp_max` no desciende tras dos etapas → revisar inicialización (quizá activar INIT_FROM_ODE) o bajar φ inicial.
+2. Si PEN domina (`W_PEN * PEN >> W_SSE * SSE`) y SSE empeora, reducir `W_PEN` y repetir etapas tardías.
+3. Si etapa 3 ofrece mejor SSE y etapa 4 sólo aumenta PEN sin bajar `comp_max` significativamente, considerar detener en 3 para handoff a modelo completo.
+
+## Ejecución rápida (PowerShell)
+
+```
+cd "...\julia_deploy"
+setx WALL_TIME 80
+$env:REDUCED_MODE="1"; $env:INIT_FROM_ODE="1"; $env:INIT_DUAL_FE="1"; `
+   $env:HOMOTOPY="1"; $env:HOM_PHI="1e-2,1e-1,1,10"; $env:HOM_W="1e-4,1e-5,1e-6,1e-8"; $env:HOM_WEIGHTS="1,1,2,4"; `
+   $env:W_PEN="0.1"; $env:PEN_NONNEG="1"; $env:PEN_REDUCED="1"; `
+   julia --project=. .\MPCC_Zenteno.jl
+```
+
+## Solución de problemas
+
+| Síntoma | Posible causa | Acción |
+|---------|---------------|--------|
+| `reduced_sets.jld2` no existe y warnings de reducción | No se corrió `pfba_preprocess.jl` | Ejecutar script; validar permisos de escritura en `results/`. |
+| `TIME_LIMIT` en primeras dos etapas con inf_pr alto | φ inicial demasiado agresivo o seeds pobres | Habilitar `INIT_FROM_ODE`; revisar bounds; bajar φ inicial a 1e-3 temporalmente. |
+| `PEN` crece varias órdenes en etapa 4, SSE empeora | W_PEN excesivo al tensar φ | Bajar `W_PEN` (p.ej. 0.05) o detener en etapa 3. |
+| `stationarity_residual` no baja | w demasiado grande al final | Asegurar etapa final con w ≤ 1e-8; revisar restricciones lambda reducidas. |
+| FO_upt todos ~0 en modo reducido cuando esperaba actividad | `REDUCED_DISABLE_UPTAKE=1` o no se incluyeron reacciones de uptake en A/C | Revisar flag y sets generados. |
+
+## Próximos módulos (planeado)
+
+| Módulo | Idea |
+|--------|------|
+| 4 | Límites de variación temporal en parámetros / smoothness |
+| 5 | Refinamiento malla (coarse→fine) usando solución homotopía como warm start |
+| 6 | Multistart / clustering inicial de semillas |
+| 7 | Reporte activo de sets residualizados (reacciones activas, α saturados) |
+| 8 | Ajustes solver adaptativos (cambiar tolerancias tras etapa 2) |
+| 9 | Comparador automático de métricas baseline vs nuevas estrategias |
+
+## Resumen rápido de recomendaciones
+
+- Activar reducción (`REDUCED_MODE=1`) para exploración y tuning de schedule; hacer handoff al modelo completo sólo cuando `comp_max` ≲ 1e3 y `stationarity_residual` ≲ 1e-2 (o al menos estable).
+- Usar ODE seeding (`INIT_FROM_ODE=1`) cuando los datos distan del start plano; acelera descenso inicial de SSE.
+- Mantener `PEN_NONNEG=1` para interpretabilidad (magnitudes directas) salvo análisis comparativos históricos.
+- Ajustar `W_PEN` si el ratio (W_PEN*PEN)/(W_SSE*SSE) > 5 temprano; objetivo rango 1–3 en etapas medias.
+- Guardar baseline siempre: permite cuantificar ganancias de inicialización antes de modificar schedule.
+
+---
+Última actualización: {{AUTO_DOC_FECHA}} (editar manualmente al cambiar parámetros recomendados).
+
 

@@ -1,3 +1,0 @@
-status=LOCALLY_SOLVED
-primal_status=FEASIBLE_POINT
-objective=92.55864760253144

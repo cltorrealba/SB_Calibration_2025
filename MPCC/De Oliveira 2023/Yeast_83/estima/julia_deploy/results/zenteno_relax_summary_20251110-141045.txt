@@ -1,3 +1,0 @@
-status=TIME_LIMIT
-primal_status=INFEASIBLE_POINT
-objective=207959.4001192777
