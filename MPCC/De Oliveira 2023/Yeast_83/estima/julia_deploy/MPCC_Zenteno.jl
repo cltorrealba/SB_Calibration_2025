@@ -291,6 +291,25 @@ if :mu0 in EST_SET
     UB[i_mu] = log(max(1e-12, 2.0 * Pnom[:mu0]))
 end
 
+# Optional: freeze (or tighten) bounds for estimable parameters (Experiment D scenario)
+# Activate with ENV FROZEN_BOUNDS=1. You can supply per-parameter center values via
+#   P_FROZEN_paramName (e.g. P_FROZEN_mu0=0.3007) and a relative half-width via FROZEN_REL_WIDTH (default 0.05).
+# If FROZEN_REL_WIDTH=0, bounds collapse to a single point (pure freeze).
+if get(ENV, "FROZEN_BOUNDS", "0") == "1"
+    relw = tryparse(Float64, get(ENV, "FROZEN_REL_WIDTH", "0.05"))
+    relw === nothing && (relw = 0.05)
+    for k in EST_SET
+        env_key = "P_FROZEN_" * String(k)
+        v = tryparse(Float64, get(ENV, env_key, string(Pnom[k])))
+        v === nothing && (v = Pnom[k])
+        i = findfirst(==(k), Pnames)
+        # Apply tightened (or collapsed) bounds around chosen center value v
+        LB[i] = log(max(1e-12, (1 - relw) * v))
+        UB[i] = log(max(1e-12, (1 + relw) * v))
+    end
+    println("[CFG] FROZEN_BOUNDS active: rel_width=$(relw), centers=" * join(["$(k)=$(get(ENV, "P_FROZEN_" * String(k), string(Pnom[k])))" for k in EST_SET], ", "))
+end
+
 # Load data for FO (nc x ph x ncp)
 data = load_data_default(nc, nfe, ncp)
 
