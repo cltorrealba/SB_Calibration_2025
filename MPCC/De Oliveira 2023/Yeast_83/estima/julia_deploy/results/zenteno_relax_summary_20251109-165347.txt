@@ -1,4 +1,0 @@
-status=TIME_LIMIT
-primal_status=INFEASIBLE_POINT
-objective=1.7527811623022968e6
-solve_time_s=1807.5009999275208

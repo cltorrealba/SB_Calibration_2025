@@ -31,6 +31,7 @@ using FileIO, JLD2
 using Dates
 using Printf
 using Statistics: mean
+using SparseArrays
 # Optional ODE integration and plotting
 try
     using DifferentialEquations
@@ -141,6 +142,53 @@ println("[CFG] th=", th, ", nfe=", nfe, ", hv_mode=", (HV_ADAPTIVE ? "adaptive" 
 T_const = try parse(Float64, get(ENV, "T_CONST", "296.15")) catch; 296.15 end
 println("[CFG] T_const=", T_const)
 
+# Reduced-mode toggles (for sparse/active-set reconstruction)
+const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
+const REDUCED_DISABLE_UPTAKE = get(ENV, "REDUCED_DISABLE_UPTAKE", "0") == "1"
+const PEN_REDUCED = get(ENV, "PEN_REDUCED", "1") == "1"  # when true, sum FO penalties only over candidate set C in reduced mode
+const PEN_NONNEG  = get(ENV, "PEN_NONNEG", "1") == "1"    # when true, use smooth nonnegative penalty (sqrt(FO^2+eps)) in objective
+const PFBA_EPS = try parse(Float64, get(ENV, "PFBA_EPS", "1e-7")) catch; 1e-7 end
+println("[CFG] Reduced mode=", REDUCED_MODE)
+
+# Initialization pipeline sub-flags
+# INIT_FROM_ODE: run a quick forward ODE to seed FE-end states (and cdot) before building algebraic constraints
+# INIT_DUAL_FE:  perform per-FE flux/alpha/lambda heuristic seeding (legacy INIT_PIPELINE behavior)
+const INIT_FROM_ODE = get(ENV, "INIT_FROM_ODE", "0") == "1"
+const INIT_DUAL_FE = begin
+    # If user sets explicitly use that; else default to INIT_PIPELINE (or enabled)
+    v = get(ENV, "INIT_DUAL_FE", get(ENV, "INIT_PIPELINE", "1"))
+    v == "1"
+end
+
+"""
+Load reduced sets A, C, F per FE from JLD2 file.
+Returns (A_sets, C_sets, F_sets) where each is Vector{Vector{Int}} of length nfe.
+If file not found or invalid, returns nothing.
+"""
+function _load_reduced_sets(path::String)
+    if !isfile(path)
+        return nothing
+    end
+    try
+        d = JLD2.jldopen(path, "r") do f
+            A = read(f, "A")
+            C = read(f, "C")
+            F = read(f, "F")
+            return (A, C, F)
+        end
+        return d
+    catch err
+        @warn "Failed loading reduced sets" err
+        return nothing
+    end
+end
+
+const REDUCED_SETS_PATH = joinpath(RESULTS_DIR, "reduced_sets.jld2")
+reduced_sets = REDUCED_MODE ? _load_reduced_sets(REDUCED_SETS_PATH) : nothing
+if REDUCED_MODE && reduced_sets === nothing
+    @warn "REDUCED_MODE=1 but reduced sets not found at $(REDUCED_SETS_PATH); proceeding without reduction"
+end
+
 # Radau-3 collocation matrix (same as Python)
 colmat = [
     0.19681547722366   -0.06553542585020   0.02377097434822;
@@ -151,12 +199,37 @@ colmat = [
 # Default kinetics constants
 R = 8.314
 
-# pFBA ridge (in stationarity) and linear penalty weights (mirror relaxed Pyomo)
-# Fixed defaults (no toggles): feasibility-first configuration
-w = 1e-20
-phi1 = 1.0
-phi2 = 1.0
-phi3 = 1.0
+# pFBA ridge (in stationarity) and linear penalty weights (homotopy-capable)
+# Replaced scalar constants with JuMP parameters (fixed variables) to allow staged homotopy.
+# Default (no homotopy): very small ridge, unit penalty scaling.
+# When HOMOTOPY=1 we will overwrite these via fix() in staged solves.
+
+const HOMOTOPY = get(ENV, "HOMOTOPY", "0") == "1"
+# Full-model handoff/checkpoint flags
+const HANDOFF_FULL = get(ENV, "HANDOFF_FULL", "0") == "1"
+const HANDOFF_STAGE = try parse(Int, get(ENV, "HANDOFF_STAGE", "3")) catch; 3 end
+const INIT_FROM_CHECKPOINT = get(ENV, "INIT_FROM_CHECKPOINT", "0") == "1"
+const CHECKPOINT_PATH = get(ENV, "CHECKPOINT_PATH", joinpath(RESULTS_DIR, "zenteno_handoff_full_checkpoint.jld2"))
+# Optional custom schedules via comma-separated ENV variables
+function _parse_list(s::String)
+    parts = filter(!isempty, split(s, [',',';',' ']))
+    vals = Float64[]
+    for p in parts
+        try push!(vals, parse(Float64, strip(p))) catch; end
+    end
+    return vals
+end
+# Adopt capped homotopy schedule by default (phi: 1e-2 -> 1e-1 -> 1 -> 10; w ridge: 1e-4 -> 1e-5 -> 1e-6 -> 1e-8)
+# These defaults were empirically selected to balance SSE improvement with complementarity tightening without overshooting penalty dominance.
+HOM_PHI = _parse_list(get(ENV, "HOM_PHI", HOMOTOPY ? "1e-2,1e-1,1,10" : ""))
+HOM_W   = _parse_list(get(ENV, "HOM_W",   HOMOTOPY ? "1e-4,1e-5,1e-6,1e-8" : ""))
+# Fall back to 2-stage default if lengths mismatch or empty
+if HOMOTOPY && (length(HOM_PHI) == 0 || length(HOM_W) == 0 || length(HOM_PHI) != length(HOM_W))
+    HOM_PHI = [1e-1, 1.0]
+    HOM_W   = [1e-4, 1e-6]
+end
+initial_phi = HOMOTOPY ? HOM_PHI[1] : 1.0
+initial_w   = HOMOTOPY ? HOM_W[1]   : 1e-20
 
 # pFBA d-vector (encourage positive growth reaction)
 d = zeros(nv); d[obj] = -1.0
@@ -224,10 +297,51 @@ data = load_data_default(nc, nfe, ncp)
 # Measurement selection: use only X(1), G(3), F(4), E(5) in SSE
 const MEAS_IDX = [1,3,4,5]
 
-# Weights for objective terms
-const W_SSE = 1.0
-const W_PEN = 0.2
+# Weights for objective terms (overridable via ENV: W_SSE, W_PEN)
+const W_SSE = begin
+    v = tryparse(Float64, get(ENV, "W_SSE", "1.0"))
+    v === nothing ? 1.0 : v
+end
+const W_PEN = begin
+    v = tryparse(Float64, get(ENV, "W_PEN", "0.2"))
+    v === nothing ? 0.2 : v
+end
 const W_REG = 1e-8
+
+"""
+Build reduced index sets (reactions and metabolite rows) when reduced_sets are present.
+Returns (K_AX, M_AX) where K_AX are reaction indices to keep variables for, and M_AX are
+metabolite rows with support in K_AX.
+"""
+function _build_reduced_axes()
+    if !REDUCED_MODE || reduced_sets === nothing
+        return (collect(1:nv), collect(1:nm))
+    end
+    A_sets, C_sets, _ = reduced_sets
+    K = Int[]
+    for i in 1:nfe
+        if i <= length(A_sets); append!(K, A_sets[i]); end
+        if i <= length(C_sets); append!(K, C_sets[i]); end
+    end
+    K = unique(K); sort!(K)
+    # Include uptake reactions only if uptake is enabled in reduced mode
+    if !REDUCED_DISABLE_UPTAKE
+        push!(K, glu); push!(K, fru)
+        K = unique(K); sort!(K)
+    end
+    # Active metabolite rows with any nonzero in kept reactions
+    M = Int[]
+    for mc in 1:nm
+        for k in K
+            if S[mc, k] != 0.0
+                push!(M, mc)
+                break
+            end
+        end
+    end
+    M = unique(M); sort!(M)
+    return (K, M)
+end
 
 # ---------------------------------------------
 # JuMP model
@@ -251,21 +365,49 @@ println("[CFG] Ipopt wall_time=", wall_time)
 # ---------------------------------------------
 # Variables
 # ---------------------------------------------
+K_AX, M_AX = _build_reduced_axes()
 @variables(m, begin
     c[1:nc, 1:nfe, 1:ncp]           # states
     cdot[1:nc, 1:nfe, 1:ncp]        # time derivatives
-    # Simulation-only: no FO (data-fit) term
-    teta[1:np]                       # log-parameters
-    hv[1:nfe]                        # element lengths
+    teta[1:np]                      # log-parameters (log-space)
+    hv[1:nfe]                       # element lengths
+end)
 
-    v[1:nv, 1:nfe]                   # fluxes
-    lambda_[1:nm, 1:nfe]             # multipliers (stoichiometry)
-    alpha_U[1:nv, 1:nfe]
-    alpha_L[1:nv, 1:nfe]
-    alpha_upt[1:2, 1:nfe]            # [glu, fru]
+# Homotopy / penalty scaling parameters as fixed variables (so objective & constraints can see updated values across stages)
+@variable(m, phi1_param >= 0.0)
+@variable(m, phi2_param >= 0.0)
+@variable(m, phi3_param >= 0.0)
+@variable(m, w_param   >= 0.0)
+fix(phi1_param, initial_phi; force=true)
+fix(phi2_param, initial_phi; force=true)
+fix(phi3_param, initial_phi; force=true)
+fix(w_param,   initial_w;   force=true)
 
-    FO_U[1:nv, 1:nfe]
-    FO_L[1:nv, 1:nfe]
+# Flux, multipliers and complementarity variables
+if !REDUCED_MODE || reduced_sets === nothing
+    @variables(m, begin
+        v[1:nv, 1:nfe]
+        lambda_[1:nm, 1:nfe]
+        alpha_U[1:nv, 1:nfe]
+        alpha_L[1:nv, 1:nfe]
+        FO_U[1:nv, 1:nfe]
+        FO_L[1:nv, 1:nfe]
+    end)
+else
+    # Pruned variables for reduced mode: only keep reactions in K_AX
+    @variables(m, begin
+        v[K_AX, 1:nfe]
+        lambda_[M_AX, 1:nfe]    # prune lambda to active metabolite rows
+        alpha_U[K_AX, 1:nfe]
+        alpha_L[K_AX, 1:nfe]
+        FO_U[K_AX, 1:nfe]
+        FO_L[K_AX, 1:nfe]
+    end)
+end
+
+# Uptake alphas and products (always defined; can be disabled in constraints/PEN)
+@variables(m, begin
+    alpha_upt[1:2, 1:nfe]
     FO_upt[1:2, 1:nfe]
 end)
 
@@ -280,13 +422,195 @@ for i in 1:nfe
     set_start_value(hv[i], hm[i])
 end
 
+# Optional: load warm-start checkpoint for full model handoff
+if INIT_FROM_CHECKPOINT
+    try
+        if isfile(CHECKPOINT_PATH)
+            # Proper JLD2 reading: open and pull required datasets explicitly
+            JLD2.jldopen(CHECKPOINT_PATH, "r") do f
+                # teta, hv, c always attempted
+                if haskey(f, "teta")
+                    local TETAk = read(f, "teta")
+                    for p in 1:np
+                        set_start_value(teta[p], TETAk[p])
+                    end
+                end
+                if haskey(f, "hv")
+                    local HVk = read(f, "hv")
+                    for i in 1:nfe
+                        set_start_value(hv[i], HVk[i])
+                    end
+                end
+                if haskey(f, "c")
+                    local Ck = read(f, "c")
+                    @assert size(Ck,1) == nc && size(Ck,2) == nfe && size(Ck,3) == ncp "Checkpoint c size mismatch"
+                    for l in 1:nc, i in 1:nfe, j in 1:ncp
+                        set_start_value(c[l,i,j], Ck[l,i,j])
+                    end
+                end
+                # Only apply v/alphas/lambda when full model present
+                if (!REDUCED_MODE || reduced_sets === nothing)
+                    if haskey(f, "v")
+                        local Vk = read(f, "v")
+                        @assert size(Vk,1) == nv && size(Vk,2) == nfe "Checkpoint v size mismatch"
+                        for k in 1:nv, i in 1:nfe
+                            set_start_value(v[k,i], Vk[k,i])
+                        end
+                    end
+                    if haskey(f, "alpha_L")
+                        local AL = read(f, "alpha_L")
+                        @assert size(AL,1) == nv && size(AL,2) == nfe "Checkpoint alpha_L size mismatch"
+                        for k in 1:nv, i in 1:nfe
+                            set_start_value(alpha_L[k,i], AL[k,i])
+                        end
+                    end
+                    if haskey(f, "alpha_U")
+                        local AU = read(f, "alpha_U")
+                        @assert size(AU,1) == nv && size(AU,2) == nfe "Checkpoint alpha_U size mismatch"
+                        for k in 1:nv, i in 1:nfe
+                            set_start_value(alpha_U[k,i], AU[k,i])
+                        end
+                    end
+                    if haskey(f, "lambda_")
+                        local LM = read(f, "lambda_")
+                        @assert size(LM,1) == nm && size(LM,2) == nfe "Checkpoint lambda size mismatch"
+                        for r in 1:nm, i in 1:nfe
+                            set_start_value(lambda_[r,i], LM[r,i])
+                        end
+                    end
+                end
+                println("[INIT] Loaded warm start from checkpoint ", CHECKPOINT_PATH)
+            end
+        else
+            @warn "INIT_FROM_CHECKPOINT=1 but file not found" CHECKPOINT_PATH
+        end
+    catch err
+        @warn "Failed to load checkpoint warm start" err
+    end
+end
+
+# Optional ODE-based primal seeding
+if INIT_FROM_ODE
+    try
+        mu_T0 = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
+        Kg_T0 = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
+        b_T0  = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
+        mrate0 = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
+        function _pstart(sym)
+            i = findfirst(==(sym), Pnames)
+            st = try start_value(teta[i]) catch; nothing end
+            return exp(st === nothing ? T0[i] : st)
+        end
+        mu0_s   = _pstart(:mu0);  betaG0_s = _pstart(:betaG0); betaF0_s = _pstart(:betaF0)
+        Kn0_s   = _pstart(:Kn0);  Kg0_s    = _pstart(:Kg0);    Kf0_s    = _pstart(:Kf0)
+        Kig0_s  = _pstart(:Kig0); Kie0_s   = _pstart(:Kie0);   Kd0_s    = _pstart(:Kd0)
+        Yxn_s   = _pstart(:Yxn);  Yxg_s    = _pstart(:Yxg);    Yxf_s    = _pstart(:Yxf)
+        Yeg_s   = _pstart(:Yeg);  Yef_s    = _pstart(:Yef)
+        function zenteno_rhs_seed!(du,u,p,t)
+            X,N,G,F,E = u
+            mu   = mu0_s * mu_T0 * (N / (N + Kn0_s * Kg_T0 + 1e-9))
+            betaG = betaG0_s * b_T0 * (G / (G + Kg0_s * Kg_T0 + 1e-9)) * ((Kie0_s * Kg_T0) / (E + Kie0_s * Kg_T0 + 1e-9))
+            betaF = betaF0_s * b_T0 * (F / (F + Kf0_s * Kg_T0 + 1e-9)) * ((Kig0_s * Kg_T0) / (G + Kig0_s * Kg_T0 + 1e-9)) * ((Kie0_s * Kg_T0) / (E + Kie0_s * Kg_T0 + 1e-9))
+            Td   = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+            sw   = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
+            Kd   = Kd0_s * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * sw
+            denom = G + F + 1e-9
+            phiG = G / denom
+            phiF = F / denom
+            du[1] = (mu - Kd) * X
+            du[2] = -(mu / Yxn_s) * X
+            du[3] = -((mu / Yxg_s) + (betaG / Yeg_s) + mrate0 * phiG) * X
+            du[4] = -((mu / Yxf_s) + (betaF / Yef_s) + mrate0 * phiF) * X
+            du[5] = (betaG + betaF) * X
+            return nothing
+        end
+        u0 = copy(c0)
+        prob_seed = DifferentialEquations.ODEProblem(zenteno_rhs_seed!, u0, (0.0, th))
+        sol_seed = DifferentialEquations.solve(prob_seed, DifferentialEquations.Tsit5(), reltol=1e-6, abstol=1e-8)
+        t_nodes = cumsum(hm)
+        for i in 1:nfe
+            ti = t_nodes[i]; ui = sol_seed(ti)
+            du = similar(ui); zenteno_rhs_seed!(du, ui, nothing, ti)
+            for j in 1:ncp
+                for l in 1:nc
+                    set_start_value(c[l,i,j], ui[l])
+                    set_start_value(cdot[l,i,j], du[l])
+                end
+            end
+        end
+        println("[INIT] Applied ODE-based primal seeding")
+    catch err
+        @warn "INIT_FROM_ODE failed" err
+    end
+end
+
 # ---------------------------------------------
 # Objective: SSE over measured states + penalties + small parameter regularization
 # ---------------------------------------------
 @NLexpression(m, SSE, sum( (c[l,i,j] - data[l,i,j])^2 for l in MEAS_IDX, i in 1:nfe, j in 1:ncp ))
-@NLexpression(m, PEN, sum( sum( -phi1 * FO_L[k,i] - phi3 * FO_U[k,i] for k in 1:nv )
-                        +  phi2 * FO_upt[1,i] + phi2 * FO_upt[2,i]
+
+# Refactor PEN to exclude eliminated FO terms in reduced mode and optionally disable uptake terms
+if !REDUCED_MODE || reduced_sets === nothing
+    if PEN_NONNEG
+        @NLexpression(m, PEN, sum( sum( phi1_param * sqrt(FO_L[k,i]^2 + 1e-12) + phi3_param * sqrt(FO_U[k,i]^2 + 1e-12) for k in 1:nv )
+                                +  phi2_param * sqrt(FO_upt[1,i]^2 + 1e-12) + phi2_param * sqrt(FO_upt[2,i]^2 + 1e-12)
+                            for i in 1:nfe ))
+    else
+        @NLexpression(m, PEN, sum( sum( -phi1_param * FO_L[k,i] - phi3_param * FO_U[k,i] for k in 1:nv )
+                                +  phi2_param * FO_upt[1,i] + phi2_param * FO_upt[2,i]
+                            for i in 1:nfe ))
+    end
+else
+    # Build penalty: optionally candidate-only or legacy all-reaction sum when PEN_REDUCED=0
+    _, C_sets, _ = reduced_sets
+    if PEN_REDUCED
+        if REDUCED_DISABLE_UPTAKE
+            if PEN_NONNEG
+                @NLexpression(m, PEN, sum(
+                    sum( phi1_param * sqrt(FO_L[k,i]^2 + 1e-12) + phi3_param * sqrt(FO_U[k,i]^2 + 1e-12) for k in ((i <= length(C_sets)) ? C_sets[i] : Int[]) )
                     for i in 1:nfe ))
+            else
+                @NLexpression(m, PEN, sum(
+                    sum( -phi1_param * FO_L[k,i] - phi3_param * FO_U[k,i] for k in ((i <= length(C_sets)) ? C_sets[i] : Int[]) )
+                    for i in 1:nfe ))
+            end
+        else
+            if PEN_NONNEG
+                @NLexpression(m, PEN, sum(
+                    sum( phi1_param * sqrt(FO_L[k,i]^2 + 1e-12) + phi3_param * sqrt(FO_U[k,i]^2 + 1e-12) for k in ((i <= length(C_sets)) ? C_sets[i] : Int[]) )
+                    +  phi2_param * sqrt(FO_upt[1,i]^2 + 1e-12) + phi2_param * sqrt(FO_upt[2,i]^2 + 1e-12)
+                    for i in 1:nfe ))
+            else
+                @NLexpression(m, PEN, sum(
+                    sum( -phi1_param * FO_L[k,i] - phi3_param * FO_U[k,i] for k in ((i <= length(C_sets)) ? C_sets[i] : Int[]) )
+                    +  phi2_param * FO_upt[1,i] + phi2_param * FO_upt[2,i]
+                    for i in 1:nfe ))
+            end
+        end
+    else
+        # Legacy: sum across all reactions even in reduced mode (for comparison only)
+        if REDUCED_DISABLE_UPTAKE
+            if PEN_NONNEG
+                @NLexpression(m, PEN, sum( sum( phi1_param * sqrt(FO_L[k,i]^2 + 1e-12) + phi3_param * sqrt(FO_U[k,i]^2 + 1e-12) for k in 1:nv )
+                                            for i in 1:nfe ))
+            else
+                @NLexpression(m, PEN, sum( sum( -phi1_param * FO_L[k,i] - phi3_param * FO_U[k,i] for k in 1:nv )
+                                            for i in 1:nfe ))
+            end
+        else
+            if PEN_NONNEG
+                @NLexpression(m, PEN, sum( sum( phi1_param * sqrt(FO_L[k,i]^2 + 1e-12) + phi3_param * sqrt(FO_U[k,i]^2 + 1e-12) for k in 1:nv )
+                                            + phi2_param * sqrt(FO_upt[1,i]^2 + 1e-12) + phi2_param * sqrt(FO_upt[2,i]^2 + 1e-12)
+                                            for i in 1:nfe ))
+            else
+                @NLexpression(m, PEN, sum( sum( -phi1_param * FO_L[k,i] - phi3_param * FO_U[k,i] for k in 1:nv )
+                                            + phi2_param * FO_upt[1,i] + phi2_param * FO_upt[2,i]
+                                            for i in 1:nfe ))
+            end
+        end
+    end
+end
+
 # Regularize only estimable params around nominal
 const EST_POS = [findfirst(==(k), Pnames) for k in EST_SET]
 @NLexpression(m, REG, sum( (teta[p] - T0[p])^2 for p in EST_POS ))
@@ -415,45 +739,144 @@ end
     dE[i=1:nfe, j=1:ncp], cdot[5, i, j] ==  (betaG_j[i, j] + betaF_j[i, j]) * c[1, i, j]
 end)
 
-# Stoichiometric balances and flux bounds
-@constraints(m, begin
-    Sc[mc=1:nm, i=1:nfe],  sum(S[mc, k] * v[k, i] for k in 1:nv) == 0
-    v_UB[k=1:nv, i=1:nfe], v[k, i] - ub[k] <= 0
-    v_LB[k=1:nv, i=1:nfe], -v[k, i] + lb[k] <= 0
+# Flux bounds and sign restrictions (always defined)
+if !REDUCED_MODE || reduced_sets === nothing
+    @constraints(m, begin
+        v_UB[k=1:nv, i=1:nfe], v[k, i] - ub[k] <= 0
+        v_LB[k=1:nv, i=1:nfe], -v[k, i] + lb[k] <= 0
+        alphaL_sign[k=1:nv, i=1:nfe], alpha_L[k, i] <= 0
+        alphaU_sign[k=1:nv, i=1:nfe], alpha_U[k, i] >= 0
+        alphaUPT_sign[u=1:2, i=1:nfe], alpha_upt[u, i] <= 0
+    end)
+else
+    @constraints(m, begin
+        v_UB[k=K_AX, i=1:nfe], v[k, i] - ub[k] <= 0
+        v_LB[k=K_AX, i=1:nfe], -v[k, i] + lb[k] <= 0
+        alphaL_sign[k=K_AX, i=1:nfe], alpha_L[k, i] <= 0
+        alphaU_sign[k=K_AX, i=1:nfe], alpha_U[k, i] >= 0
+        alphaUPT_sign[u=1:2, i=1:nfe], alpha_upt[u, i] <= 0
+    end)
+end
 
-    # Signs for multipliers
-    alphaL_sign[k=1:nv, i=1:nfe], alpha_L[k, i] <= 0
-    alphaU_sign[k=1:nv, i=1:nfe], alpha_U[k, i] >= 0
-    alphaUPT_sign[u=1:2, i=1:nfe], alpha_upt[u, i] <= 0
-end)
+# Stoichiometric balances: full or reduced by active metabolites per FE
+if !REDUCED_MODE || reduced_sets === nothing
+    @constraint(m, Sc[mc=1:nm, i=1:nfe], sum(S[mc, k] * v[k, i] for k in 1:nv) == 0)
+else
+    A_sets, C_sets, F_sets = reduced_sets
+    for i in 1:nfe
+        Ai = (i <= length(A_sets)) ? A_sets[i] : Int[]
+        Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+        Ri = union(Ai, Ci)
+        # Determine active metabolite rows with support in Ri
+        active_mc = Int[]
+        for mc in 1:nm
+            found = false
+            for k in Ri
+                if S[mc, k] != 0.0
+                    found = true
+                    break
+                end
+            end
+            if found
+                push!(active_mc, mc)
+            end
+        end
+        # Create balances only for active_mc, summando sobre reacciones activas en este FE
+        for mc in active_mc
+            nz_rxn = Int[]
+            for k in Ri
+                if S[mc, k] != 0.0 && (k in K_AX)
+                    push!(nz_rxn, k)
+                end
+            end
+            @constraint(m, sum(S[mc, k] * v[k, i] for k in nz_rxn) == 0)
+        end
+        # No need to fix lambda for inactive metabolites: lambda_ only exists over M_AX
+    end
+end
 
-# Lagrangian stationarity (relaxed)
-@constraints(m, begin
-    Lagr[k=1:nv, i=1:nfe], + d[k] + w * v[k, i] * vs[k] + alpha_L[k, i] + alpha_U[k, i] +
-                            up_glu[k] * alpha_upt[1, i] + up_fru[k] * alpha_upt[2, i] +
-                            sum(S[r, k] * lambda_[r, i] for r in 1:nm) == 0
-end)
+if !REDUCED_MODE || reduced_sets === nothing
+    # Lagrangian stationarity (full model)
+    @constraints(m, begin
+        Lagr[k=1:nv, i=1:nfe], + d[k] + w_param * v[k, i] * vs[k] + alpha_L[k, i] + alpha_U[k, i] +
+                                up_glu[k] * alpha_upt[1, i] + up_fru[k] * alpha_upt[2, i] +
+                                sum(S[r, k] * lambda_[r, i] for r in 1:nm) == 0
+    end)
+else
+    # Reduced stationarity only for candidate reactions C[i]
+    A_sets, C_sets, F_sets = reduced_sets
+    for i in 1:nfe
+        Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+        # Zero-out alphas for non-candidates among kept axes
+        nonC = setdiff(K_AX, Ci)
+        for k in nonC
+            @constraint(m, alpha_L[k, i] == 0.0)
+            @constraint(m, alpha_U[k, i] == 0.0)
+        end
+        # Stationarity only for candidates
+        for k in Ci
+            if !(k in K_AX); continue; end
+            # Sparse metabolite coupling: restrict lambda sum to metabolites with nonzero S[r,k]
+            nz_met = Int[]
+            for r in M_AX
+                if S[r, k] != 0.0
+                    push!(nz_met, r)
+                end
+            end
+            @constraint(m, + d[k] + w_param * v[k, i] * vs[k] + alpha_L[k, i] + alpha_U[k, i] +
+                           up_glu[k] * alpha_upt[1, i] + up_fru[k] * alpha_upt[2, i] +
+                           sum(S[r, k] * lambda_[r, i] for r in nz_met) == 0)
+        end
+    end
+end
 
 # Complementarity product definitions and uptake inequalities
-@NLconstraints(m, begin
-    FO_L_def[k=1:nv, i=1:nfe],  FO_L[k, i]   == (v[k, i] - lb[k]) * alpha_L[k, i]
-    FO_U_def[k=1:nv, i=1:nfe],  FO_U[k, i]   == (v[k, i] - ub[k]) * alpha_U[k, i]
+if !REDUCED_MODE || reduced_sets === nothing
+    @NLconstraints(m, begin
+        FO_L_def[k=1:nv, i=1:nfe],  FO_L[k, i]   == (v[k, i] - lb[k]) * alpha_L[k, i]
+        FO_U_def[k=1:nv, i=1:nfe],  FO_U[k, i]   == (v[k, i] - ub[k]) * alpha_U[k, i]
 
-    v_LB_g[i=1:nfe],            -v[glu, i] - rG[i] <= 0
-    v_LB_f[i=1:nfe],            -v[fru, i] - rF[i] <= 0
+        v_LB_g[i=1:nfe],            -v[glu, i] - rG[i] <= 0
+        v_LB_f[i=1:nfe],            -v[fru, i] - rF[i] <= 0
 
-    FO_upt1[i=1:nfe],           FO_upt[1, i] == (-v[glu, i] - rG[i]) * alpha_upt[1, i]
-    FO_upt2[i=1:nfe],           FO_upt[2, i] == (-v[fru, i] - rF[i]) * alpha_upt[2, i]
-end)
+        FO_upt1[i=1:nfe],           FO_upt[1, i] == (-v[glu, i] - rG[i]) * alpha_upt[1, i]
+        FO_upt2[i=1:nfe],           FO_upt[2, i] == (-v[fru, i] - rF[i]) * alpha_upt[2, i]
+    end)
+else
+    # Reduced FO: only for candidates that are kept in K_AX
+    _, C_sets, F_sets = reduced_sets
+    for i in 1:nfe
+        Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+        # Only create nonlinear FO products for candidate reactions
+        for k in Ci
+            if !(k in K_AX); continue; end
+            @NLconstraint(m, FO_L[k, i]   == (v[k, i] - lb[k]) * alpha_L[k, i])
+            @NLconstraint(m, FO_U[k, i]   == (v[k, i] - ub[k]) * alpha_U[k, i])
+        end
+        # Uptake inequalities optionally disabled in reduced mode
+        if REDUCED_DISABLE_UPTAKE
+            @constraint(m, FO_upt[1, i] == 0.0)
+            @constraint(m, FO_upt[2, i] == 0.0)
+        else
+            @NLconstraint(m, -v[glu, i] - rG[i] <= 0)
+            @NLconstraint(m, -v[fru, i] - rF[i] <= 0)
+            @NLconstraint(m, FO_upt[1, i] == (-v[glu, i] - rG[i]) * alpha_upt[1, i])
+            @NLconstraint(m, FO_upt[2, i] == (-v[fru, i] - rF[i]) * alpha_upt[2, i])
+        end
+    end
+end
 
 # (No FO equality: simulation-only mode)
 
+const INIT_PIPELINE = get(ENV, "INIT_PIPELINE", "1") == "1"
+
 # ---------------------------------------------
-# Light-touch initialization mirrored from Pyomo (always on)
+# Light-touch initialization mirrored from Pyomo (controlled by INIT_PIPELINE)
 # - Fluxes: seed sugar uptakes v_glu, v_fru at FE ends to -rG_fe, -rF_fe
 # - Alphas: activity-based seeds at bounds; uptake alphas when ineq is tight
 # - Lambdas: least-squares init for S^T * lambda ≈ -(d + w*v + alphas + uptake)
 # ---------------------------------------------
+if INIT_PIPELINE && INIT_DUAL_FE
 try
     # Helpers pulling initial state/param starts (FE-end uses j=ncp)
     function _phiGF(G::Float64, F::Float64)
@@ -481,6 +904,8 @@ try
     # Precompute S^T for lambda LS
     ST = Array{Float64}(S)'
 
+    # Choose reaction axis according to reduced mode
+    _KAX = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
     for i in 1:nfe
         # FE-end states
         X = c0[1]; N = c0[2]; G = c0[3]; F = c0[4]; E = c0[5]
@@ -492,9 +917,9 @@ try
         rF0 = (mu_fe0 / Yxf0) + (betaF_fe0 / Yef0) + (mrate0 * phiF)
 
         # Seed uptakes and clip to bounds
-        set_start_value(v[glu, i], -rG0)
-        set_start_value(v[fru, i], -rF0)
-        for k in 1:nv
+        if glu in _KAX; set_start_value(v[glu, i], -rG0); end
+        if fru in _KAX; set_start_value(v[fru, i], -rF0); end
+        for k in _KAX
             vk = _sv(v[k, i])
             if vk < lb[k]
                 set_start_value(v[k, i], lb[k])
@@ -505,37 +930,213 @@ try
 
         # Activity-based alphas
         tol = 1e-8
-        for k in 1:nv
+        for k in _KAX
             vk = _sv(v[k, i])
             aL = (abs(vk - lb[k]) <= tol) ? (-alpha0) : 0.0
             aU = (abs(vk - ub[k]) <= tol) ? (+alpha0) : 0.0
             set_start_value(alpha_L[k, i], aL)
             set_start_value(alpha_U[k, i], aU)
         end
-        sG = -_sv(v[glu, i]) - rG0
-        sF = -_sv(v[fru, i]) - rF0
-        set_start_value(alpha_upt[1, i], (abs(sG) <= tol) ? (-alpha0) : 0.0)
-        set_start_value(alpha_upt[2, i], (abs(sF) <= tol) ? (-alpha0) : 0.0)
+        if glu in _KAX
+            sG = -_sv(v[glu, i]) - rG0
+            set_start_value(alpha_upt[1, i], (abs(sG) <= tol) ? (-alpha0) : 0.0)
+        else
+            set_start_value(alpha_upt[1, i], 0.0)
+        end
+        if fru in _KAX
+            sF = -_sv(v[fru, i]) - rF0
+            set_start_value(alpha_upt[2, i], (abs(sF) <= tol) ? (-alpha0) : 0.0)
+        else
+            set_start_value(alpha_upt[2, i], 0.0)
+        end
 
         # Lambda least-squares
         rhs = zeros(nv)
+        # Use a scalar ridge for LS (JuMP variable w_param is not a Float64 here)
+        w_ls = try value(w_param) catch; initial_w end
         a_upt1 = _sv(alpha_upt[1, i])
         a_upt2 = _sv(alpha_upt[2, i])
-        for k in 1:nv
+        for k in _KAX
             vk = _sv(v[k, i])
             aLk = _sv(alpha_L[k, i])
             aUk = _sv(alpha_U[k, i])
             upt = (k == glu ? a_upt1 : 0.0) + (k == fru ? a_upt2 : 0.0)
-            rhs[k] = -(d[k] + w * vk * vs[k] + aLk + aUk + upt)
+            rhs[k] = -(d[k] + w_ls * vk * vs[k] + aLk + aUk + upt)
         end
-        # Solve ST * lambda ≈ rhs
-        lam = ST \ rhs
-        for r in 1:nm
-            set_start_value(lambda_[r, i], lam[r])
+        # Solve reduced LS: S[:,K_AX]^T * lambda ≈ rhs[K_AX]
+        ST_red = Array{Float64}(S[:, _KAX])'
+        lam = ST_red \ rhs[_KAX]
+        # Map solution only to M_AX rows
+        for (idx, r) in enumerate(M_AX)
+            set_start_value(lambda_[r, i], idx <= length(lam) ? lam[idx] : 0.0)
         end
+        # Seed FO products for consistency with starts
+        for k in _KAX
+            vk  = _sv(v[k, i]); aLk = _sv(alpha_L[k, i]); aUk = _sv(alpha_U[k, i])
+            try set_start_value(FO_L[k,i], (vk - lb[k]) * aLk) catch; end
+            try set_start_value(FO_U[k,i], (vk - ub[k]) * aUk) catch; end
+        end
+        try set_start_value(FO_upt[1,i], (-(try _sv(v[glu,i]) catch; 0.0 end) - rG0) * _sv(alpha_upt[1,i])) catch; end
+        try set_start_value(FO_upt[2,i], (-(try _sv(v[fru,i]) catch; 0.0 end) - rF0) * _sv(alpha_upt[2,i])) catch; end
     end
 catch err
     @warn "Initialization skipped" err
+end
+end
+
+# ---------------------------------------------
+# Baseline metrics harness (before optimization / homotopy)
+# ---------------------------------------------
+try
+    base_path = joinpath(RESULTS_DIR, "zenteno_metrics_baseline_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+    n_v_axes = (!REDUCED_MODE || reduced_sets === nothing) ? nv : length(K_AX)
+    n_lam_axes = (!REDUCED_MODE || reduced_sets === nothing) ? nm : length(M_AX)
+    # Rough variable count (for tracking reductions)
+    n_vars_est = nc*nfe*ncp*2 + np + nfe + n_v_axes*nfe + n_lam_axes*nfe + 2*n_v_axes*nfe + 2*nfe + 2*n_v_axes*nfe
+    # Helper counts
+    n_coll = nc*(nfe-1)*ncp + nc*ncp
+    n_hv = HV_ADAPTIVE ? (1 + 3*nfe) : nfe
+    n_bounds = nc*nfe*ncp + 2*np
+    n_ode = nc*nfe*ncp
+    n_vb = 2*n_v_axes*nfe
+    n_alpha_sign = 2*n_v_axes*nfe + 2*nfe
+    # Active stoichiometric rows
+    function _stoich_rows()
+        if !REDUCED_MODE || reduced_sets === nothing
+            return nm*nfe
+        else
+            A_sets, C_sets, _ = reduced_sets
+            total = 0
+            for i in 1:nfe
+                Ai = (i <= length(A_sets)) ? A_sets[i] : Int[]
+                Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+                Ri = union(Ai, Ci)
+                local cnt = 0
+                for mc in 1:nm
+                    for k in Ri
+                        if S[mc,k] != 0.0
+                            cnt += 1; break
+                        end
+                    end
+                end
+                total += cnt
+            end
+            return total
+        end
+    end
+    n_stoich = _stoich_rows()
+    function _stationarity_rows()
+        if !REDUCED_MODE || reduced_sets === nothing
+            return nv*nfe
+        else
+            _, C_sets, _ = reduced_sets
+            total = 0
+            for i in 1:nfe
+                Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+                total += length(intersect(Ci, K_AX))
+            end
+            return total
+        end
+    end
+    n_stat = _stationarity_rows()
+    function _fo_defs()
+        if !REDUCED_MODE || reduced_sets === nothing
+            return 2*nv*nfe
+        else
+            _, C_sets, _ = reduced_sets
+            cnt = 0
+            for i in 1:nfe
+                Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+                cnt += 2*length(intersect(Ci, K_AX))
+            end
+            return cnt
+        end
+    end
+    n_fo = _fo_defs()
+    n_upt = REDUCED_DISABLE_UPTAKE ? (2*nfe) : (4*nfe)
+    # Initial SSE from starts
+    sse0 = 0.0
+    for i in 1:nfe, j in 1:ncp, l in MEAS_IDX
+        s = try start_value(c[l,i,j]) catch; c0[l] end
+        sse0 += (s - data[l,i,j])^2
+    end
+    # Initial penalty estimate from starts with initial_phi
+    phi0 = HOMOTOPY ? HOM_PHI[1] : 1.0
+    _sv(x) = (v = try start_value(x) catch; nothing end; v === nothing ? 0.0 : v)
+    pen0 = 0.0
+    if !REDUCED_MODE || reduced_sets === nothing
+        for i in 1:nfe, k in 1:nv
+            foL = _sv(FO_L[k,i]); foU = _sv(FO_U[k,i])
+            pen0 += phi0 * (PEN_NONNEG ? sqrt(foL^2 + 1e-12) : -foL)
+            pen0 += phi0 * (PEN_NONNEG ? sqrt(foU^2 + 1e-12) : -foU)
+        end
+        for i in 1:nfe, u in 1:2
+            fou = _sv(FO_upt[u,i])
+            pen0 += phi0 * (PEN_NONNEG ? sqrt(fou^2 + 1e-12) : fou)
+        end
+    else
+        _, C_sets, _ = reduced_sets
+        for i in 1:nfe
+            Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+            for k in Ci
+                if !(k in K_AX); continue; end
+                foL = _sv(FO_L[k,i]); foU = _sv(FO_U[k,i])
+                pen0 += phi0 * (PEN_NONNEG ? sqrt(foL^2 + 1e-12) : -foL)
+                pen0 += phi0 * (PEN_NONNEG ? sqrt(foU^2 + 1e-12) : -foU)
+            end
+            if !REDUCED_DISABLE_UPTAKE
+                for u in 1:2
+                    fou = _sv(FO_upt[u,i])
+                    pen0 += phi0 * (PEN_NONNEG ? sqrt(fou^2 + 1e-12) : fou)
+                end
+            end
+        end
+    end
+    reg0 = 0.0
+    for p in EST_POS
+        st = try start_value(teta[p]) catch; T0[p] end
+        reg0 += (st - T0[p])^2
+    end
+    comp0 = 0.0
+    if !REDUCED_MODE || reduced_sets === nothing
+        for i in 1:nfe, k in 1:nv
+            comp0 = max(comp0, abs(_sv(FO_L[k,i])), abs(_sv(FO_U[k,i])))
+        end
+    else
+        for i in 1:nfe, k in K_AX
+            comp0 = max(comp0, abs(_sv(FO_L[k,i])), abs(_sv(FO_U[k,i])))
+        end
+    end
+    for i in 1:nfe, u in 1:2
+        comp0 = max(comp0, abs(_sv(FO_upt[u,i])))
+    end
+    open(base_path, "w") do io
+        println(io, "tag=baseline")
+        println(io, "timestamp=", Dates.now())
+        println(io, "vars.total_est=", n_vars_est)
+        println(io, "axes.reactions=", n_v_axes, ", lambda_rows=", n_lam_axes)
+        println(io, "cons.collocation=", n_coll)
+        println(io, "cons.hv=", n_hv)
+        println(io, "cons.bounds=", n_bounds)
+        println(io, "cons.ode=", n_ode)
+        println(io, "cons.v_bounds=", n_vb)
+        println(io, "cons.alpha_sign=", n_alpha_sign)
+        println(io, "cons.stoichiometry=", n_stoich)
+        println(io, "cons.stationarity=", n_stat)
+        println(io, "cons.fo_products=", n_fo)
+        println(io, "cons.uptake=", n_upt)
+        @printf(io, "SSE0=%.6e\n", sse0)
+        @printf(io, "PEN0=%.6e\n", pen0)
+        @printf(io, "REG0=%.6e\n", reg0)
+        @printf(io, "OBJ0=%.6e\n", W_SSE*sse0 + W_PEN*pen0 + W_REG*reg0)
+        @printf(io, "comp_max0=%.6e\n", comp0)
+        println(io, "flags.REDUCED_MODE=", REDUCED_MODE, ", PEN_NONNEG=", PEN_NONNEG, ", PEN_REDUCED=", PEN_REDUCED)
+        println(io, "flags.INIT_FROM_ODE=", INIT_FROM_ODE, ", INIT_DUAL_FE=", INIT_DUAL_FE, ", INIT_PIPELINE=", INIT_PIPELINE)
+        println(io, "weights.W_SSE=", W_SSE, ", W_PEN=", W_PEN, ", W_REG=", W_REG)
+    end
+    println("[BASE] Saved baseline metrics ", base_path)
+catch err
+    @warn "Baseline metrics harness failed" err
 end
 
 # ---------------------------------------------
@@ -657,28 +1258,159 @@ catch err
 end
 
 println("[INFO] Starting optimization @ ", Dates.now())
-optimize!(m)
-status = termination_status(m)
-pr_status = primal_status(m)
-println("[INFO] Solver status: ", status, ", primal: ", pr_status)
-
-# Report objective (penalty) value
-try
-    println("[INFO] Penalty objective: ", objective_value(m))
-catch
-end
-
-# Save a small summary file
-try
-    summary_path = joinpath(RESULTS_DIR, "zenteno_relax_summary_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
-    open(summary_path, "w") do io
-        println(io, "status=", status)
-        println(io, "primal_status=", pr_status)
-    try println(io, "objective=", objective_value(m)) catch end
+if HOMOTOPY
+    # Build stages from HOM_PHI/HOM_W
+    nst = min(length(HOM_PHI), length(HOM_W))
+    # Optional per-stage time weights (comma-separated); default favors later stages
+    function _parse_int_list(s::String)
+        parts = filter(!isempty, split(s, [',',';',' ']))
+        vals = Int[]
+        for p in parts
+            try push!(vals, parse(Int, strip(p))) catch; end
+        end
+        return vals
     end
-    println("[SAVE] ", summary_path)
-catch err
-    @warn "Failed to save summary" err
+    # Default stage time weights: emphasize later stages once curvature & complementarity sharpen.
+    # For the adopted 4-stage schedule use 1,1,2,4 (last stage gets half of total time).
+    default_weights = nst == 4 ? "1,1,2,4" : (repeat("1,", max(nst-2,0)) * "2,2")
+    HOM_WEIGHTS = _parse_int_list(get(ENV, "HOM_WEIGHTS", default_weights))
+    if length(HOM_WEIGHTS) != nst
+        HOM_WEIGHTS = fill(1, nst)
+    end
+    total_w = max(sum(HOM_WEIGHTS), 1)
+    for idx in 1:nst
+        local per_stage_wall = wall_time * (HOM_WEIGHTS[idx] / total_w)
+        local phi_i = HOM_PHI[idx]
+        local w_i   = HOM_W[idx]
+        local tag_i = "hom_s$(idx)"
+        println("[HOM] Stage $(idx) tag=$(tag_i) phi=$(phi_i) w=$(w_i) wall_time=$(per_stage_wall)")
+        fix(phi1_param, phi_i; force=true)
+        fix(phi2_param, phi_i; force=true)
+        fix(phi3_param, phi_i; force=true)
+        fix(w_param,   w_i;   force=true)
+        # Adjust Ipopt wall clock for this stage
+        set_optimizer_attribute(m, "max_wall_time", per_stage_wall)
+        optimize!(m)
+        status = termination_status(m)
+        pr_status = primal_status(m)
+        println("[HOM] Solver status stage $(idx): ", status, ", primal: ", pr_status)
+        # Compute complementarity max and stationarity residual (approx)
+        foL_max = try maximum(abs(value(FO_L[k,i])) for k in K_AX, i in 1:nfe) catch; NaN end
+        foU_max = try maximum(abs(value(FO_U[k,i])) for k in K_AX, i in 1:nfe) catch; NaN end
+        foupt_max = try maximum(abs(value(FO_upt[u,i])) for u in 1:2, i in 1:nfe) catch; NaN end
+        comp_max = maximum([foL_max, foU_max, foupt_max])
+        # Stationarity residual: max absolute left-hand side for candidate reactions
+        stat_res = NaN
+        try
+            if REDUCED_MODE && reduced_sets !== nothing
+                _, C_sets, _ = reduced_sets
+                local max_res = 0.0
+                for i in 1:nfe
+                    Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+                    for k in Ci
+                        if !(k in K_AX); continue; end
+                        nz_met = Int[]
+                        for r in M_AX
+                            if S[r, k] != 0.0
+                                push!(nz_met, r)
+                            end
+                        end
+                        lhs = d[k] + value(w_param) * (try value(v[k,i]) catch; 0.0 end) * vs[k] +
+                              (try value(alpha_L[k,i]) catch; 0.0 end) + (try value(alpha_U[k,i]) catch; 0.0 end) +
+                              up_glu[k] * (try value(alpha_upt[1,i]) catch; 0.0 end) + up_fru[k] * (try value(alpha_upt[2,i]) catch; 0.0 end)
+                        for r in nz_met
+                            lhs += S[r,k] * (try value(lambda_[r,i]) catch; 0.0 end)
+                        end
+                        max_res = max(max_res, abs(lhs))
+                    end
+                end
+                stat_res = max_res
+            end
+        catch
+        end
+        # Save metrics file per stage
+        metrics_path = joinpath(RESULTS_DIR, "zenteno_metrics_" * tag_i * "_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+        open(metrics_path, "w") do io
+            println(io, "tag=", tag_i)
+            println(io, "phi=", phi_i, ", w=", w_i)
+            println(io, "status=", status)
+            println(io, "primal_status=", pr_status)
+            try println(io, "objective=", objective_value(m)) catch end
+            println(io, @sprintf("comp_max=%.6e", comp_max))
+            println(io, @sprintf("stationarity_residual=%.6e", stat_res))
+            # Include existing SSE/PEN/REG metrics for comparison
+            sse_val = try value(SSE) catch; NaN end
+            pen_val = try value(PEN) catch; NaN end
+            reg_val = try value(REG) catch; NaN end
+            println(io, @sprintf("SSE=%.6e", sse_val))
+            println(io, @sprintf("PEN=%.6e", pen_val))
+            println(io, @sprintf("REG=%.6e", reg_val))
+        end
+        println("[HOM] Saved metrics ", metrics_path)
+
+        # Export warm-start checkpoint for full model at selected stage
+        if HANDOFF_FULL && idx == HANDOFF_STAGE
+            try
+                # Build full-sized arrays
+                Vk = zeros(nv, nfe)
+                AL = zeros(nv, nfe)
+                AU = zeros(nv, nfe)
+                LM = zeros(nm, nfe)
+                # Map reduced axes to full
+                if !REDUCED_MODE || reduced_sets === nothing
+                    for i2 in 1:nfe, k2 in 1:nv
+                        Vk[k2,i2] = try value(v[k2,i2]) catch; 0.0 end
+                        AL[k2,i2] = try value(alpha_L[k2,i2]) catch; 0.0 end
+                        AU[k2,i2] = try value(alpha_U[k2,i2]) catch; 0.0 end
+                    end
+                    for i2 in 1:nfe, r2 in 1:nm
+                        LM[r2,i2] = try value(lambda_[r2,i2]) catch; 0.0 end
+                    end
+                else
+                    # Reduced → full mapping using K_AX, M_AX
+                    for i2 in 1:nfe
+                        for k2 in K_AX
+                            Vk[k2,i2] = try value(v[k2,i2]) catch; 0.0 end
+                            AL[k2,i2] = try value(alpha_L[k2,i2]) catch; 0.0 end
+                            AU[k2,i2] = try value(alpha_U[k2,i2]) catch; 0.0 end
+                        end
+                        for r2 in M_AX
+                            LM[r2,i2] = try value(lambda_[r2,i2]) catch; 0.0 end
+                        end
+                    end
+                end
+                # States and params
+                Ck = Array{Float64}(undef, nc, nfe, ncp)
+                for l2 in 1:nc, i2 in 1:nfe, j2 in 1:ncp
+                    Ck[l2,i2,j2] = try value(c[l2,i2,j2]) catch; c0[l2] end
+                end
+                HVk = [try value(hv[i2]) catch; hm[i2] end for i2 in 1:nfe]
+                TETAk = [try value(teta[p]) catch; T0[p] end for p in 1:np]
+                JLD2.jldsave(CHECKPOINT_PATH; teta=TETAk, hv=HVk, c=Ck, v=Vk, alpha_L=AL, alpha_U=AU, lambda_=LM,
+                              meta=Dict("stage"=>idx, "phi"=>phi_i, "w"=>w_i, "timestamp"=>string(Dates.now())))
+                println("[HANDOFF] Saved full-model warm start checkpoint ", CHECKPOINT_PATH)
+            catch err
+                @warn "Failed to export handoff checkpoint" err
+            end
+        end
+    end
+else
+    optimize!(m)
+    status = termination_status(m)
+    pr_status = primal_status(m)
+    println("[INFO] Solver status: ", status, ", primal: ", pr_status)
+    try println("[INFO] Penalty objective: ", objective_value(m)) catch end
+    try
+        summary_path = joinpath(RESULTS_DIR, "zenteno_relax_summary_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+        open(summary_path, "w") do io
+            println(io, "status=", status)
+            println(io, "primal_status=", pr_status)
+            try println(io, "objective=", objective_value(m)) catch end
+        end
+        println("[SAVE] ", summary_path)
+    catch err
+        @warn "Failed to save summary" err
+    end
 end
 
 # ---------------------------------------------
@@ -699,10 +1431,17 @@ try
         println(io, @sprintf("REG=%.6e", reg_val))
         println(io, @sprintf("OBJ=%.6e", try objective_value(m) catch; NaN end))
         # Complementarity diagnostics (FO products magnitude summaries)
-        foL_max = try maximum(abs(value(FO_L[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
-        foU_max = try maximum(abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+        if !REDUCED_MODE || reduced_sets === nothing
+            foL_max = try maximum(abs(value(FO_L[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+            foU_max = try maximum(abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+            fo_sum  = try sum(abs(value(FO_L[k,i])) + abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
+        else
+            # In reduced mode, FO variables exist only for reactions in K_AX
+            foL_max = try maximum(abs(value(FO_L[k,i])) for k in K_AX, i in 1:nfe) catch; NaN end
+            foU_max = try maximum(abs(value(FO_U[k,i])) for k in K_AX, i in 1:nfe) catch; NaN end
+            fo_sum  = try sum(abs(value(FO_L[k,i])) + abs(value(FO_U[k,i])) for k in K_AX, i in 1:nfe) catch; NaN end
+        end
         foupt_max = try maximum(abs(value(FO_upt[u,i])) for u in 1:2, i in 1:nfe) catch; NaN end
-        fo_sum = try sum(abs(value(FO_L[k,i])) + abs(value(FO_U[k,i])) for k in 1:nv, i in 1:nfe) catch; NaN end
         foupt_sum = try sum(abs(value(FO_upt[u,i])) for u in 1:2, i in 1:nfe) catch; NaN end
         println(io, @sprintf("FO_L_max=%.6e", foL_max))
         println(io, @sprintf("FO_U_max=%.6e", foU_max))

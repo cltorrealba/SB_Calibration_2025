@@ -1,0 +1,32 @@
+Experimento: experiment1_reduc_0a3 (seed desde modelo reducido)
+Fecha: 2025-11-12
+
+Archivos esperados en esta carpeta (pendientes de mover si aún están en results/):
+- reduced_sets.jld2 (copia)
+- zenteno_metrics_baseline_20251112-181243.txt
+- zenteno_pre_ode_vs_data_20251112-181249.png
+- zenteno_metrics_hom_s1_20251112-180005.txt
+- zenteno_metrics_hom_s2_20251112-180318.txt
+- zenteno_metrics_hom_s3_20251112-180930.txt
+- zenteno_post_ode_vs_data_mpcc_20251112-180934.png
+- zenteno_handoff_full_checkpoint.jld2
+- zenteno_seed_checkpoint.jld2
+- zenteno_metrics_seeded_20251112-181953.txt
+- zenteno_estimation_report_20251112-181948.txt
+- zenteno_post_ode_vs_data_mpcc_20251112-181953.png
+- zenteno_estimation_report_20251112-180932.txt
+- zenteno_relax_summary_20251112-181948.txt
+- zenteno_comparison_20251112-182600.txt
+
+Resumen de métricas (vs baseline full-model):
+- SSE: -13.7% (seed full)
+- PEN: -84.8% (seed full)
+- REG: -0.4% (seed full, leve cambio por regularización)
+- OBJ: -55.3% (seed full)
+- comp_max: -85.8% (seed full)
+- stationarity_residual (stage-3): 2.259785e-08
+
+Notas:
+- El homotopy fue 3 etapas (phi=1e-2,1e-1,1; w=1e-4,1e-5,1e-6) con pesos 1,1,2 (180/180/360 s).
+- Se generó el seed en zenteno_seed_checkpoint.jld2 a partir del handoff en etapa 3.
+- Mantener una copia de reduced_sets.jld2 en results/ para futuros experimentos.

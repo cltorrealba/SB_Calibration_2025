@@ -1,0 +1,30 @@
+Experimento: experiment1_no_reduc_0a3 (seed desde modelo completo)
+Fecha: 2025-11-12
+
+Archivos en esta carpeta:
+- zenteno_metrics_baseline_20251112-170110.txt
+- zenteno_pre_ode_vs_data_20251112-170115.png
+- zenteno_metrics_hom_s1_20251112-164848.txt
+- zenteno_metrics_hom_s2_20251112-165234.txt
+- zenteno_metrics_hom_s3_20251112-165919.txt
+- zenteno_post_ode_vs_data_mpcc_20251112-165923.png
+- zenteno_handoff_full_checkpoint.jld2
+- zenteno_seed_checkpoint.jld2
+- zenteno_metrics_seeded_20251112-170831.txt
+- zenteno_estimation_report_20251112-164045.txt (baseline report)
+- zenteno_estimation_report_20251112-170829.txt (seeded full-run)
+- zenteno_relax_summary_20251112-170828.txt
+- zenteno_comparison_20251112-171325.txt (comparación detallada)
+
+Resumen de métricas (vs baseline full-model, usando estimation_report):
+- SSE: 2.955843e+05 -> 2.599378e+05  (−12.06%)
+- PEN: 2.079448e+06 -> 5.127373e+04  (−97.53%)
+- REG: 4.817252e-01 -> 2.317718e-01  (−51.90%)
+- OBJ: 7.114739e+05 -> 2.701926e+05  (−62.03%)
+- comp_max: 1.883810e+02 -> 1.267875e+02  (−32.70%)
+- stationarity_residual (stage-3): ver zenteno_metrics_hom_s3_20251112-165919.txt
+
+Notas:
+- Homotopy (3 etapas): phi=1e-2,1e-1,1; w=1e-4,1e-5,1e-6; pesos 1,1,2 (180/180/360 s).
+- Seed generado desde etapa 3 y usado en corrida full posterior (360 s).
+- Ver zenteno_comparison_20251112-171325.txt para tabla de comparación completa.

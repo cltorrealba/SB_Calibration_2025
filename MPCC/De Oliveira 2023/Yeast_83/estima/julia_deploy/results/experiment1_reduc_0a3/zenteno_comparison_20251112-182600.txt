@@ -1,0 +1,16 @@
+Comparison report generated: 2025-11-12 18:26:00
+Baseline: zenteno_estimation_report_20251112-174250.txt
+Seed Stage-3: zenteno_metrics_hom_s3_20251112-180930.txt
+Seed Full-run: zenteno_estimation_report_20251112-181948.txt
+
+Metric                              Baseline        Seed_s3       Seed_full     %Imp_s3     %Imp_full
+--------------------------------------------------------------------------------------------------------------
+SSE                                 2.955813e+05    2.548630e+05  2.550046e+05       13.77        13.73
+PEN                                 2.079469e+06    5.566397e+05  3.148624e+05       73.24        84.84
+REG                                 4.785485e-01    4.776600e-01  4.804512e-01        0.19        -0.40
+OBJ                                 7.114752e+05             NaN  3.179771e+05         NaN        55.33
+comp_max                            1.883810e+02    4.273749e+01  2.668976e+01       77.33        85.81
+stationarity_residual                        NaN    2.259785e-08           NaN         NaN          NaN
+comp_sum                            2.079470e+06             NaN  3.148624e+05         NaN        84.85
+
+PEN/SSE ratio                       7.036897e+00    2.184385e+00  1.234943e+00

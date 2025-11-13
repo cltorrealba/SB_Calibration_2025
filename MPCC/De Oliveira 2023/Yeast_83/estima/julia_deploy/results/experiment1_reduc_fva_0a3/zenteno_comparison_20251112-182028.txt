@@ -1,0 +1,16 @@
+Comparison report generated: 2025-11-12 18:20:27
+Baseline: C:\Users\ctorrealba\OneDrive - Viña Concha y Toro S.A\Documentos\Proyectos I+D\PI-4497\Resultados\2025\SB_Calibration_2025\MPCC\De Oliveira 2023\Yeast_83\estima\julia_deploy\results\zenteno_metrics_baseline_20251112-174257.txt
+Seed Stage-3: C:\Users\ctorrealba\OneDrive - Viña Concha y Toro S.A\Documentos\Proyectos I+D\PI-4497\Resultados\2025\SB_Calibration_2025\MPCC\De Oliveira 2023\Yeast_83\estima\julia_deploy\results\zenteno_metrics_hom_s3_20251112-180930.txt
+Seed Full-run: C:\Users\ctorrealba\OneDrive - Viña Concha y Toro S.A\Documentos\Proyectos I+D\PI-4497\Resultados\2025\SB_Calibration_2025\MPCC\De Oliveira 2023\Yeast_83\estima\julia_deploy\results\zenteno_metrics_seeded_20251112-181953.txt
+
+Metric                                Baseline         Seed_s3       Seed_full      %Imp_s3    %Imp_full
+--------------------------------------------------------------------------------------------------------------
+SSE                               2.955813e+05    2.548630e+05    2.550046e+05        13.78        13.73
+PEN                               2.079469e+06    5.566397e+05    3.148624e+05        73.23        84.86
+REG                               4.785485e-01    4.776600e-01    4.804512e-01         0.19        -0.40
+OBJ                               7.114752e+05             NaN    3.179771e+05          NaN        55.31
+comp_max                          1.883810e+02    4.273749e+01    2.668976e+01        77.31        85.83
+stationarity_residual                      NaN    2.259785e-08             NaN          NaN          NaN
+comp_sum                                   NaN             NaN             NaN          NaN          NaN
+
+PEN/SSE ratio                     7.035185e+00    2.184074e+00    1.234732e+00

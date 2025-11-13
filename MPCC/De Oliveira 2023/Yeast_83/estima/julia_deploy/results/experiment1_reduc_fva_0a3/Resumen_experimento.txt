@@ -1,0 +1,25 @@
+﻿Experimento 1 (reduced + FVA): baseline 360s, seed homotopía 180/180/360s, corrida seeded full 360s.
+
+- Archivos clave:
+  - Baseline: zenteno_metrics_baseline_20251113-082458.txt
+  - Seed hom s3: zenteno_metrics_hom_s3_20251113-084305.txt
+  - Seeded full: zenteno_metrics_seeded_20251113-085415.txt
+  - Comparación: zenteno_comparison_20251113-085552.txt
+  - Checkpoints: zenteno_handoff_full_checkpoint.jld2, zenteno_seed_checkpoint.jld2
+  - reduced_sets.jld2 generado con FVA_ENABLE=1, FVA_FORCE=1, PFBA_EPS=1e-7
+
+- Resumen de métricas (de comparación):
+  - SSE:     baseline=2.95578e+05 | seed_s3=2.547835e+05 | seeded=2.405642e+05 | Δ% s3=13.80 | Δ% seeded=18.61
+  - PEN:     baseline=2.079424e+06 | seed_s3=5.428177e+05 | seeded=2.700346e+06 | Δ% s3=73.90 | Δ% seeded=-29.86
+  - REG:     baseline=4.792294e-01 | seed_s3=4.800469e-01 | seeded=4.804545e-01
+  - OBJ:     baseline=7.114629e+05 | seeded=7.806335e+05
+  - comp_max: baseline=1.883810e+02 | seed_s3=4.208449e+01 | seeded=1.874569e+02 | Δ% s3=77.66 | Δ% seeded=0.49
+  - stationarity_residual (s3): 4.62e-14
+
+- Estado del solver:
+  - Homotopía s3: TIME_LIMIT con handoff guardado
+  - Seeded full: TIME_LIMIT, primal NEARLY_FEASIBLE_POINT
+
+Notas:
+- Los tiempos límite se respetaron (360s para baseline y seeded full; 180/180/360s para homotopía).
+- La reducción con FVA mejoró fuertemente comp_max en el seed (-78%), y el seeded full mantuvo comp_max similar al baseline, con SSE menor.
