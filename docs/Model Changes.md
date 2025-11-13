@@ -111,11 +111,11 @@ Where:
 
 ENV controls:
 - `BV_ON` (0|1): master switch (default 0).
-- `BV_SCOPE` (`all`|`uptake`): quick scope selector. `uptake` restricts to glucose & fructose uptake indices (`glu`, `fru`). Default `uptake` (updated).
+- `BV_SCOPE` (`all`|`uptake`): quick scope selector. `uptake` restricts to glucose & fructose uptake indices (`glu`, `fru`). Default `all`.
 - `BV_RXN_SET`: explicit comma/space/semicolon separated list of reaction indices. If non-empty, overrides `BV_SCOPE`.
-- `DV_MAX_GLU`, `DV_MAX_FRU`: dv_max for glucose/fructose uptake reactions. Default `0.5` (updated; previously `1.0`).
-- `DV_MAX_COMMON`: dv_max for all other reactions. Default `50.0` (updated; previously `1e3`).
-- `IPOPT_MUMPS_MEM_PERCENT`: Optional pass-through to Ipopt (`mumps_mem_percent`) to mitigate restoration failures under tight memory. Default now `150` if unset.
+- `DV_MAX_GLU`, `DV_MAX_FRU`: dv_max for glucose/fructose uptake reactions (defaults 1.0 unless overridden in trial mode where we often use 0.5).
+- `DV_MAX_COMMON`: dv_max for all other reactions (default large, e.g. `1e3` so effectively inactive unless `BV_SCOPE=all`).
+- `IPOPT_MUMPS_MEM_PERCENT`: Optional pass-through to Ipopt (`mumps_mem_percent`) to mitigate restoration failures under tight memory.
 - `BV_TRIAL_WALL_TIME`: Used only by pipeline `bv_trial` mode to set `WALL_TIME` quickly (default 60 s).
 
 Selection logic in code (`MPCC_Zenteno.jl`):
@@ -162,10 +162,7 @@ $env:BV_ON="1"; $env:BV_RXN_SET="2588,2583,3000"; julia --project=. .\experiment
 
 Disable BV (default behavior): simply omit `BV_ON` or set it to 0.
 
-Defaults (Nov 2025):
-- Runtime safety: Ipopt/MUMPS memory percent defaults to `150` unless overridden via ENV.
-- BV module: `BV_ON=0` by default. When enabling BV without further overrides, scope defaults to `uptake` with `DV_MAX_GLU=DV_MAX_FRU=0.5` and `DV_MAX_COMMON=50.0`.
-- Hybrid (BV early → BV off late): not enabled by default based on comparative runs; prefer either no-BV throughout or BV kept on if stability dominates.
+Default stance (Nov 2025): Leave `BV_ON=0` for production calibrations until final evaluation of impact on SSE/PEN and solver iteration robustness. Use `bv_trial` mode for quick exploratory checks.
 
 Future considerations:
 - Adaptive dv_max schedule that relaxes bounds mid-run once flux trajectories stabilize.
