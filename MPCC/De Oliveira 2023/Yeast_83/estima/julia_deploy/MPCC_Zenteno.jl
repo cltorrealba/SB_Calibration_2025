@@ -376,6 +376,11 @@ set_optimizer_attribute(m, "acceptable_tol", 1e-2)
 set_optimizer_attribute(m, "linear_solver", "mumps")
 set_optimizer_attribute(m, "mu_strategy", "adaptive")
 set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based")
+# Optional MUMPS memory percent; default to a safer 150 unless overridden via ENV
+let mm = try parse(Int, get(ENV, "IPOPT_MUMPS_MEM_PERCENT", "150")) catch; 150 end
+    set_optimizer_attribute(m, "mumps_mem_percent", mm)
+    println("[CFG] Ipopt mumps_mem_percent=", mm)
+end
 # Wall-clock time configurable via ENV["WALL_TIME"] (default 600 s). Use 60 for quick diagnostic runs.
 wall_time = try parse(Float64, get(ENV, "WALL_TIME", "600")) catch; 600.0 end
 set_optimizer_attribute(m, "max_wall_time", wall_time)
@@ -886,6 +891,61 @@ else
 end
 
 # (No FO equality: simulation-only mode)
+
+# -----------------------------------------------------------
+# Module 4: Temporal smoothness of fluxes between finite elements
+# If BV_ON=1, impose bounded variation constraints:
+#   -dv_max_k * hv[i] <= v[k,i] - v[k,i-1] <= dv_max_k * hv[i]  for i>=2
+# Separate dv_max for glucose/fructose uptake vs common reactions.
+# ENV defaults (override as needed):
+#   BV_ON (0/1), DV_MAX_GLU, DV_MAX_FRU, DV_MAX_COMMON
+# -----------------------------------------------------------
+const BV_ON = get(ENV, "BV_ON", "0") == "1"
+# Default scope now 'uptake' to match recommended usage; when BV_ON=0 this has no effect
+const BV_SCOPE = lowercase(get(ENV, "BV_SCOPE", "uptake"))  # 'all' or 'uptake'
+# Tighter default uptake variation caps based on trials; common left moderate unless explicitly scoping 'all'
+const DV_MAX_GLU   = try parse(Float64, get(ENV, "DV_MAX_GLU", "0.5")) catch; 0.5 end
+const DV_MAX_FRU   = try parse(Float64, get(ENV, "DV_MAX_FRU", "0.5")) catch; 0.5 end
+const DV_MAX_COMMON= try parse(Float64, get(ENV, "DV_MAX_COMMON", "50.0")) catch; 50.0 end
+const BV_RXN_SET_RAW = strip(get(ENV, "BV_RXN_SET", ""))  # optional comma-separated list of reaction indices for BV
+BV_RXN_SET = BV_RXN_SET_RAW == "" ? Int[] : begin
+    parsed = Int[]
+    for tok in split(BV_RXN_SET_RAW, [',',';',' '])
+        t = strip(tok)
+        isempty(t) && continue
+        try push!(parsed, parse(Int, t)) catch err
+            println("[WARN] BV_RXN_SET parse failed for token='" * t * "': " * string(err))
+        end
+    end
+    parsed
+end
+if BV_ON
+    println("[CFG] BV_ON=1; scope=$(BV_SCOPE); dv_max_glu=$(DV_MAX_GLU), dv_max_fru=$(DV_MAX_FRU), dv_max_common=$(DV_MAX_COMMON); BV_RXN_SET_RAW='" * BV_RXN_SET_RAW * "'")
+    # Determine base candidate set (respect reduced mode)
+    base_set = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
+    # Pre-scope selection
+    rxn_set = if !isempty(BV_RXN_SET)
+        intersect(BV_RXN_SET, base_set)  # user override list
+    elseif BV_SCOPE == "uptake"
+        filter(k -> k == glu || k == fru, base_set)
+    else
+        base_set
+    end
+    if isempty(rxn_set)
+        println("[WARN] BV constraints: rxn_set empty (scope='$(BV_SCOPE)'); skipping BV constraints")
+    else
+        trunc_list = length(rxn_set) > 30 ? string(rxn_set[1:15], " ... ", rxn_set[end-14:end]) : string(rxn_set)
+        println("[CFG] BV constraints will apply to |rxn_set|=$(length(rxn_set)) reactions: ", trunc_list)
+    end
+    for k in rxn_set
+        dvk = (k == glu) ? DV_MAX_GLU : (k == fru ? DV_MAX_FRU : DV_MAX_COMMON)
+        for i in 2:nfe
+            @constraint(m, v[k, i] - v[k, i-1] <= dvk * hv[i])
+            @constraint(m, v[k, i] - v[k, i-1] >= -dvk * hv[i])
+        end
+    end
+    println("[CFG] BV constraints added: reactions=", rxn_set)
+end
 
 const INIT_PIPELINE = get(ENV, "INIT_PIPELINE", "1") == "1"
 

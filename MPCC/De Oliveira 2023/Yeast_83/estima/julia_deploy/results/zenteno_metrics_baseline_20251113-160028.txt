@@ -1,0 +1,22 @@
+tag=baseline
+timestamp=2025-11-13T16:00:29.110
+vars.total_est=268082
+axes.reactions=3928, lambda_rows=2666
+cons.collocation=180
+cons.hv=12
+cons.bounds=208
+cons.ode=180
+cons.v_bounds=94272
+cons.alpha_sign=94296
+cons.stoichiometry=31992
+cons.stationarity=47136
+cons.fo_products=94272
+cons.uptake=48
+SSE0=2.520157e+05
+PEN0=9.429600e-04
+REG0=1.644020e-01
+OBJ0=2.520157e+05
+comp_max0=0.000000e+00
+flags.REDUCED_MODE=false, PEN_NONNEG=true, PEN_REDUCED=true
+flags.INIT_FROM_ODE=true, INIT_DUAL_FE=true, INIT_PIPELINE=true
+weights.W_SSE=1.0, W_PEN=0.2, W_REG=1.0e-8

@@ -94,3 +94,81 @@ Future considerations:
   - Potential identifiability diagnostics (e.g., computing condition numbers of local Hessian / Fisher approximations) to warn if `lag_tau_h` and `lag_sensitivity` become strongly collinear.
   - Option to selectively apply lag scaling only to growth-associated fluxes rather than all reaction rates, reducing parameter cross-talk with yield terms.
 
+### Update (2025-11-13): Module 4 — Bounded Variation (Temporal Smoothness of Fluxes)
+
+Rationale: Some flux trajectories exhibited high-frequency oscillations between consecutive finite elements (FEs) during early Ipopt iterations, stressing MUMPS memory and harming stability. We introduced optional bounded variation (BV) constraints to limit the per-element jump of selected fluxes.
+
+Constraint form (enabled when `BV_ON=1`):
+
+```
+    -dv_max_k * h_i <= v_{k,i} - v_{k,i-1} <= dv_max_k * h_i      for i = 2..nfe
+```
+
+Where:
+- `v_{k,i}` is flux k at FE i.
+- `h_i` (`hv[i]` in code) is the FE length scaling (so larger elements allow proportionally larger jumps).
+- `dv_max_k` is a per-reaction bound chosen from ENV parameters.
+
+ENV controls:
+- `BV_ON` (0|1): master switch (default 0).
+- `BV_SCOPE` (`all`|`uptake`): quick scope selector. `uptake` restricts to glucose & fructose uptake indices (`glu`, `fru`). Default `uptake` (updated).
+- `BV_RXN_SET`: explicit comma/space/semicolon separated list of reaction indices. If non-empty, overrides `BV_SCOPE`.
+- `DV_MAX_GLU`, `DV_MAX_FRU`: dv_max for glucose/fructose uptake reactions. Default `0.5` (updated; previously `1.0`).
+- `DV_MAX_COMMON`: dv_max for all other reactions. Default `50.0` (updated; previously `1e3`).
+- `IPOPT_MUMPS_MEM_PERCENT`: Optional pass-through to Ipopt (`mumps_mem_percent`) to mitigate restoration failures under tight memory. Default now `150` if unset.
+- `BV_TRIAL_WALL_TIME`: Used only by pipeline `bv_trial` mode to set `WALL_TIME` quickly (default 60 s).
+
+Selection logic in code (`MPCC_Zenteno.jl`):
+1. Build `base_set` (= all reactions unless reduced mode active, then `K_AX`).
+2. If `BV_RXN_SET` provided → intersect with `base_set`.
+3. Else if `BV_SCOPE=='uptake'` → `[glu, fru]`.
+4. Else → full `base_set`.
+5. For each k in final `rxn_set`, compute `dvk` with special cases glu/fru; apply two linear constraints per internal FE.
+
+Logging additions:
+- Prints configuration: scope, dv_max_* values, raw BV_RXN_SET.
+- Prints truncated reaction set (first 15 … last 15) if large.
+- Warns & skips if set empty.
+
+Recommended usage patterns:
+| Scenario | Suggested ENV |
+|----------|---------------|
+| Diagnostic smoothing (only uptake) | `BV_ON=1 BV_SCOPE=uptake DV_MAX_GLU=0.5 DV_MAX_FRU=0.5` |
+| Broad smoothing (all) | Start with `DV_MAX_COMMON=100` then tighten carefully |
+| Targeted manual list | `BV_ON=1 BV_RXN_SET="2588,2583,3000"` |
+
+Tuning guidance:
+- Start restrictive only on uptake; confirm no MUMPS OOM. Then optionally expand scope.
+- If restoration failures persist, reduce `DV_MAX_GLU/FRU` further (e.g. 0.3) or increase `IPOPT_MUMPS_MEM_PERCENT` (e.g. 150→200) cautiously.
+- Keep `DV_MAX_COMMON` large unless you intend to smooth all fluxes; overly tight common bounds can introduce artificial coupling and slow convergence.
+
+Edge cases & safeguards:
+- Frozen bounds state is independent; we added a guard to prevent accidental carry-over (`seed` auto-resets `FROZEN_BOUNDS` unless using explicit frozen modes).
+- Reduced mode compatibility: when `REDUCED_MODE=1`, BV uses the reduced flux set `K_AX`; indices in `BV_RXN_SET` not in `K_AX` are silently dropped.
+- Empty selection triggers a warning instead of adding empty constraint loops.
+
+Example PowerShell commands:
+
+Restrict to uptake (recommended first test):
+```powershell
+Set-Location "...\julia_deploy"
+$env:BV_ON="1"; $env:BV_SCOPE="uptake"; $env:DV_MAX_GLU="0.5"; $env:DV_MAX_FRU="0.5"; $env:BV_TRIAL_WALL_TIME="60"; julia --project=. .\experiment_pipeline.jl bv_trial
+```
+
+Manual list override:
+```powershell
+$env:BV_ON="1"; $env:BV_RXN_SET="2588,2583,3000"; julia --project=. .\experiment_pipeline.jl bv_trial
+```
+
+Disable BV (default behavior): simply omit `BV_ON` or set it to 0.
+
+Defaults (Nov 2025):
+- Runtime safety: Ipopt/MUMPS memory percent defaults to `150` unless overridden via ENV.
+- BV module: `BV_ON=0` by default. When enabling BV without further overrides, scope defaults to `uptake` with `DV_MAX_GLU=DV_MAX_FRU=0.5` and `DV_MAX_COMMON=50.0`.
+- Hybrid (BV early → BV off late): not enabled by default based on comparative runs; prefer either no-BV throughout or BV kept on if stability dominates.
+
+Future considerations:
+- Adaptive dv_max schedule that relaxes bounds mid-run once flux trajectories stabilize.
+- Per-flux statistical detection of high-variance trajectories to auto-select BV_RXN_SET.
+- Integration with stationarity residual diagnostics to ensure BV does not mask complementarity improvements.
+
