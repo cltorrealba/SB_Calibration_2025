@@ -1,0 +1,28 @@
+th=240.0, nfe=12, hv_mode=fixed
+measured_states=[1, 3, 4, 5]
+estimable_params=[:mu0]
+SSE=2.370633e+05
+PEN=3.735062e+01
+REG=3.005154e-01
+OBJ=2.370708e+05
+FO_L_max=4.957578e-01
+FO_U_max=1.450617e+00
+FO_upt_max=5.943455e-01
+FO_LU_sum=3.055598e+01
+FO_upt_sum=6.742809e+00
+
+# Parameters (name, nominal, lb, ub, start, opt_log, opt_real)
+     mu0  nom= 1.416650e-01  lb= 7.083250e-02  ub= 2.833300e-01  start= 2.124975e-01  opt_log=-1.406097e+00  opt=2.450980e-01
+  betaG0  nom= 1.411820e+00  lb= 1.411820e+00  ub= 1.411820e+00  start= 1.411820e+00  opt_log= 3.371145e-01  opt=1.400900e+00
+  betaF0  nom= 8.494820e+00  lb= 8.494820e+00  ub= 8.494820e+00  start= 8.494820e+00  opt_log= 2.121102e+00  opt=8.340320e+00
+     Kn0  nom= 2.268820e-01  lb= 2.268820e-01  ub= 2.268820e-01  start= 2.268820e-01  opt_log=-1.481962e+00  opt=2.271914e-01
+     Kg0  nom= 3.151400e+00  lb= 3.151400e+00  ub= 3.151400e+00  start= 3.151400e+00  opt_log= 1.153970e+00  opt=3.170756e+00
+     Kf0  nom= 2.976250e+00  lb= 2.976250e+00  ub= 2.976250e+00  start= 2.976250e+00  opt_log= 1.097022e+00  opt=2.995233e+00
+    Kig0  nom= 2.952760e+01  lb= 2.952760e+01  ub= 2.952760e+01  start= 2.952760e+01  opt_log= 3.356683e+00  opt=2.869385e+01
+    Kie0  nom= 2.998090e+00  lb= 2.998090e+00  ub= 2.998090e+00  start= 2.998090e+00  opt_log= 1.088606e+00  opt=2.970130e+00
+     Kd0  nom= 3.117360e-05  lb= 3.117360e-05  ub= 3.117360e-05  start= 3.117360e-05  opt_log=-1.041000e+01  opt=3.012955e-05
+     Yxn  nom= 9.805760e+00  lb= 9.805760e+00  ub= 9.805760e+00  start= 9.805760e+00  opt_log= 2.266075e+00  opt=9.641485e+00
+     Yxg  nom= 3.943450e-01  lb= 3.943450e-01  ub= 3.943450e-01  start= 3.943450e-01  opt_log=-9.354115e-01  opt=3.924244e-01
+     Yxf  nom= 1.862200e-01  lb= 1.862200e-01  ub= 1.862200e-01  start= 1.862200e-01  opt_log=-1.695108e+00  opt=1.835793e-01
+     Yeg  nom= 1.413300e-01  lb= 1.413300e-01  ub= 1.413300e-01  start= 1.413300e-01  opt_log=-1.973471e+00  opt=1.389736e-01
+     Yef  nom= 9.693200e-01  lb= 9.693200e-01  ub= 9.693200e-01  start= 9.693200e-01  opt_log=-3.988816e-02  opt=9.608969e-01
