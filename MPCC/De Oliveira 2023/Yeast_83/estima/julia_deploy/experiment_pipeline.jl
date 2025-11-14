@@ -192,13 +192,11 @@ function mode_seed_run()
     end
     SSE = PEN = REG = OBJ = FO_L_max = FO_U_max = FO_upt_max = NaN
     for ln in eachline(joinpath(RESULTS_DIR, basename(rep)))
-        if startswith(ln, "SSE="); SSE = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
         if startswith(ln, "PEN="); PEN = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
         if startswith(ln, "REG="); REG = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
         if startswith(ln, "OBJ="); OBJ = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
         if startswith(ln, "FO_L_max="); FO_L_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
         if startswith(ln, "FO_U_max="); FO_U_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
-        if startswith(ln, "FO_upt_max="); FO_upt_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
     end
     comp_max = maximum([FO_L_max, FO_U_max, FO_upt_max])
     metrics_path = joinpath(RESULTS_DIR, "zenteno_metrics_seeded_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
@@ -230,9 +228,7 @@ function mode_bv_trial()
         "CHECKPOINT_PATH" => ck,
         "INIT_FROM_ODE" => init_from_checkpoint == "1" ? "0" : "1",
         "INIT_DUAL_FE" => "0",
-        "REDUCED_MODE" => "0",
         "WALL_TIME" => get(ENV, "BV_TRIAL_WALL_TIME", "60"),
-        "BV_ON" => "1",
         "BV_SCOPE" => get(ENV, "BV_SCOPE", "all"),
         "DV_MAX_GLU" => get(ENV, "DV_MAX_GLU", "0.5"),
         "DV_MAX_FRU" => get(ENV, "DV_MAX_FRU", "0.5"),
@@ -371,7 +367,10 @@ function main()
             "CHECKPOINT_PATH" => ck_coarse,
             # trim overhead on fine stage
             "SKIP_PRE_ODE" => get(ENV, "SKIP_PRE_ODE_FINE", "1"),
-            "SKIP_PLOTS" => get(ENV, "SKIP_PLOTS_FINE", "1"),
+            # Final fine stage: por defecto queremos ver el plot completo a nfe=fine_nfe.
+            # Cambiamos el default de SKIP_PLOTS_FINE a "0" para que se ejecuten las gráficas post-optimización.
+            # Si el usuario desea seguir ocultándolas puede exportar SKIP_PLOTS_FINE=1.
+            "SKIP_PLOTS" => get(ENV, "SKIP_PLOTS_FINE", "0"),
             "BASELINE_WRITE" => get(ENV, "BASELINE_WRITE_FINE", "0"),
             # prefer preserving warm start instead of re-running ODE seeding
             "SEED_INIT_FROM_ODE" => get(ENV, "SEED_INIT_FROM_ODE_FINE", "0")
@@ -474,6 +473,206 @@ function main()
         mode_compare()
     elseif mode == "bv_trial"
         mode_bv_trial()
+        elseif mode == "multistart"
+            # Multi-start over estimable parameters in log-space.
+            K = try parse(Int, get(ENV, "MULTISTART", "0")) catch; 0 end
+            if K <= 1
+                println("[MULTISTART] MULTISTART<=1; running single base mode. Set MULTISTART=3 (por ejemplo).")
+                base_mode = get(ENV, "MULTISTART_BASE_MODE", "seed180_cf")
+                ARGS[1] = base_mode
+                main()
+                return
+            end
+            base_mode = get(ENV, "MULTISTART_BASE_MODE", "seed180_cf")
+            println("[MULTISTART] Ejecutando K=", K, " intentos; base_mode=", base_mode)
+            # Replicate parameter metadata (must mirror MPCC_Zenteno for bounds logic)
+            Pnom = Dict(
+                :mu0=>0.141665, :betaG0=>1.41182, :betaF0=>8.49482, :Kn0=>0.226882,
+                :Kg0=>3.1514, :Kf0=>2.97625, :Kig0=>29.5276, :Kie0=>2.99809, :Kd0=>3.11736e-5,
+                :Yxn=>9.80576, :Yxg=>0.394345, :Yxf=>0.18622, :Yeg=>0.14133, :Yef=>0.96932
+            )
+            # Parse EST_PARAMS (same as MPCC)
+            est_params_raw = get(ENV, "EST_PARAMS", "mu0")
+            est_syms = Symbol.(filter(!isempty, split(est_params_raw, [',',';',' '])))
+            est_syms = [s for s in est_syms if haskey(Pnom, s)]
+            if isempty(est_syms)
+                println("[MULTISTART] EST_PARAMS vacío o inválido; nada que optimizar.")
+                return
+            end
+            # Build bounds in log-space with optional overrides via EST_RANGES
+            # Syntax: EST_RANGES="mu0:0.4,2.5;kcat_glc:0.2,8" (multiplicative factors relative to Pnom)
+            ranges_raw = get(ENV, "EST_RANGES", "")
+            range_lo = Dict{Symbol,Float64}(); range_hi = Dict{Symbol,Float64}()
+            if !isempty(strip(ranges_raw))
+                for tok in filter(!isempty, split(ranges_raw, [';','\n']))
+                    parts = split(tok, ':')
+                    if length(parts) == 2
+                        sname = Symbol(strip(parts[1]))
+                        if haskey(Pnom, sname)
+                            try
+                                lr = split(parts[2], [',','/',' '])
+                                if length(lr) >= 2
+                                    range_lo[sname] = parse(Float64, strip(lr[1]))
+                                    range_hi[sname] = parse(Float64, strip(lr[2]))
+                                end
+                            catch err
+                                println("[MULTISTART] WARNING: failed to parse EST_RANGES token '", tok, "': ", err)
+                            end
+                        end
+                    end
+                end
+            end
+            LB = Dict{Symbol,Float64}(); UB = Dict{Symbol,Float64}()
+            for s in est_syms
+                local lo = haskey(range_lo, s) ? range_lo[s] : (s == :mu0 ? 0.5 : 0.1)
+                local hi = haskey(range_hi, s) ? range_hi[s] : (s == :mu0 ? 2.0 : 10.0)
+                LB[s] = log(max(1e-12, lo * Pnom[s]))
+                UB[s] = log(max(1e-12, hi * Pnom[s]))
+            end
+            # Early-stop tunables (improved defaults unless user overrides via ENV):
+            # Si el usuario NO define MULTISTART_EARLY_REL usamos 5e-3 (más exigente que 1e-3) para abortar antes.
+            # Si el usuario NO define MULTISTART_MAX_NOIMPROVE usamos 1 (un solo intento sin mejora suficiente).
+            early_rel = try
+                let v = get(ENV, "MULTISTART_EARLY_REL", "")
+                    isempty(v) ? 5e-3 : parse(Float64, v)
+                end
+            catch; 5e-3 end
+            max_noimprove = try
+                let v = get(ENV, "MULTISTART_MAX_NOIMPROVE", "")
+                    isempty(v) ? 1 : parse(Int, v)
+                end
+            catch; 1 end
+            println("[MULTISTART] early_rel=", early_rel, " max_noimprove=", max_noimprove, " (override con MULTISTART_EARLY_REL / MULTISTART_MAX_NOIMPROVE)")
+            # Storage (include checkpoint path + real-space starts)
+            records = Vector{NamedTuple{(:start_id,:SSE,:OBJ,:wall_s,:starts_log,:starts_real,:checkpoint)}}()
+            best_SSE = Inf
+            no_improve = 0
+            t_run0 = Dates.now()
+            for k in 1:K
+                # Early stop condition
+                if no_improve >= max_noimprove
+                    println("[MULTISTART] Early stop: ", max_noimprove, " intentos consecutivos sin mejora relativa >", early_rel, " en SSE.")
+                    break
+                end
+                # Sample uniform log-space
+                starts_log = Dict{Symbol,Float64}()
+                for s in est_syms
+                    starts_log[s] = LB[s] + rand()*(UB[s]-LB[s])
+                end
+                ENV["EST_STARTS"] = join(string.(starts_log[s] for s in est_syms), ",")
+                println("[MULTISTART] start_id=", k, " overrides EST_STARTS=", ENV["EST_STARTS"])
+                # Also populate per-parameter real-space overrides (optional; used by TETA_START_ logic)
+                for s in est_syms
+                    ENV["TETA_START_" * String(s)] = string(exp(starts_log[s]))
+                end
+                # Run base mode once with overrides
+                t0 = Dates.now()
+                ARGS[1] = base_mode
+                main()  # calls underlying seed180_cf etc.
+                t1 = Dates.now()
+                wall_s = convert(Int, Dates.value(t1 - t0) ÷ 1000)
+                # Parse latest estimation report for SSE & OBJ
+                rep = latest("zenteno_estimation_report_")
+                SSE = OBJ = NaN
+                if rep !== nothing
+                    for ln in eachline(rep)
+                        if startswith(ln, "SSE=")
+                            SSE = try parse(Float64, split(ln, "=")[2]) catch; NaN end
+                        elseif startswith(ln, "OBJ=")
+                            OBJ = try parse(Float64, split(ln, "=")[2]) catch; NaN end
+                        end
+                    end
+                else
+                    println("[MULTISTART] WARNING: no estimation report found; SSE/OBJ NaN")
+                end
+                # Capture checkpoint produced by base mode and snapshot it uniquely
+                ck_candidates = ["zenteno_seed_checkpoint.jld2", "zenteno_handoff_full_checkpoint.jld2"]
+                ck_found = ""
+                for ckname in ck_candidates
+                    ckpath = joinpath(RESULTS_DIR, ckname)
+                    if isfile(ckpath)
+                        ck_found = ckpath
+                        break
+                    end
+                end
+                unique_ck = ""
+                if ck_found != ""
+                    unique_ck = joinpath(RESULTS_DIR, @sprintf("multistart_checkpoint_%03d.jld2", k))
+                    try
+                        cp(ck_found, unique_ck; force=true)
+                        println("[MULTISTART] Snapshot checkpoint -> ", unique_ck)
+                    catch err
+                        println("[MULTISTART] WARNING: failed to copy checkpoint: ", err)
+                        unique_ck = ""
+                    end
+                else
+                    println("[MULTISTART] No checkpoint file detected for attempt ", k)
+                end
+                push!(records, (
+                    start_id=k,
+                    SSE=SSE,
+                    OBJ=OBJ,
+                    wall_s=wall_s,
+                    starts_log=join(string.(starts_log[s] for s in est_syms), ","),
+                    starts_real=join(string.(exp(starts_log[s]) for s in est_syms), ","),
+                    checkpoint=unique_ck
+                ))
+                if isfinite(SSE)
+                    if SSE < best_SSE * (1 - early_rel)
+                        best_SSE = SSE
+                        no_improve = 0
+                    else
+                        no_improve += 1
+                    end
+                else
+                    no_improve += 1
+                end
+            end
+            # Write summary CSV
+            if !isempty(records)
+                summ_path = joinpath(RESULTS_DIR, "zenteno_multistart_summary_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".csv")
+                open(summ_path, "w") do io
+                    println(io, "start_id,SSE,OBJ,wall_s,starts_log,starts_real,checkpoint")
+                    for r in records
+                        @printf(io, "%d,%.6e,%.6e,%d,%s,%s,%s\n", r.start_id, r.SSE, r.OBJ, r.wall_s, r.starts_log, r.starts_real, r.checkpoint)
+                    end
+                end
+                println("[MULTISTART] Saved summary ", summ_path)
+                # Select best by SSE then OBJ fallback
+                sorted = sort(records; lt=(a,b)->begin
+                    as = isfinite(a.SSE) ? a.SSE : Inf
+                    bs = isfinite(b.SSE) ? b.SSE : Inf
+                    as == bs ? (isfinite(a.OBJ) ? a.OBJ : Inf) < (isfinite(b.OBJ) ? b.OBJ : Inf) : as < bs
+                end)
+                best = first(sorted)
+                best_path = joinpath(RESULTS_DIR, "zenteno_multistart_best_starts.txt")
+                open(best_path, "w") do io
+                    println(io, "# Best multi-start (by SSE then OBJ)")
+                    println(io, @sprintf("SSE=%.6e OBJ=%.6e wall_s=%d", best.SSE, best.OBJ, best.wall_s))
+                    println(io, "EST_PARAMS=", est_syms)
+                    println(io, "EST_STARTS(log)=", best.starts_log)
+                    println(io, "EST_STARTS(real)=", best.starts_real)
+                    println(io, "# Reutilizar (log): export EST_STARTS=", best.starts_log)
+                    println(io, "# Reutilizar (real -> convertir a log si se requiere): ", best.starts_real)
+                    if !isempty(best.checkpoint)
+                        println(io, "BEST_CHECKPOINT=", best.checkpoint)
+                    end
+                end
+                println("[MULTISTART] Best start recorded at ", best_path)
+                if !isempty(best.checkpoint) && isfile(best.checkpoint)
+                    out_ck = joinpath(RESULTS_DIR, "zenteno_multistart_best_checkpoint.jld2")
+                    try
+                        cp(best.checkpoint, out_ck; force=true)
+                        println("[MULTISTART] Copied best checkpoint -> ", out_ck)
+                    catch err
+                        println("[MULTISTART] WARNING: failed to copy best checkpoint: ", err)
+                    end
+                else
+                    println("[MULTISTART] No checkpoint associated with best start; nothing to copy.")
+                end
+            else
+                println("[MULTISTART] No records; nothing saved.")
+            end
     else
         error("Unknown mode $(mode). Use one of: baseline, seed, seed_run, compare")
     end
