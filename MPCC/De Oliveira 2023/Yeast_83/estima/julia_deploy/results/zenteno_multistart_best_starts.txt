@@ -1,0 +1,6 @@
+# Best multi-start (by SSE then OBJ)
+SSE=2.323354e+05 OBJ=2.323644e+05 wall_s=525
+EST_PARAMS=[:mu0]
+EST_STARTS=-2.109608011585423
+# To reuse this start: set ENV EST_STARTS=-2.109608011585423
+BEST_CHECKPOINT=C:\Users\ctorrealba\OneDrive - Viña Concha y Toro S.A\Documentos\Proyectos I+D\PI-4497\Resultados\2025\SB_Calibration_2025\MPCC\De Oliveira 2023\Yeast_83\estima\julia_deploy\results\multistart_checkpoint_002.jld2

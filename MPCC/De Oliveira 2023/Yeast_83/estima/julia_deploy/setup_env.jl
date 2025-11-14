@@ -2,7 +2,7 @@ using Pkg
 Pkg.activate(".")
 # Ensure required packages for MPCC_Zenteno estimation workflow and synthetic data generation.
 core_packages = [
-	"JuMP", "Ipopt", "FileIO", "JLD2", "DifferentialEquations", "Plots", "XLSX", "Distributions", "Glob"
+	"JuMP", "Ipopt", "FileIO", "JLD2", "DifferentialEquations", "Plots", "XLSX", "Distributions", "Glob", "CSV"
 ]
 # LP solvers for pFBA/FVA
 lp_packages = ["HiGHS", "GLPK"]

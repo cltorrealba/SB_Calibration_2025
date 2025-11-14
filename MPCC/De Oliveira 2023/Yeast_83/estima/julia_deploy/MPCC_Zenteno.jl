@@ -315,6 +315,41 @@ if get(ENV, "FROZEN_BOUNDS", "0") == "1"
     println("[CFG] FROZEN_BOUNDS active: rel_width=$(relw), centers=" * join(["$(k)=$(get(ENV, "P_FROZEN_" * String(k), string(Pnom[k])))" for k in EST_SET], ", "))
 end
 
+# -------------------------------------------------
+# Helper: parameter name to index (duplicated early to allow multi-start override before later definition)
+# -------------------------------------------------
+if !isdefined(Main, :Pidx)  # define only if not already in Main (avoid redefinition warnings on include reloads)
+    function Pidx(sym)
+        for (i, s) in enumerate(Pnames)
+            s == sym && return i
+        end
+        error("Parameter $sym not found")
+    end
+end
+
+# -------------------------------------------------
+# Deferred multi-start overrides (parsed only). Applied later once variables exist.
+# -------------------------------------------------
+const MULTISTART_OVERRIDES = let raw = get(ENV, "EST_STARTS", "")
+    if isempty(raw)
+        Dict{Symbol,Float64}()
+    else
+        parts = filter(!isempty, split(raw, [',',';',' ']))
+        if length(parts) == length(EST_SET)
+            d = Dict{Symbol,Float64}()
+            for (i,sym) in enumerate(EST_SET)
+                vlog = try parse(Float64, parts[i]) catch; NaN end
+                isfinite(vlog) && (d[sym] = vlog)
+            end
+            println("[MULTISTART] Registered EST_STARTS overrides for ", EST_SET)
+            d
+        else
+            println("[MULTISTART] EST_STARTS length (", length(parts), ") does not match |EST_SET|=", length(EST_SET), "; ignoring override")
+            Dict{Symbol,Float64}()
+        end
+    end
+end
+
 # Load data for FO (nc x ph x ncp)
 data = load_data_default(nc, nfe, ncp)
 
@@ -764,9 +799,24 @@ end
 # Parameter starts (log-space). For estimables, perturb away from nominal within bounds.
 for (i,k) in enumerate(Pnames)
     if k in EST_SET
-        # deterministic offset: 1.5x, clipped to [LB, UB]
-        vstart = log(clamp(Pnom[k] * 1.5, exp(LB[i]), exp(UB[i])))
-        set_start_value(teta[i], vstart)
+        # First: multi-start override (already log-space) if present
+        if haskey(MULTISTART_OVERRIDES, k)
+            vlog = MULTISTART_OVERRIDES[k]
+            vlog_clipped = min(max(vlog, LB[i]), UB[i])
+            set_start_value(teta[i], vlog_clipped)
+            continue
+        end
+        # External real-space override via TETA_START_<param>
+        env_key = "TETA_START_" * String(k)
+        if haskey(ENV, env_key)
+            val_real = try parse(Float64, ENV[env_key]) catch; exp(T0[i]) end
+            val_real = clamp(val_real, exp(LB[i]), exp(UB[i]))
+            set_start_value(teta[i], log(val_real))
+        else
+            # Deterministic offset 1.5x
+            vstart = log(clamp(Pnom[k] * 1.5, exp(LB[i]), exp(UB[i])))
+            set_start_value(teta[i], vstart)
+        end
     else
         set_start_value(teta[i], T0[i])
     end
@@ -1798,18 +1848,64 @@ end
         Plots.scatter!(plt_post[4], t_nodes, E_fe, label="MPCC E", color=:purple, m=:star5)
         Plots.ylabel!(plt_post[4], "E"); Plots.xlabel!(plt_post[4], "time")
         post_path = joinpath(RESULTS_DIR, "zenteno_post_ode_vs_data_mpcc_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".png")
-        # R² diagnostics post (ODE opt vs data)
+        # R² diagnostics post
         if !isempty(t_syn)
             _r2(y_obs, y_pred) = (length(y_obs) <= 1 ? NaN : (1 - sum((y_obs .- y_pred).^2) / sum((y_obs .- mean(y_obs)).^2)))
-            predX = [sol_post(t)[1] for t in t_syn]
-            predG = [sol_post(t)[3] for t in t_syn]
-            predF = [sol_post(t)[4] for t in t_syn]
-            predE = [sol_post(t)[5] for t in t_syn]
-            r2X = _r2(Y_syn[1,:], predX); r2G = _r2(Y_syn[3,:], predG); r2F = _r2(Y_syn[4,:], predF); r2E = _r2(Y_syn[5,:], predE)
-            Plots.title!(plt_post[1], @sprintf("X (R²=%.3f)", r2X))
-            Plots.title!(plt_post[2], @sprintf("G (R²=%.3f)", r2G))
-            Plots.title!(plt_post[3], @sprintf("F (R²=%.3f)", r2F))
-            Plots.title!(plt_post[4], @sprintf("E (R²=%.3f)", r2E))
+            # ODE vs DATA
+            predX_ode = [sol_post(t)[1] for t in t_syn]
+            predG_ode = [sol_post(t)[3] for t in t_syn]
+            predF_ode = [sol_post(t)[4] for t in t_syn]
+            predE_ode = [sol_post(t)[5] for t in t_syn]
+            r2X_ode = _r2(Y_syn[1,:], predX_ode); r2G_ode = _r2(Y_syn[3,:], predG_ode); r2F_ode = _r2(Y_syn[4,:], predF_ode); r2E_ode = _r2(Y_syn[5,:], predE_ode)
+            # MPCC vs DATA con interpolación lineal entre nodos más cercanos
+            # helper simple: interpola serie definida en t_nodes al tiempo ts
+            _interp(ts, tn::Vector{<:Real}, y::Vector{<:Real}) = begin
+                if length(tn) == 0
+                    return NaN
+                elseif ts <= tn[1]
+                    return y[1]
+                elseif ts >= tn[end]
+                    return y[end]
+                else
+                    # buscar j tal que tn[j] <= ts <= tn[j+1]
+                    local j = 1
+                    for jj in 1:length(tn)-1
+                        if tn[jj] <= ts <= tn[jj+1]
+                            j = jj; break
+                        end
+                    end
+                    local t0 = tn[j]; local t1 = tn[j+1]
+                    local y0 = y[j];  local y1 = y[j+1]
+                    local w = (ts - t0) / max(1e-12, (t1 - t0))
+                    return (1-w)*y0 + w*y1
+                end
+            end
+            predX_mpcc = [_interp(ts, t_nodes, X_fe) for ts in t_syn]
+            predG_mpcc = [_interp(ts, t_nodes, G_fe) for ts in t_syn]
+            predF_mpcc = [_interp(ts, t_nodes, F_fe) for ts in t_syn]
+            predE_mpcc = [_interp(ts, t_nodes, E_fe) for ts in t_syn]
+            r2X_mpcc = _r2(Y_syn[1,:], predX_mpcc); r2G_mpcc = _r2(Y_syn[3,:], predG_mpcc); r2F_mpcc = _r2(Y_syn[4,:], predF_mpcc); r2E_mpcc = _r2(Y_syn[5,:], predE_mpcc)
+            Plots.title!(plt_post[1], @sprintf("X (R²_ODE=%.3f, R²_MPCC=%.3f)", r2X_ode, r2X_mpcc))
+            Plots.title!(plt_post[2], @sprintf("G (R²_ODE=%.3f, R²_MPCC=%.3f)", r2G_ode, r2G_mpcc))
+            Plots.title!(plt_post[3], @sprintf("F (R²_ODE=%.3f, R²_MPCC=%.3f)", r2F_ode, r2F_mpcc))
+            Plots.title!(plt_post[4], @sprintf("E (R²_ODE=%.3f, R²_MPCC=%.3f)", r2E_ode, r2E_mpcc))
+            # Anexar R² al último reporte de estimación
+            try
+                # buscar el último archivo de reporte
+                local files = [joinpath(RESULTS_DIR, f) for f in readdir(RESULTS_DIR) if occursin("zenteno_estimation_report_", f) && endswith(f, ".txt")]
+                if !isempty(files)
+                    sort!(files)
+                    local rfile = files[end]
+                    open(rfile, "a") do io
+                        println(io, @sprintf("R2_ODE_X=%.6f", r2X_ode)); println(io, @sprintf("R2_MPCC_X=%.6f", r2X_mpcc))
+                        println(io, @sprintf("R2_ODE_G=%.6f", r2G_ode)); println(io, @sprintf("R2_MPCC_G=%.6f", r2G_mpcc))
+                        println(io, @sprintf("R2_ODE_F=%.6f", r2F_ode)); println(io, @sprintf("R2_MPCC_F=%.6f", r2F_mpcc))
+                        println(io, @sprintf("R2_ODE_E=%.6f", r2E_ode)); println(io, @sprintf("R2_MPCC_E=%.6f", r2E_mpcc))
+                    end
+                end
+            catch err
+                @warn "Failed to append R² to estimation report" err
+            end
         end
         Plots.png(plt_post, post_path)
         println("[PLOT] Saved post-optimization ODE plot ", post_path)
