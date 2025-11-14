@@ -1917,3 +1917,92 @@ end
     end
 
 ## (Removed standalone ODE vs MPCC plot; now integrated into the post-optimization plot.)
+
+# ---------------------------------------------
+# Module 7 — Active set report per FE (default ON, disable with ACTIVE_REPORT=0)
+# Generates CSV with per-FE active sets at bounds, switches vs previous FE,
+# and uptake diagnostics for glucose/fructose (v, tight flag, slack, FO_upt).
+# ---------------------------------------------
+try
+    ACTIVE_REPORT = get(ENV, "ACTIVE_REPORT", "1") == "1"
+    if ACTIVE_REPORT
+        # Determine reaction axes to inspect (respect reduced mode)
+        base_set = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
+        # FE-end times for context
+        t_nodes_rep = cumsum([try value(hv[i]) catch; hm[i] end for i in 1:nfe])
+        # Tolerances
+        tol_bnd = 1e-7
+        tol_upt = 1e-8
+        # Helpers
+        _val(x) = try value(x) catch; NaN end
+        # CSV path
+        rep_csv = joinpath(RESULTS_DIR, "zenteno_active_report_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".csv")
+        open(rep_csv, "w") do io
+            println(io, "fe,t_end,n_act_lb,n_act_ub,act_lb_idx,act_ub_idx,switches_lb,switches_ub,lb_added,lb_removed,ub_added,ub_removed,v_glu,v_fru,upt_tight_glu,upt_tight_fru,slack_glu,slack_fru,FO_upt_glu,FO_upt_fru")
+            prev_lb = Set{Int}(); prev_ub = Set{Int}()
+            for i in 1:nfe
+                # Active at lower/upper bound
+                act_lb = Int[]; act_ub = Int[]
+                for k in base_set
+                    lbk = lb[k]; ubk = ub[k]
+                    if !isfinite(lbk) && !isfinite(ubk)
+                        continue
+                    end
+                    vk = _val(v[k,i])
+                    if isfinite(lbk) && isfinite(vk) && abs(vk - lbk) <= tol_bnd
+                        push!(act_lb, k)
+                    end
+                    if isfinite(ubk) && isfinite(vk) && abs(vk - ubk) <= tol_bnd
+                        push!(act_ub, k)
+                    end
+                end
+                sort!(act_lb); sort!(act_ub)
+                # Switch counts vs previous
+                cur_lb = Set(act_lb); cur_ub = Set(act_ub)
+                lb_added = length(setdiff(cur_lb, prev_lb)); lb_removed = length(setdiff(prev_lb, cur_lb))
+                ub_added = length(setdiff(cur_ub, prev_ub)); ub_removed = length(setdiff(prev_ub, cur_ub))
+                switches_lb = lb_added + lb_removed
+                switches_ub = ub_added + ub_removed
+                prev_lb = cur_lb; prev_ub = cur_ub
+                # Uptake diagnostics
+                vglu = (glu in base_set) ? _val(v[glu,i]) : NaN
+                vfru = (fru in base_set) ? _val(v[fru,i]) : NaN
+                rGi = try value(rG[i]) catch; NaN end
+                rFi = try value(rF[i]) catch; NaN end
+                slack_g = (isfinite(vglu) && isfinite(rGi)) ? (-vglu - rGi) : NaN
+                slack_f = (isfinite(vfru) && isfinite(rFi)) ? (-vfru - rFi) : NaN
+                tight_g = (isfinite(slack_g) && abs(slack_g) <= tol_upt) ? 1 : 0
+                tight_f = (isfinite(slack_f) && abs(slack_f) <= tol_upt) ? 1 : 0
+                fou_g = try value(FO_upt[1,i]) catch; NaN end
+                fou_f = try value(FO_upt[2,i]) catch; NaN end
+                # Serialize index lists as pipe-separated to keep CSV simple
+                act_lb_str = isempty(act_lb) ? "[]" : join(string.(act_lb), "|")
+                act_ub_str = isempty(act_ub) ? "[]" : join(string.(act_ub), "|")
+                @printf(io, "%d,%.9f,%d,%d,\"%s\",\"%s\",%d,%d,%d,%d,%d,%d,%.9e,%.9e,%d,%d,%.9e,%.9e,%.9e,%.9e\n",
+                    i, t_nodes_rep[i], length(act_lb), length(act_ub), act_lb_str, act_ub_str,
+                    switches_lb, switches_ub, lb_added, lb_removed, ub_added, ub_removed,
+                    vglu, vfru, tight_g, tight_f, slack_g, slack_f, fou_g, fou_f)
+            end
+        end
+        # Quick console summary
+        try
+            # Re-read to compute totals quickly (avoid storing all rows)
+            total_sw_lb = 0; total_sw_ub = 0
+            for (lnum, ln) in enumerate(eachline(rep_csv))
+                if lnum == 1; continue; end
+                parts = split(ln, ',')
+                switches_lb = try parse(Int, parts[7]) catch; 0 end
+                switches_ub = try parse(Int, parts[8]) catch; 0 end
+                total_sw_lb += switches_lb
+                total_sw_ub += switches_ub
+            end
+            println("[ACTIVE] Active-set report saved: ", rep_csv, " | total_switches_lb=", total_sw_lb, ", total_switches_ub=", total_sw_ub)
+        catch
+            println("[ACTIVE] Active-set report saved: ", rep_csv)
+        end
+    else
+        println("[ACTIVE] Skipping active-set report (ACTIVE_REPORT=0)")
+    end
+catch err
+    @warn "Active-set report generation failed" err
+end
