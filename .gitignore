@@ -40,4 +40,4 @@ Calibration_data_preprocess_bdd.py
 metadata_2024_2025.csv
 
 # Experiment ablation results (long filenames)
-/MPCC/De Oliveira 2023/Yeast_83/estima/julia_deploy/results/ablation_*/
+/MPCC/De Oliveira 2023/Yeast_83/estima/julia_deploy/results/
