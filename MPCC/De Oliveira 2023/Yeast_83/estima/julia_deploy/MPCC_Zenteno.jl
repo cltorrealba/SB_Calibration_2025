@@ -50,7 +50,10 @@ const BASELINE_WRITE = get(ENV, "BASELINE_WRITE", "1") == "1"
 # ---------------------------------------------
 const BASE_DIR = @__DIR__
 const ESTIMA_DIR = normpath(joinpath(BASE_DIR, ".."))
-const RESULTS_DIR = joinpath(BASE_DIR, "results")
+# Allow routing outputs into a subfolder via ENV["EXPERIMENT"], e.g., EXPERIMENT=experimento_mu0
+const RESULTS_DIR_BASE = joinpath(BASE_DIR, "results")
+const EXPERIMENT_NAME = get(ENV, "EXPERIMENT", "")
+const RESULTS_DIR = isempty(EXPERIMENT_NAME) ? RESULTS_DIR_BASE : joinpath(RESULTS_DIR_BASE, EXPERIMENT_NAME)
 isdir(RESULTS_DIR) || mkpath(RESULTS_DIR)
 
 # Synthetic data integration (will be used for future SSE objective)
@@ -407,15 +410,102 @@ end
 # ---------------------------------------------
 m = Model(Ipopt.Optimizer)
 
-# Ipopt options
+# -------------------------------------------------
+# Ipopt base options (Module 8 will micro-tune if SOLVER_TUNE=1)
+# -------------------------------------------------
+SOLVER_TUNE = get(ENV, "SOLVER_TUNE", "0") == "1"
 set_optimizer_attribute(m, "warm_start_init_point", "yes")
 set_optimizer_attribute(m, "print_level", 5)
 set_optimizer_attribute(m, "tol", 1e-4)
 set_optimizer_attribute(m, "acceptable_iter", 5)
 set_optimizer_attribute(m, "acceptable_tol", 1e-2)
-set_optimizer_attribute(m, "linear_solver", "mumps")
+# Linear solver: default to MUMPS, but allow override via ENV["IPOPT_LINEAR_SOLVER"]
+let ls = lowercase(get(ENV, "IPOPT_LINEAR_SOLVER", "mumps"))
+    # Valid options depend on how Ipopt was built. Common values:
+    # "mumps" (bundled), "ma27"/"ma57"/"ma86"/"ma97" (HSL, licensed),
+    # "pardiso" (Intel MKL Pardiso or Pardiso Project), "wsmp" (IBM, licensed).
+    # If an unavailable solver is requested, Ipopt will error at runtime.
+    set_optimizer_attribute(m, "linear_solver", ls)
+    println("[CFG] Ipopt linear_solver=", ls)
+    if ls == "pardiso"
+        println("[CFG] Detected pardiso linear solver → applying Pardiso-specific defaults & ENV overrides")
+        # Helper applies safe defaults first, then overwrites with ENV-provided overrides.
+        function _configure_pardiso!(m::JuMP.Model)
+            # --- Safe baseline defaults ---
+            # msglvl: 0 silent, 1 summary, >1 verbose; keep silent for large runs
+            try set_optimizer_attribute(m, "pardiso_msglvl", 0) catch err; println("[WARN] Could not set pardiso_msglvl default: ", err) end
+            # matching_strategy: use enumeration string; 'complete+2x2' improves robustness on ill-conditioned Jacobians
+            try set_optimizer_attribute(m, "pardiso_matching_strategy", "complete+2x2") catch err; println("[WARN] Could not set pardiso_matching_strategy default: ", err) end
+            # order: use enumeration string; 'metis' usually good tradeoff; allow override
+            try set_optimizer_attribute(m, "pardiso_order", "metis") catch err; println("[WARN] Could not set pardiso_order default: ", err) end
+            # Potential additional safe toggles (commented until validated):
+            # set_optimizer_attribute(m, "pardiso_redo_symbolic", 0)
+            # set_optimizer_attribute(m, "pardiso_skip_inertia_test", 0)
+
+            # --- ENV overrides mapping ---
+            mapping = Dict(
+                "PARDISO_MSG_LVL" => "pardiso_msglvl",
+                "PARDISO_MATCHING" => "pardiso_matching_strategy",
+                "PARDISO_ORDER" => "pardiso_order",
+                "PARDISO_REDOSYM" => "pardiso_redo_symbolic",
+                "PARDISO_ITERATIVE" => "pardiso_iterative",
+                "PARDISO_SKIP_INERTIA" => "pardiso_skip_inertia_test",
+                "PARDISO_SCALING" => "pardiso_scaling"
+            )
+            for (envk, ipoptk) in mapping
+                if haskey(ENV, envk)
+                    raw = ENV[envk]
+                    parsed = begin
+                        try
+                            parse(Int, raw)
+                        catch
+                            try
+                                parse(Float64, raw)
+                            catch
+                                raw  # keep as String (Ipopt will parse enumerations)
+                            end
+                        end
+                    end
+                    # Special case: matching strategy expects enumeration string, accept numeric shortcuts
+                    if ipoptk == "pardiso_matching_strategy" && parsed isa Int
+                        parsed = parsed == 1 ? "complete" : parsed == 2 ? "complete+2x2" : parsed == 3 ? "constraints" : string(parsed)
+                    elseif ipoptk == "pardiso_order" && parsed isa Int
+                        # Map simple numeric codes to known orderings
+                        parsed = parsed == 1 ? "amd" : parsed == 2 ? "metis" : parsed == 3 ? "pmetis" : string(parsed)
+                    end
+                    try
+                        set_optimizer_attribute(m, ipoptk, parsed)
+                        println("[CFG] Ipopt ", ipoptk, "=", parsed)
+                    catch err
+                        println("[WARN] Failed to set ", ipoptk, " from ENV ", envk, ": ", err)
+                    end
+                end
+            end
+        end
+        _configure_pardiso!(m)
+    end
+end
 set_optimizer_attribute(m, "mu_strategy", "adaptive")
 set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based")
+
+if SOLVER_TUNE
+    println("[TUNE] SOLVER_TUNE=1 → applying conservative micro-tuning options")
+    # Earlier acceptable termination to avoid excessive iterations while keeping feasibility focus
+    set_optimizer_attribute(m, "acceptable_tol", 5e-2)
+    set_optimizer_attribute(m, "acceptable_constr_viol_tol", 5e-2)
+    set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e2)
+    set_optimizer_attribute(m, "acceptable_compl_inf_tol", 5e-2)
+    set_optimizer_attribute(m, "acceptable_obj_change_tol", 1e-4)
+    # Limit iterations softly (wall time still primary limiter in homotopy stages)
+    set_optimizer_attribute(m, "max_iter", 500)
+    # Slightly larger bound push to avoid getting stuck on tight bounds; smaller warm-start pushes
+    set_optimizer_attribute(m, "bound_push", 1e-2)
+    set_optimizer_attribute(m, "bound_frac", 0.5)
+    set_optimizer_attribute(m, "warm_start_bound_push", 1e-6)
+    set_optimizer_attribute(m, "warm_start_mult_bound_push", 1e-6)
+    # Use LOQO oracle occasionally helpful for large MPCC-like structures
+    set_optimizer_attribute(m, "mu_oracle", "loqo")
+end
 # Optional MUMPS memory percent override to mitigate out-of-memory or oversubscription
 if haskey(ENV, "IPOPT_MUMPS_MEM_PERCENT")
     mumps_mem = try parse(Int, ENV["IPOPT_MUMPS_MEM_PERCENT"]) catch; 100 end
@@ -1569,9 +1659,12 @@ if HOMOTOPY
         catch
             # bv_scale_param not defined (BV_OFF)
         end
-        # Adjust Ipopt wall clock for this stage
-        set_optimizer_attribute(m, "max_wall_time", per_stage_wall)
-        optimize!(m)
+    # Adjust Ipopt wall clock for this stage
+    set_optimizer_attribute(m, "max_wall_time", per_stage_wall)
+    # Measure wall time for this stage
+    local _t0 = time()
+    optimize!(m)
+    local wall_s_stage = time() - _t0
         status = termination_status(m)
         pr_status = primal_status(m)
         println("[HOM] Solver status stage $(idx): ", status, ", primal: ", pr_status)
@@ -1609,6 +1702,45 @@ if HOMOTOPY
             end
         catch
         end
+        # Primal violation proxy: max bound violation on v and uptake slack violation
+        viol_pr = 0.0
+        try
+            # Choose reaction index set respecting reduced mode
+            if !REDUCED_MODE || reduced_sets === nothing
+                for i in 1:nfe, k in 1:nv
+                    local vk = try value(v[k,i]) catch; NaN end
+                    local lbk = lb[k]; local ubk = ub[k]
+                    if isfinite(vk)
+                        if isfinite(lbk); viol_pr = max(viol_pr, max(0.0, lbk - vk)); end
+                        if isfinite(ubk); viol_pr = max(viol_pr, max(0.0, vk - ubk)); end
+                    end
+                end
+            else
+                for i in 1:nfe, k in K_AX
+                    local vk = try value(v[k,i]) catch; NaN end
+                    local lbk = lb[k]; local ubk = ub[k]
+                    if isfinite(vk)
+                        if isfinite(lbk); viol_pr = max(viol_pr, max(0.0, lbk - vk)); end
+                        if isfinite(ubk); viol_pr = max(viol_pr, max(0.0, vk - ubk)); end
+                    end
+                end
+            end
+            # Uptake inequality residuals: slack = (-v - r) <= 0 → violation if slack > 0
+            for i in 1:nfe
+                local vglu = try value(FO_upt[1,i]); catch; NaN end # placeholder ensure array exists
+                # Use v[...] directly for uptake indices when available
+                local vv_glu = try value(v[glu,i]) catch; NaN end
+                local vv_fru = try value(v[fru,i]) catch; NaN end
+                local rGi = try value(rG[i]) catch; NaN end
+                local rFi = try value(rF[i]) catch; NaN end
+                local slack_g = (isfinite(vv_glu) && isfinite(rGi)) ? (-vv_glu - rGi) : NaN
+                local slack_f = (isfinite(vv_fru) && isfinite(rFi)) ? (-vv_fru - rFi) : NaN
+                if isfinite(slack_g); viol_pr = max(viol_pr, max(0.0, slack_g)); end
+                if isfinite(slack_f); viol_pr = max(viol_pr, max(0.0, slack_f)); end
+            end
+        catch
+        end
+
         # Save metrics file per stage
         metrics_path = joinpath(RESULTS_DIR, "zenteno_metrics_" * tag_i * "_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
         open(metrics_path, "w") do io
@@ -1617,8 +1749,10 @@ if HOMOTOPY
             println(io, "status=", status)
             println(io, "primal_status=", pr_status)
             try println(io, "objective=", objective_value(m)) catch end
+            println(io, @sprintf("wall_s=%.3f", wall_s_stage))
             println(io, @sprintf("comp_max=%.6e", comp_max))
             println(io, @sprintf("stationarity_residual=%.6e", stat_res))
+            println(io, @sprintf("viol_primal=%.6e", viol_pr))
             # Include existing SSE/PEN/REG metrics for comparison
             sse_val = try value(SSE) catch; NaN end
             pen_val = try value(PEN) catch; NaN end
@@ -1681,6 +1815,47 @@ else
     pr_status = primal_status(m)
     println("[INFO] Solver status: ", status, ", primal: ", pr_status)
     try println("[INFO] Penalty objective: ", objective_value(m)) catch end
+    # Export warm-start checkpoint also for single-stage runs when requested
+    if HANDOFF_FULL
+        try
+            Vk = zeros(nv, nfe)
+            AL = zeros(nv, nfe)
+            AU = zeros(nv, nfe)
+            LM = zeros(nm, nfe)
+            if !REDUCED_MODE || reduced_sets === nothing
+                for i2 in 1:nfe, k2 in 1:nv
+                    Vk[k2,i2] = try value(v[k2,i2]) catch; 0.0 end
+                    AL[k2,i2] = try value(alpha_L[k2,i2]) catch; 0.0 end
+                    AU[k2,i2] = try value(alpha_U[k2,i2]) catch; 0.0 end
+                end
+                for i2 in 1:nfe, r2 in 1:nm
+                    LM[r2,i2] = try value(lambda_[r2,i2]) catch; 0.0 end
+                end
+            else
+                for i2 in 1:nfe
+                    for k2 in K_AX
+                        Vk[k2,i2] = try value(v[k2,i2]) catch; 0.0 end
+                        AL[k2,i2] = try value(alpha_L[k2,i2]) catch; 0.0 end
+                        AU[k2,i2] = try value(alpha_U[k2,i2]) catch; 0.0 end
+                    end
+                    for r2 in M_AX
+                        LM[r2,i2] = try value(lambda_[r2,i2]) catch; 0.0 end
+                    end
+                end
+            end
+            Ck = Array{Float64}(undef, nc, nfe, ncp)
+            for l2 in 1:nc, i2 in 1:nfe, j2 in 1:ncp
+                Ck[l2,i2,j2] = try value(c[l2,i2,j2]) catch; c0[l2] end
+            end
+            HVk = [try value(hv[i2]) catch; hm[i2] end for i2 in 1:nfe]
+            TETAk = [try value(teta[p]) catch; T0[p] end for p in 1:np]
+            JLD2.jldsave(CHECKPOINT_PATH; teta=TETAk, hv=HVk, c=Ck, v=Vk, alpha_L=AL, alpha_U=AU, lambda_=LM,
+                          meta=Dict("stage"=>0, "phi"=>NaN, "w"=>NaN, "timestamp"=>string(Dates.now())))
+            println("[HANDOFF] Saved full-model warm start checkpoint ", CHECKPOINT_PATH)
+        catch err
+            @warn "Failed to export handoff checkpoint (single-stage)" err
+        end
+    end
     try
         summary_path = joinpath(RESULTS_DIR, "zenteno_relax_summary_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
         open(summary_path, "w") do io
@@ -1742,6 +1917,76 @@ try
     println("[REPORT] Saved ", rep_path)
 catch err
     @warn "Failed to save estimation report" err
+end
+
+# -------------------------------------------------
+# Module 8: Scaling diagnostics (opt-in via SOLVER_TUNE)
+# Reports normalized magnitudes/residual proxies without altering model equations
+# -------------------------------------------------
+if SOLVER_TUNE
+    try
+        diag_path = joinpath(RESULTS_DIR, "zenteno_scaling_diagnostics_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+        # Typical magnitudes (user-specified heuristics)
+        typ_X = 1.0      # states
+        typ_N = 0.2      # nitrogen-related (if distinguishable)
+        typ_GF = 100.0   # fluxes (G/F)
+        typ_E = 10.0     # enzyme / stationarity scale
+        # Helper to safely value
+        _sv(x) = try value(x) catch; NaN end
+        # Aggregate statistics
+        # States c
+        c_vals = Float64[]
+        for l in 1:nc, i in 1:nfe, j in 1:ncp
+            push!(c_vals, _sv(c[l,i,j]))
+        end
+        mean_abs_c = mean(abs.(c_vals))
+        # Fluxes v (may be reduced)
+        v_vals = Float64[]
+        if !REDUCED_MODE || reduced_sets === nothing
+            for k in 1:nv, i in 1:nfe
+                push!(v_vals, _sv(v[k,i]))
+            end
+        else
+            for k in K_AX, i in 1:nfe
+                push!(v_vals, _sv(v[k,i]))
+            end
+        end
+        mean_abs_v = mean(abs.(v_vals))
+        # Complementarity proxy already computed earlier per stage; recompute max FO magnitude overall
+        fo_vals = Float64[]
+        if !REDUCED_MODE || reduced_sets === nothing
+            for k in 1:nv, i in 1:nfe
+                push!(fo_vals, abs(_sv(FO_L[k,i])));
+                push!(fo_vals, abs(_sv(FO_U[k,i])))
+            end
+        else
+            for k in K_AX, i in 1:nfe
+                push!(fo_vals, abs(_sv(FO_L[k,i])));
+                push!(fo_vals, abs(_sv(FO_U[k,i])))
+            end
+        end
+        max_fo = isempty(fo_vals) ? NaN : maximum(fo_vals)
+        # Stationarity residual approximation: reuse stat_res if defined else NaN
+        stat_res_try = try stat_res catch; NaN end
+        # Normalizations
+        norm_mean_abs_c_X = mean_abs_c / typ_X
+        norm_mean_abs_v_GF = mean_abs_v / typ_GF
+        norm_stat_E = stat_res_try / typ_E
+        norm_comp_GF = max_fo / typ_GF
+        open(diag_path, "w") do io
+            println(io, "SOLVER_TUNE=1")
+            println(io, "typ_X=", typ_X, ", typ_N=", typ_N, ", typ_GF=", typ_GF, ", typ_E=", typ_E)
+            println(io, @sprintf("mean_abs_c=%.6e norm_mean_abs_c_X=%.6e", mean_abs_c, norm_mean_abs_c_X))
+            println(io, @sprintf("mean_abs_v=%.6e norm_mean_abs_v_GF=%.6e", mean_abs_v, norm_mean_abs_v_GF))
+            println(io, @sprintf("max_FO=%.6e norm_comp_GF=%.6e", max_fo, norm_comp_GF))
+            println(io, @sprintf("stationarity_residual=%.6e norm_stat_E=%.6e", stat_res_try, norm_stat_E))
+            println(io)
+            println(io, "Notes: N-specific diagnostics not isolated; adjust typ_N or extend grouping if metadata available.")
+        end
+        println("[TUNE] Scaling diagnostics saved: ", diag_path)
+    catch err
+        @warn "SOLVER_TUNE scaling diagnostics failed" err
+    end
 end
 
     # ---------------------------------------------

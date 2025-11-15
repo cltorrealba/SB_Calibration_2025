@@ -38,3 +38,77 @@ Notas
 
 - Scripts legacy permanecen en `legacy/` como referencia.
 - La CLI construye on-the-fly matrices 24xxx si aparecen en el split y puede cachearlas en `mats/` (desactivar con `--no-cache-2024`).
+
+## Julia MPCC (Ipopt) – Experimentos
+
+Ubicación: `MPCC/De Oliveira 2023/Yeast_83/estima/julia_deploy`
+
+- Ejecutable: `experiment_pipeline.jl`
+- Modos soportados: `baseline`, `seed`, `seed_run`, `seed180`, `seed180_bv`, `seed180_cf`, `seed_reduced`, `seed_frozen`, `seed_run_frozen`, `bv_trial`, `compare`, `init_only`.
+
+### Solver por defecto y Pardiso (opt‑in)
+
+- Por defecto: `linear_solver=mumps` para no consumir licencias de Pardiso.
+- Para habilitar Pardiso por corrida, exporta:
+
+```powershell
+$env:IPOPT_LINEAR_SOLVER="pardiso"
+# Recomendado (Pardiso Panua):
+$env:PARDISO_NUM_THREADS="2"
+$env:PARDISO_MATCHING="complete+2x2"
+$env:PARDISO_ORDER="metis"
+$env:PARDISO_MSG_LVL="0"
+# Rutas (si usas Ipopt/Pardiso de Panua):
+$env:PANUA_IPOPT_DIR="C:\ruta\panua-ipopt-20240228-win"
+$env:IPOPT_PARDISO_DLL_DIR="C:\ruta\panua-pardiso-20240630-win\lib"
+$env:PANUA_LIC_PATH="C:\ruta\panua-licenses"
+```
+
+Notas:
+- El pipeline silencia el banner de licencia con `PARDISOLICMESSAGE=1` y fija `OMP_NUM_THREADS`/`MKL_NUM_THREADS` si `PARDISO_NUM_THREADS` está definido.
+- Si `IPOPT_LINEAR_SOLVER` no está seteado, se usa MUMPS.
+
+### Comandos típicos (PowerShell)
+
+1) Baseline 360s (sin homotopía, MUMPS por defecto):
+
+```powershell
+Set-Location -Path "...\MPCC\De Oliveira 2023\Yeast_83\estima\julia_deploy"
+$env:EXPERIMENT="mi_experimento"
+$env:ACTIVE_REPORT="1"; $env:SKIP_PLOTS="1"; $env:WALL_TIME="360"; $env:NFE="12"
+julia --project=. .\experiment_pipeline.jl baseline
+```
+
+2) Inicialización (init_only) 360s para generar warm‑start (opcionalmente con Pardiso):
+
+```powershell
+# (opcional) activar Pardiso por esta corrida
+$env:IPOPT_LINEAR_SOLVER="pardiso"; $env:PARDISO_NUM_THREADS="2"; $env:PARDISO_MATCHING="complete+2x2"; $env:PARDISO_ORDER="metis"; $env:PARDISO_MSG_LVL="0"
+$env:INIT_FROM_ODE="1"; $env:INIT_DUAL_FE="1"; $env:BV_ON="0"
+julia --project=. .\experiment_pipeline.jl init_only
+```
+
+Salidas clave en `results/<EXPERIMENT>/`:
+- `zenteno_handoff_full_checkpoint.jld2` (warm‑start completo)
+- `zenteno_seed_checkpoint.jld2` (copia del anterior para consumo de `seed_run`)
+- `zenteno_estimation_report_*.txt`, `zenteno_metrics_init_only_*.txt`
+
+3) Corrida seeded 360s desde el checkpoint:
+
+```powershell
+julia --project=. .\experiment_pipeline.jl seed_run
+```
+
+### Cuándo conviene usar la semilla (warm‑start)
+
+- Mismo modelo/estructura y `nfe`: reduce penalizaciones y complementarias, acelera y estabiliza la convergencia.
+- Multistart: mejor tasa de éxito por intento; combina con variación de inicios de parámetros.
+- Coarse→Fine: soportado por `seed180_cf` (mapeo de malla integrado).
+- Cambios fuertes (estructura, BV, datos muy distintos): considera regenerar la semilla.
+- Aislar solver vs init: puedes correr MUMPS con `INIT_FROM_CHECKPOINT=1` y el mismo `CHECKPOINT_PATH`.
+
+### Recomendaciones Pardiso (si se usa)
+
+- `PARDISO_NUM_THREADS=2` suele ser estable y con buen rendimiento.
+- `pardiso_matching_strategy=complete+2x2`, `pardiso_order=metis`, `pardiso_msglvl=0`.
+- Mantén Ipopt primero en `PATH`; añade la carpeta de DLL de Pardiso al final.

@@ -1,3 +1,0 @@
-status=TIME_LIMIT
-primal_status=NEARLY_FEASIBLE_POINT
-objective=284299.9885255841

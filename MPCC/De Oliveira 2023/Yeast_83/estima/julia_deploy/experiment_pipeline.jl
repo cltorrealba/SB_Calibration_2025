@@ -13,8 +13,95 @@ using FileIO
 using Glob
 
 const BASE_DIR = @__DIR__
-const RESULTS_DIR = joinpath(BASE_DIR, "results")
+# Honor EXPERIMENT env to route outputs into results/<experiment>
+const RESULTS_DIR_BASE = joinpath(BASE_DIR, "results")
+const EXPERIMENT_NAME = get(ENV, "EXPERIMENT", "")
+const RESULTS_DIR = isempty(EXPERIMENT_NAME) ? RESULTS_DIR_BASE : joinpath(RESULTS_DIR_BASE, EXPERIMENT_NAME)
 isdir(RESULTS_DIR) || mkpath(RESULTS_DIR)
+
+# Optionally redirect Ipopt to a custom library (e.g., Pardiso-enabled Ipopt)
+function maybe_configure_custom_ipopt()
+    # Accept either a direct DLL directory or a root folder containing a lib/ subdir
+    root = get(ENV, "IPOPT_DLL_DIR", get(ENV, "PANUA_IPOPT_DIR", get(ENV, "PANUA_IPOPT_ROOT", "")))
+    isempty(root) && return
+    # Try as provided
+    cand1 = joinpath(root, "libipopt.dll")
+    # Try typical layout root/lib/libipopt.dll
+    cand2 = joinpath(root, "lib", "libipopt.dll")
+    dll_dir = ""
+    libpath = ""
+    if isfile(cand1)
+        dll_dir = root; libpath = cand1
+    elseif isfile(cand2)
+        dll_dir = joinpath(root, "lib"); libpath = cand2
+    else
+        println("[IPOPT] Warning: libipopt.dll not found under ", root)
+        return
+    end
+    # Point Ipopt.jl to the custom library and ensure dependent DLLs are discoverable
+    ENV["JULIA_IPOPT_LIBRARY_PATH"] = libpath
+    # Prepend Ipopt DLL directory to PATH for dependencies (e.g., libiomp5md.dll)
+    # Keep Ipopt's runtime first to avoid mismatched OpenMP DLLs being picked up before it.
+    ENV["PATH"] = dll_dir * ";" * get(ENV, "PATH", "")
+    # If user provided an explicit Pardiso DLL directory, prepend that too
+    pard_dir = get(ENV, "IPOPT_PARDISO_DLL_DIR", get(ENV, "PARDISO_DLL_DIR", ""))
+    if !isempty(pard_dir) && isdir(pard_dir)
+        # Append Pardiso dir after Ipopt dir to prioritize Ipopt's OpenMP first
+        ENV["PATH"] = get(ENV, "PATH", "") * ";" * pard_dir
+        println("[IPOPT] Added Pardiso DLL dir to PATH (append): ", pard_dir)
+    end
+    println("[IPOPT] Using custom Ipopt library: ", libpath)
+    # Silence verbose Pardiso license banner and repeated checks if supported by runtime
+    if isempty(strip(get(ENV, "PARDISOLICMESSAGE", "")))
+        # According to Panua docs, setting PARDISOLICMESSAGE=1 suppresses the banner
+        ENV["PARDISOLICMESSAGE"] = "1"
+    end
+    # If user didn't pick a linear solver, default to MUMPS to avoid consuming Pardiso licenses unintentionally
+    if isempty(get(ENV, "IPOPT_LINEAR_SOLVER", ""))
+        ENV["IPOPT_LINEAR_SOLVER"] = "mumps"
+        println("[IPOPT] Defaulting linear_solver=mumps (enable Pardiso with IPOPT_LINEAR_SOLVER=pardiso)")
+    end
+    # Preflight: if Pardiso is requested, ensure libpardiso.dll is discoverable; otherwise, fall back to MUMPS
+    let solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+        if solver == "pardiso"
+            # Common locations to probe
+            candidates = String[
+                joinpath(dll_dir, "libpardiso.dll"),
+                joinpath(root, "libpardiso.dll"),
+                joinpath(root, "lib", "libpardiso.dll")
+            ]
+            if !isempty(pard_dir)
+                push!(candidates, joinpath(pard_dir, "libpardiso.dll"))
+            end
+            has_pardiso = any(isfile, candidates)
+            if !has_pardiso
+                println("[IPOPT] Warning: Pardiso requested but libpardiso.dll was not found under ", root)
+                println("[IPOPT] Falling back to linear_solver=mumps. Place libpardiso.dll next to libipopt.dll or in PATH to enable Pardiso.")
+                ENV["IPOPT_LINEAR_SOLVER"] = "mumps"
+            end
+        end
+    end
+end
+
+# Optionally configure threading for Pardiso/MKL via a single knob
+function maybe_configure_threads()
+    local t = strip(get(ENV, "PARDISO_NUM_THREADS", ""))
+    isempty(t) && return
+    # Only set if user hasn't pinned them already
+    if isempty(strip(get(ENV, "OMP_NUM_THREADS", "")))
+        ENV["OMP_NUM_THREADS"] = t
+        println("[IPOPT] OMP_NUM_THREADS=", t)
+    end
+    if isempty(strip(get(ENV, "MKL_NUM_THREADS", "")))
+        ENV["MKL_NUM_THREADS"] = t
+        println("[IPOPT] MKL_NUM_THREADS=", t)
+    end
+    # Prevent MKL from changing threads dynamically
+    if isempty(strip(get(ENV, "MKL_DYNAMIC", "")))
+        ENV["MKL_DYNAMIC"] = "FALSE"
+        println("[IPOPT] MKL_DYNAMIC=FALSE")
+    end
+end
 
 function latest(pattern::String)
     files = filter(f -> occursin(pattern, basename(f)), glob("*.txt", RESULTS_DIR))
@@ -84,6 +171,9 @@ function run_cmd(env::Dict{String,String}; tag::String)
         ENV[k] = v
         println("[ENV] ", k, "=", v)
     end
+    # Configure custom Ipopt (if requested) and threading before loading MPCC_Zenteno (which imports Ipopt)
+    maybe_configure_custom_ipopt()
+    maybe_configure_threads()
     include("MPCC_Zenteno.jl")
     println("[RUN] Completed mode='", tag, "' @ ", Dates.now())
 end
@@ -211,6 +301,67 @@ function mode_seed_run()
         println(io, @sprintf("comp_sum=%.6e", NaN))
     end
     println("[SEED_RUN] Saved seeded metrics: ", metrics_path)
+end
+
+"""
+mode_init_only
+Solución simple (sin homotopía) por 360s para generar un checkpoint de inicialización.
+Permite controlar INIT_FROM_ODE/INIT_DUAL_FE vía ENV; siempre activa HANDOFF_FULL para guardar warm-start.
+Además, escribe un archivo de métricas similar a seed_run.
+"""
+function mode_init_only()
+    env = Dict(
+        "HOMOTOPY" => "0",
+        "INIT_FROM_CHECKPOINT" => "0",
+        # Permite override externo; por defecto inicia desde ODE con duales factibles
+        "INIT_FROM_ODE" => get(ENV, "INIT_FROM_ODE", "1"),
+        "INIT_DUAL_FE" => get(ENV, "INIT_DUAL_FE", "1"),
+        # Forzar guardado de warm-start al final
+        "HANDOFF_FULL" => "1",
+        "HANDOFF_STAGE" => get(ENV, "HANDOFF_STAGE", "3"),
+        "REDUCED_MODE" => "0",
+        "WALL_TIME" => "360",
+        # Permite ensayos con/sin BV, por defecto respeta ENV actual
+        "BV_ON" => get(ENV, "BV_ON", get(ENV, "INIT_BV_ON", "0")),
+        "BV_SCOPE" => get(ENV, "BV_SCOPE", get(ENV, "INIT_BV_SCOPE", "uptake")),
+    )
+    run_cmd(env; tag="init_only")
+    # Copiar y renombrar checkpoint a seed estándar
+    ck = joinpath(RESULTS_DIR, "zenteno_handoff_full_checkpoint.jld2")
+    if isfile(ck)
+        new_ck = joinpath(RESULTS_DIR, "zenteno_seed_checkpoint.jld2")
+        cp(ck, new_ck; force=true)
+        println("[INIT_ONLY] Copied checkpoint to ", new_ck)
+    else
+        println("[INIT_ONLY] Warning: checkpoint not found at ", ck)
+    end
+    # Escribir métricas derivadas del estimation_report
+    rep = latest("zenteno_estimation_report_")
+    if rep === nothing
+        println("[INIT_ONLY] No estimation report found; metrics skipped")
+        return
+    end
+    SSE = PEN = REG = OBJ = FO_L_max = FO_U_max = FO_upt_max = NaN
+    for ln in eachline(joinpath(RESULTS_DIR, basename(rep)))
+        if startswith(ln, "PEN="); PEN = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+        if startswith(ln, "REG="); REG = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+        if startswith(ln, "OBJ="); OBJ = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+        if startswith(ln, "FO_L_max="); FO_L_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+        if startswith(ln, "FO_U_max="); FO_U_max = try parse(Float64, split(ln, "=")[2]) catch; NaN end; end
+    end
+    comp_max = maximum([FO_L_max, FO_U_max, FO_upt_max])
+    metrics_path = joinpath(RESULTS_DIR, "zenteno_metrics_init_only_" * Dates.format(Dates.now(), "yyyymmdd-HHMMSS") * ".txt")
+    open(metrics_path, "w") do io
+        println(io, "tag=init_only")
+        println(io, @sprintf("SSE=%.6e", SSE))
+        println(io, @sprintf("PEN=%.6e", PEN))
+        println(io, @sprintf("REG=%.6e", REG))
+        println(io, @sprintf("OBJ=%.6e", OBJ))
+        println(io, @sprintf("comp_max=%.6e", comp_max))
+        println(io, @sprintf("stationarity_residual=%.6e", NaN))
+        println(io, @sprintf("comp_sum=%.6e", NaN))
+    end
+    println("[INIT_ONLY] Saved init-only metrics: ", metrics_path)
 end
 
 function mode_compare()
@@ -419,6 +570,8 @@ function main()
         # Use frozen bounds inside seeding (activate via ENV overrides)
         ENV["FROZEN_BOUNDS"] = "1"
         mode_seed()
+    elseif mode == "init_only"
+        mode_init_only()
     elseif mode == "seed_run"
         mode_seed_run()
     elseif mode == "seed_run_frozen"
@@ -674,7 +827,7 @@ function main()
                 println("[MULTISTART] No records; nothing saved.")
             end
     else
-        error("Unknown mode $(mode). Use one of: baseline, seed, seed_run, compare")
+        error("Unknown mode $(mode). Use one of: baseline, seed, seed_run, init_only, compare")
     end
 end
 

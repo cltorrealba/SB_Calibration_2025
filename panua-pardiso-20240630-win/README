@@ -1,0 +1,106 @@
+# COPYRIGHT (C) PANUA TECHNOLOGIES, 2023
+
+Panua PARDISO is the most recent parallel implementation of the 
+well-known sparse linear PARDISO software. It integrates recent advances
+on high-performance parallel linear solver technology. The package PARDISO 
+is a thread-safe, high-performance, robust, memory  efficient and easy to 
+use software for solving large sparse symmetric and unsymmetric linear 
+systems of equations on shared-memory,  distributed-memory multiprocessors 
+and GPUs.
+
+
+****** CONTENT ******
+
+This package includes the following directories:
+
+lib    : shared library containing the Panua Pardiso solver
+include: include files
+bin    : binaries (license verification)
+test   : test instances
+
+****** LICENSE ******
+
+In order to use Panua PARDISO you need to obtain a license key at 
+www.panua.ch and put it into a file called panua.lic.  This file may 
+contain more than one license key.  Put this file into your home 
+directory, or set the environment variable PANUA_LIC_PATH to the directory 
+that contains panua.lic.
+
+To verify that your license key is set up properly, run the 
+"check_license" binary in the bin directory of the distribution.  Make 
+sure that it reports that a valid Ipopt license could be found.
+
+In order to obtain a license, you need to generate a "fingerprint".  You 
+do this by running the "get_fingerprint" executable in the bin 
+subdirectory on the machine where you want to use Panua PARDISO.  For 
+single-user licenses, you need to be logged in as the user that will use 
+Panua PARDISO.  (Note that when you run your code on a computing cluster 
+that uses a scheduling system, your code will be run on different physical 
+machines that all have different fingerprints.)
+
+****** RUNNING TESTS ******
+
+To see if the software works on your system, run "make test" in the test 
+subdirectory of the distribution.  This compiles some simple C++, C, and 
+FORTRAN examples, and runs PARDISO in parallel for up  to 4 cores, and up 
+to 2 cores for academic trial licenses.
+
+By default, the GNU compilers are chosen.  But any other compiler that is 
+compatible with the GNU compilers (such as the Intel compilers) should 
+work as well.
+
+The Makefile might be a good start for writing your own Makefile to link 
+with PARDISO.  (Ignore the part that runs the test suite.)
+
+****** DOCUMENTATION ******
+
+You can refer to the corresponding  documentation on PANUA:
+
+  https://panua.ch/static/manual/manual.pdf
+
+Once additional features become available, further documentation will be 
+available on the Panua website.
+
+****** BINARY COMPATIBILITY ******
+
+If you already have your code integrated with PARDISO, via the shared 
+library option, you can simply replace your previous shared library with 
+the one contained in this package.
+
+****** UPDATES ******
+
+We release updated versions of the library from time to time.  Unless 
+there is a release of a new feature, you can obtain the most recent 
+version at www.panua.ch at any time.
+
+****** SUPPORT ******
+
+This software is provided as is and no warranty is granted.  We make every 
+attempt to provide software that links and runs properly, but we cannot 
+provide individualized support and we make no guarantees on the 
+performance of the algorithms.  You may report suspected bugs at 
+www.panua.ch and we will attempt to fix actual errors in a reasonable 
+response time.  Note, however, that improper use or call of the library is 
+the cause of the issue in most of the cases.
+
+****** BACKGROUND ******
+
+Panua PARDISO is based on the sparse direct method described in the paper
+
+@article{pardiso-8.0b,
+	author="Bollh{"o}fer, Matthias and Schenk, Olaf and Janalik, Radim and Hamm, Steve and Gullapalli, Kiran",
+	editor="Grama, Ananth and Sameh, Ahmed H.",
+	title="State-of-the-Art Sparse Direct Solvers",
+	bookTitle="Parallel Algorithms in Computational Science and Engineering",
+	year="2020",
+	publisher="Springer International Publishing",
+	address="Cham",
+	pages="3--33",
+	isbn="978-3-030-43736-7",
+	doi="10.1007/978-3-030-43736-7_1",
+	url="https://doi.org/10.1007/978-3-030-43736-7_1"
+}
+
+Thank you for using PARDISO! We provide the solver in the hope that it 
+may be useful to others, and we would very much like to hear about your 
+experience with it.
