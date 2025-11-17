@@ -56,10 +56,10 @@ function maybe_configure_custom_ipopt()
         # According to Panua docs, setting PARDISOLICMESSAGE=1 suppresses the banner
         ENV["PARDISOLICMESSAGE"] = "1"
     end
-    # If user didn't pick a linear solver, default to MUMPS to avoid consuming Pardiso licenses unintentionally
+    # If user didn't pick a linear solver, default to Pardiso in this mode
     if isempty(get(ENV, "IPOPT_LINEAR_SOLVER", ""))
-        ENV["IPOPT_LINEAR_SOLVER"] = "mumps"
-        println("[IPOPT] Defaulting linear_solver=mumps (enable Pardiso with IPOPT_LINEAR_SOLVER=pardiso)")
+        ENV["IPOPT_LINEAR_SOLVER"] = "pardiso"
+        println("[IPOPT] Defaulting linear_solver=pardiso (override with IPOPT_LINEAR_SOLVER)")
     end
     # Preflight: if Pardiso is requested, ensure libpardiso.dll is discoverable; otherwise, fall back to MUMPS
     let solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
@@ -264,14 +264,22 @@ function mode_seed_run()
     if !isfile(ck)
         error("Seed checkpoint missing: $(ck). Run 'seed' mode first.")
     end
+    wall = get(ENV, "SEED_RUN_WALL_TIME", "360")
+    # Allow optional single-stage homotopy with fixed phi/w via env overrides.
+    # By default, keep HOMOTOPY=0 (direct solve). To force fixed phi/w, export:
+    #   SEED_RUN_HOMOTOPY=1; SEED_RUN_HOM_PHI="<phi>"; SEED_RUN_HOM_W="<w>"
     env = Dict(
-        "HOMOTOPY" => "0",
+        "HOMOTOPY" => get(ENV, "SEED_RUN_HOMOTOPY", "0"),
         "INIT_FROM_CHECKPOINT" => "1",
         "CHECKPOINT_PATH" => ck,
         "INIT_FROM_ODE" => "0",
         "INIT_DUAL_FE" => "0",
         "REDUCED_MODE" => "0",
-        "WALL_TIME" => "360"
+        "WALL_TIME" => wall,
+        # If a caller sets HOMOTOPY=1 for seed_run, pass through single values
+        # for phi and w when provided. Lists of length 1 behave as a direct solve.
+        "HOM_PHI" => get(ENV, "SEED_RUN_HOM_PHI", get(ENV, "HOM_PHI", "")),
+        "HOM_W"   => get(ENV, "SEED_RUN_HOM_W",   get(ENV, "HOM_W",   ""))
     )
     run_cmd(env; tag="seed_run")
     # Derive seeded metrics similar to baseline
@@ -733,6 +741,10 @@ function main()
                             SSE = try parse(Float64, split(ln, "=")[2]) catch; NaN end
                         elseif startswith(ln, "OBJ=")
                             OBJ = try parse(Float64, split(ln, "=")[2]) catch; NaN end
+                        elseif startswith(ln, "OBJ_eff=")
+                            OBJ = try parse(Float64, split(ln, "=")[2]) catch; OBJ end
+                        elseif startswith(ln, "OBJ_comp=") && !isfinite(OBJ)
+                            OBJ = try parse(Float64, split(ln, "=")[2]) catch; OBJ end
                         end
                     end
                 else
