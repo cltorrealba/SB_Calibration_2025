@@ -165,13 +165,33 @@ try
         end
         @variable(model, lb[k] <= v[k=1:nv] <= ub[k])
         @constraint(model, [mc=1:nm], sum(S[mc,k]*v[k] for k in 1:nv) == 0)
+        abs_aux = nothing
+        if !opt_is_ipopt
+            # Aux variables to linearize |v| objective for LP-based parsimonious step
+            @variable(model, abs_aux_var[1:nv] >= 0)
+            @constraint(model, [k=1:nv], abs_aux_var[k] >= v[k])
+            @constraint(model, [k=1:nv], abs_aux_var[k] >= -v[k])
+            abs_aux = abs_aux_var
+        end
         # We'll enforce FE-specific uptakes by tightening variable bounds each iteration
-        @objective(model, Max, v[obj])
 
         for i in 1:nfe
             # Set per-FE exact bounds for uptake fluxes (lb=ub=value)
             JuMP.set_lower_bound(v[glu], -rG_fe[i]); JuMP.set_upper_bound(v[glu], -rG_fe[i])
             JuMP.set_lower_bound(v[fru], -rF_fe[i]); JuMP.set_upper_bound(v[fru], -rF_fe[i])
+            @objective(model, Max, v[obj])
+            optimize!(model)
+            obj_val = value(v[obj])
+            if !isfinite(obj_val)
+                error("Failed to compute biomass optimum at FE $i")
+            end
+            obj_link = @constraint(model, v[obj] >= (1.0 - 1e-6) * obj_val)
+            if opt_is_ipopt
+                @objective(model, Min, sum(v[k]^2 for k in 1:nv))
+            else
+                abs_vars = abs_aux === nothing ? error("Missing auxiliary variables for LP norm minimization") : abs_aux
+                @objective(model, Min, sum(abs_vars[k] for k in 1:nv))
+            end
             optimize!(model)
             vstar = [value(v[k]) for k in 1:nv]
             eps = try parse(Float64, get(ENV, "PFBA_EPS", "1e-7")) catch; 1e-7 end
@@ -242,6 +262,8 @@ try
             # Deduplicate and sort
             Ai = sort(unique(Ai)); Fi = sort(unique(Fi)); Ci = sort(unique(Ci))
             A[i] = Ai; F[i] = Fi; C[i] = Ci
+            JuMP.delete(model, obj_link)
+            @objective(model, Max, v[obj])
         end
     save(joinpath(RESULTS_DIR, "reduced_sets.jld2"), "A", A, "F", F, "C", C)
     println("[PFBA] Saved reduced sets to ", joinpath(RESULTS_DIR, "reduced_sets.jld2"))

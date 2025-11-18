@@ -1,14 +1,14 @@
 #=
     MPCC_Zenteno_v2 (relaxed)
     
-    Esta es una versión modificada de MPCC_Zenteno.jl para alinearla 
-    con la formulación numéricamente más simple de De Oliveira (main.jl).
+    Esta es una versiÃ³n modificada de MPCC_Zenteno.jl para alinearla 
+    con la formulaciÃ³n numÃ©ricamente mÃ¡s simple de De Oliveira (main.jl).
 
     Cambios Clave (V2):
-    1.  [Colocación] Tasas cinéticas (mu, beta, Kd) se calculan UNA VEZ por FE 
+    1.  [ColocaciÃ³n] Tasas cinÃ©ticas (mu, beta, Kd) se calculan UNA VEZ por FE 
         usando el estado final (nodo ncp) y se aplican a todos los puntos de 
-        colocación (j=1..ncp). Esto reduce la no-linealidad.
-    2.  [Ponderación] Los pesos del objetivo se invierten para priorizar el
+        colocaciÃ³n (j=1..ncp). Esto reduce la no-linealidad.
+    2.  [PonderaciÃ³n] Los pesos del objetivo se invierten para priorizar el
         ajuste de datos (SSE) sobre la complementariedad (PEN),
         replicando main.jl (W_SSE=100, W_PEN=1).
     3.  [Escalado] Se aplica escalado manual de flujos (vs) a todas las 
@@ -89,44 +89,54 @@
     ub = ub_raw isa AbstractVector ? copy(ub_raw) : copy(ub_raw[:,1])
 
     # ---------------------------------------------
-    # Cargar conjuntos de índices desde index_sets.jld2
+    # Cargar conjuntos de Ã­ndices desde index_sets.jld2
     # (generado por build_index_sets.jl)
     # ---------------------------------------------
-    const INDEX_SETS_PATH = joinpath(ESTIMA_DIR, "index_sets.jld2")
+    const INDEX_SETS_PATH = joinpath(BASE_DIR, "index_sets.jld2")
 
-    nad_met_idx      = Int[]
-    redox_rxn_idx    = Int[]
-    biomass_idx      = 0
-    maint_idx        = 0
-    nitrogen_rxn_idx = Int[]
-
-    if isfile(INDEX_SETS_PATH)
+    function _load_index_sets(path::String)
+        defaults = (
+            nad_met_idx = Int[],
+            redox_rxn_idx = Int[],
+            biomass_idx = 0,
+            maint_idx = 0,
+            nitrogen_rxn_idx = Int[],
+        )
+        if !isfile(path)
+            @warn "[INDEX] No se encontró index_sets.jld2; conjuntos redox/N quedan vacíos" path
+            return defaults
+        end
         try
-            d = JLD2.load(INDEX_SETS_PATH)
-            nad_met_idx      = get(d, "nad_met_idx",      nad_met_idx)
-            redox_rxn_idx    = get(d, "redox_rxn_idx",    redox_rxn_idx)
-            biomass_idx      = get(d, "biomass_idx",      biomass_idx)
-            maint_idx        = get(d, "maint_idx",        maint_idx)
-            nitrogen_rxn_idx = get(d, "nitrogen_rxn_idx", nitrogen_rxn_idx)
-
-            println("[INDEX] Cargado index_sets.jld2 desde: ", INDEX_SETS_PATH)
-            println("[INDEX] |nad_met_idx|      = ", length(nad_met_idx))
-            println("[INDEX] |redox_rxn_idx|    = ", length(redox_rxn_idx))
-            println("[INDEX] biomass_idx        = ", biomass_idx)
-            println("[INDEX] maint_idx          = ", maint_idx)
-            println("[INDEX] |nitrogen_rxn_idx| = ", length(nitrogen_rxn_idx))
-
-            if biomass_idx != 0 && biomass_idx != obj
-                @warn "[INDEX] biomass_idx != obj; revisa consistencia" biomass_idx obj
-            end
+            d = JLD2.load(path)
+            return (
+                nad_met_idx = get(d, "nad_met_idx", defaults.nad_met_idx),
+                redox_rxn_idx = get(d, "redox_rxn_idx", defaults.redox_rxn_idx),
+                biomass_idx = get(d, "biomass_idx", defaults.biomass_idx),
+                maint_idx = get(d, "maint_idx", defaults.maint_idx),
+                nitrogen_rxn_idx = get(d, "nitrogen_rxn_idx", defaults.nitrogen_rxn_idx),
+            )
         catch err
             @warn "[INDEX] Error cargando index_sets.jld2; se usarán conjuntos vacíos" err
+            return defaults
         end
-    else
-        @warn "[INDEX] No se encontró index_sets.jld2; conjuntos redox/N quedan vacíos" INDEX_SETS_PATH
     end
 
+    let loaded = _load_index_sets(INDEX_SETS_PATH)
+        global nad_met_idx      = loaded.nad_met_idx
+        global redox_rxn_idx    = loaded.redox_rxn_idx
+        global biomass_idx      = loaded.biomass_idx
+        global maint_idx        = loaded.maint_idx
+        global nitrogen_rxn_idx = loaded.nitrogen_rxn_idx
+    end
 
+    if !isempty(nad_met_idx) || !isempty(redox_rxn_idx) || !isempty(nitrogen_rxn_idx)
+        println("[INDEX] Cargado index_sets.jld2 desde: ", INDEX_SETS_PATH)
+        println("[INDEX] |nad_met_idx|      = ", length(nad_met_idx))
+        println("[INDEX] |redox_rxn_idx|    = ", length(redox_rxn_idx))
+        println("[INDEX] biomass_idx        = ", biomass_idx)
+        println("[INDEX] maint_idx          = ", maint_idx)
+        println("[INDEX] |nitrogen_rxn_idx| = ", length(nitrogen_rxn_idx))
+    end
     # Data loading function (unchanged)
     function load_data_default(nc::Int, ph::Int, ncp::Int)
         path = joinpath(BASE_DIR, "data.jld2")
@@ -167,6 +177,10 @@
     obj = 3414     # growth/objective reaction
     glu = 2588     # glucose uptake
     fru = 2583     # fructose uptake
+
+    if biomass_idx != 0 && biomass_idx != obj
+        @warn "[INDEX] biomass_idx != obj; revisa consistencia" biomass_idx obj
+    end
 
     # Special bounds adjustments (as in relaxed Python)
     o2 = 2816
@@ -356,10 +370,11 @@
         relw = tryparse(Float64, get(ENV, "FROZEN_REL_WIDTH", "0.05")); relw === nothing && (relw = 0.05)
         for k in EST_SET
             env_key = "P_FROZEN_" * String(k)
-            v = tryparse(Float64, get(ENV, env_key, string(Pnom[k]))); v === nothing && (v = Pnom[k])
+            val = tryparse(Float64, get(ENV, env_key, string(Pnom[k])))
+            val === nothing && (val = Pnom[k])
             i = findfirst(==(k), Pnames)
-            LB[i] = log(max(1e-12, (1 - relw) * v))
-            UB[i] = log(max(1e-12, (1 + relw) * v))
+            LB[i] = log(max(1e-12, (1 - relw) * val))
+            UB[i] = log(max(1e-12, (1 + relw) * val))
         end
         println("[CFG-V2] FROZEN_BOUNDS active: rel_width=$(relw)")
     end
@@ -404,7 +419,7 @@
     const W_PEN = 1.0   # Was 0.2
     const W_REG = 1e-8
 
-    # Pesos opcionales para regularización específica de redox y nitrógeno
+    # Pesos opcionales para regularizaciÃ³n especÃ­fica de redox y nitrÃ³geno
     const W_REDOX = try parse(Float64, get(ENV, "W_REDOX", "0.0")) catch; 0.0 end
     const W_NBAL  = try parse(Float64, get(ENV, "W_NBAL",  "0.0")) catch; 0.0 end
 
@@ -460,7 +475,7 @@
         set_optimizer_attribute(m, "linear_solver", ls)
         println("[CFG-V2] Ipopt linear_solver=", ls)
         if ls == "pardiso"
-            println("[CFG-V2] Detected pardiso linear solver → applying Pardiso-specific defaults & ENV overrides")
+            println("[CFG-V2] Detected pardiso linear solver â†’ applying Pardiso-specific defaults & ENV overrides")
             function _configure_pardiso!(m::JuMP.Model)
                 try set_optimizer_attribute(m, "pardiso_msglvl", 0) catch err; end
                 try set_optimizer_attribute(m, "pardiso_matching_strategy", "complete+2x2") catch err; end
@@ -496,7 +511,7 @@
     set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based") # Keep Ipopt's scaling, but our manual scaling helps
     if SOLVER_TUNE
         # (Tuning options unchanged)
-        println("[TUNE] SOLVER_TUNE=1 → applying conservative micro-tuning options")
+        println("[TUNE] SOLVER_TUNE=1 â†’ applying conservative micro-tuning options")
         set_optimizer_attribute(m, "acceptable_tol", 5e-2)
         set_optimizer_attribute(m, "acceptable_constr_viol_tol", 5e-2)
         set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e2)
@@ -717,8 +732,8 @@
     const EST_POS = [findfirst(==(k), Pnames) for k in EST_SET]
     @NLexpression(m, REG, sum( (teta[p] - T0[p])^2 for p in EST_POS ))
 
-    # --- Nuevos términos de regularización metabólica --------------------
-    # Si los conjuntos están vacíos, el término es 0.0 y no aporta nada.
+    # --- Nuevos tÃ©rminos de regularizaciÃ³n metabÃ³lica --------------------
+    # Si los conjuntos estÃ¡n vacÃ­os, el tÃ©rmino es 0.0 y no aporta nada.
     if isempty(redox_rxn_idx)
         @NLexpression(m, REDOX_BAL, 0.0)
     else
@@ -1203,8 +1218,9 @@
             local _t0 = time()
             optimize!(m)
             local wall_s_stage = time() - _t0
-            status = termination_status(m); pr_status = primal_status(m)
-            println("[HOM] Solver status stage $(idx): ", status, ", primal: ", pr_status)
+            local solver_status = termination_status(m)
+            local solver_pr_status = primal_status(m)
+            println("[HOM] Solver status stage $(idx): ", solver_status, ", primal: ", solver_pr_status)
 
             # (Metrics saving logic omitted for brevity - unchanged)
             
@@ -1220,9 +1236,9 @@
         end
     else
         optimize!(m)
-        status = termination_status(m)
-        pr_status = primal_status(m)
-        println("[INFO] Solver status: ", status, ", primal: ", pr_status)
+        local solver_status = termination_status(m)
+        local solver_pr_status = primal_status(m)
+        println("[INFO] Solver status: ", solver_status, ", primal: ", solver_pr_status)
         try println("[INFO] Penalty objective: ", objective_value(m)) catch end
         
         # (Single-stage handoff logic omitted for brevity - unchanged)
@@ -1393,7 +1409,7 @@
             predG_ode = [sol_post(t)[3] for t in t_syn]
             predF_ode = [sol_post(t)[4] for t in t_syn]
             predE_ode = [sol_post(t)[5] for t in t_syn]
-            r2X_ode = _r2(Y_syn[1,:], predX_ode); r2G_ode = _r2(Y_syn[3,:], predG_ode); r2F_ode = _r2(Plot_syn[4,:], predF_ode); r2E_ode = _r2(Y_syn[5,:], predE_ode)
+            r2X_ode = _r2(Y_syn[1,:], predX_ode); r2G_ode = _r2(Y_syn[3,:], predG_ode); r2F_ode = _r2(Y_syn[4,:], predF_ode); r2E_ode = _r2(Y_syn[5,:], predE_ode)
             _interp(ts, tn::Vector{<:Real}, y::Vector{<:Real}) = begin
                 if length(tn) == 0; return NaN; end
                 if ts <= tn[1]; return y[1]; end
@@ -1414,10 +1430,10 @@
             predE_mpcc = [_interp(ts, t_nodes, E_fe) for ts in t_syn]
             r2X_mpcc = _r2(Y_syn[1,:], predX_mpcc); r2G_mpcc = _r2(Y_syn[3,:], predG_mpcc);
             r2F_mpcc = _r2(Y_syn[4,:], predF_mpcc); r2E_mpcc = _r2(Y_syn[5,:], predE_mpcc)
-            Plots.title!(plt_post[1], @sprintf("X (R²_ODE=%.3f, R²_MPCC=%.3f)", r2X_ode, r2X_mpcc))
-            Plots.title!(plt_post[2], @sprintf("G (R²_ODE=%.3f, R²_MPCC=%.3f)", r2G_ode, r2G_mpcc))
-            Plots.title!(plt_post[3], @sprintf("F (R²_ODE=%.3f, R²_MPCC=%.3f)", r2F_ode, r2F_mpcc))
-            Plots.title!(plt_post[4], @sprintf("E (R²_ODE=%.3f, R²_MPCC=%.3f)", r2E_ode, r2E_mpcc))
+            Plots.title!(plt_post[1], @sprintf("X (RÂ²_ODE=%.3f, RÂ²_MPCC=%.3f)", r2X_ode, r2X_mpcc))
+            Plots.title!(plt_post[2], @sprintf("G (RÂ²_ODE=%.3f, RÂ²_MPCC=%.3f)", r2G_ode, r2G_mpcc))
+            Plots.title!(plt_post[3], @sprintf("F (RÂ²_ODE=%.3f, RÂ²_MPCC=%.3f)", r2F_ode, r2F_mpcc))
+            Plots.title!(plt_post[4], @sprintf("E (RÂ²_ODE=%.3f, RÂ²_MPCC=%.3f)", r2E_ode, r2E_mpcc))
         end
         
         Plots.png(plt_post, post_path)
