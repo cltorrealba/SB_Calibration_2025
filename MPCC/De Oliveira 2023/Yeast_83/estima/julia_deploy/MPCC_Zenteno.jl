@@ -99,17 +99,58 @@
     lb = lb_raw isa AbstractVector ? copy(lb_raw) : copy(lb_raw[:,1])
     ub = ub_raw isa AbstractVector ? copy(ub_raw) : copy(ub_raw[:,1])
 
-    # Optional data for FO (nc x ph x ncp); expected in data.jld2 as variable "data"
-    # If unavailable, we'll fall back to zeros of matching shape.
+    # Optional data for FO/SSE (nc x ph x ncp) cargado desde data.jld2.
+    # Si las dimensiones no coinciden con (nc, ph, ncp), re-muestreamos
+    # por vecino más cercano a la nueva malla de nfe/ncp.
     function load_data_default(nc::Int, ph::Int, ncp::Int)
         path = joinpath(BASE_DIR, "data.jld2")
-        if isfile(path)
-            d = FileIO.load(path, "data")
-            return d
-        else
+
+        # 1) Si no existe archivo, devolvemos ceros
+        if !isfile(path)
+            @warn "data.jld2 not found; using zeros(nc,ph,ncp) in SSE."
             return zeros(nc, ph, ncp)
         end
+
+        # 2) Cargar data original
+        d_raw = FileIO.load(path, "data")
+        sz = size(d_raw)
+
+        # Caso ideal: tamaño ya coincide
+        if sz == (nc, ph, ncp)
+            return d_raw
+        end
+
+        @warn "data.jld2 size = $(sz) != (nc=$(nc), ph=$(ph), ncp=$(ncp)); " *
+              "resampling via nearest-neighbor to match MPCC grid."
+
+        # 3) Re-muestreo simple por vecino más cercano en FE y puntos de colocación
+        data = zeros(nc, ph, ncp)
+        nc0  = sz[1]
+        ph0  = sz[2]
+        ncp0 = sz[3]
+
+        # mapeo FE_old -> FE_new
+        for l in 1:min(nc, nc0)
+            for i in 1:ph
+                # índice fuente en la malla original (1..ph0)
+                src_i = clamp(
+                    round(Int, (i-1) * (ph0-1) / max(ph-1, 1)) + 1,
+                    1, ph0
+                )
+                for j in 1:ncp
+                    # índice fuente en collocaciones (1..ncp0)
+                    src_j = clamp(
+                        round(Int, (j-1) * (ncp0-1) / max(ncp-1, 1)) + 1,
+                        1, ncp0
+                    )
+                    @inbounds data[l, i, j] = d_raw[l, src_i, src_j]
+                end
+            end
+        end
+
+        return data
     end
+
 
     # ---------------------------------------------
     # Problem sizes and key indices

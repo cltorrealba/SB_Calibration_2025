@@ -25,10 +25,50 @@ const RESULTS_DIR = abspath(joinpath(RESULTS_DIR_BASE, EXPERIMENT_NAME))
 isdir(RESULTS_DIR) || mkpath(RESULTS_DIR)
 
 # ============================================================================
+# Pardiso configuration (IPARM / MTYPE) – tuned for MPCC / KKT casi singular
+# ============================================================================
+
+function configure_pardiso_defaults()
+    # Solo tiene efecto si realmente estamos usando Pardiso
+    solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+    !(solver in ("pardiso", "pardisomkl")) && return
+
+    # Helper local: solo setea si el usuario no lo definió antes
+    set_default!(name::AbstractString, value::AbstractString) =
+        isempty(strip(get(ENV, name, ""))) && (ENV[name] = value)
+
+    # Tipo de matriz: real simétrica indefinida (KKT de MPCC)
+    # Ipopt ya usa MTYPE = -2 internamente, pero lo dejamos explícito por si
+    # el wrapper Panua lee esto.
+    set_default!("PARDISO_MTYPE", "-2")
+
+    # IPARM según índices del manual (0-based)
+    set_default!("PARDISO_IPARM_0",  "1")   # activar iparm manual
+    set_default!("PARDISO_IPARM_1",  "2")   # reordenamiento METIS automático
+    set_default!("PARDISO_IPARM_4",  "0")   # no precondensation
+    set_default!("PARDISO_IPARM_7",  "2")   # iter refinement (2 pasos)
+    set_default!("PARDISO_IPARM_9",  "13")  # pivot perturbation recommended
+    set_default!("PARDISO_IPARM_10", "1")   # scaling automático
+    set_default!("PARDISO_IPARM_12", "1")   # matching (super importante en MPCC)
+    set_default!("PARDISO_IPARM_18", "-1")  # pivot threshold automático
+    set_default!("PARDISO_IPARM_24", "1")   # precision check
+    set_default!("PARDISO_IPARM_26", "1")   # iterative refinement seguro
+    set_default!("PARDISO_IPARM_34", "1")   # low-rank updates (KKT estable)
+    set_default!("PARDISO_IPARM_59", "1")   # strong pivoting (KKT casi singular)
+
+    println("[IPOPT] Pardiso defaults set (MTYPE=-2, IPARM[0,1,4,7,9,10,12,18,24,26,34,59])")
+end
+
+# ============================================================================
 # Ipopt Configuration
 # ============================================================================
 
 function configure_custom_ipopt()
+    # --- NUEVO: permitir forzar la instalación por defecto ---
+    if get(ENV, "USE_DEFAULT_IPOPT", "0") == "1"
+        println("[IPOPT] USE_DEFAULT_IPOPT=1 → skipping custom Ipopt; using default Ipopt")
+        return
+    end
     # Helper: generate parent chain up to project root (Windows safe)
     function parent_chain(path::String; max_depth::Int=8)
         acc = String[]
@@ -155,6 +195,7 @@ function configure_custom_ipopt()
         ENV["IPOPT_LINEAR_SOLVER"] = "pardiso"
     end
     solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+
     # Verify pardiso availability if requested
     if solver == "pardiso"
         pard_candidates = String[
@@ -181,6 +222,9 @@ function configure_custom_ipopt()
     else
         println("[IPOPT] linear_solver=", solver)
     end
+
+    # Aplicar tuning por defecto de Pardiso (solo si sigue activo)
+    configure_pardiso_defaults()
 
     # Final debug summary
     println("[IPOPT] Using custom Ipopt library: ", cand_lib)
@@ -238,7 +282,7 @@ function run_mpcc(env::Dict{String,T}; tag::String) where {T<:AbstractString}
     configure_custom_ipopt()
     configure_threads()
     debug_print_ipopt_solver()
-    include("MPCC_Zenteno.jl")
+    include("MPCC_Zenteno_v2.jl")
     println("[RUN] Completed mode='", tag, "' @ ", Dates.now())
 end
 
@@ -353,7 +397,8 @@ function mode_seed()
         "HOM_PHI" => get(ENV, "HOM_PHI", "1e-2,1e-1,1"),
         "HOM_W" => get(ENV, "HOM_W", "1e-4,1e-5,1e-6"),
         "HOM_WEIGHTS" => get(ENV, "HOM_WEIGHTS", "1,1,2"),  # 450s, 450s, 900s
-        "WALL_TIME" => "1800",
+        "WALL_TIME" => "600",
+        "HV_ADAPTIVE" => "0",
         
         # Initialization
         "INIT_FROM_ODE" => "1",
@@ -740,13 +785,15 @@ function mode_baseline()
     println("="^80)
     
     env = Dict(
-        "HOMOTOPY" => "0",
+        "HOMOTOPY" => "1",
         "INIT_FROM_CHECKPOINT" => "0",
-        "INIT_FROM_ODE" => "0",
-        "INIT_DUAL_FE" => "0",
-        "REDUCED_MODE" => "0",
+        "INIT_FROM_ODE" => "1",
+        "INIT_DUAL_FE" => "1",
+        "REDUCED_MODE" => "0",   # <- cambia esto a 1
         "BV_ON" => "0",
-        "WALL_TIME" => "360"
+        "WALL_TIME" => "600",
+        "SKIP_PLOTS" => "0"
+        
     )
     
     run_mpcc(env; tag="baseline")
