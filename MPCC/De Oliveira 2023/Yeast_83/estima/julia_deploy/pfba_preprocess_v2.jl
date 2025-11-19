@@ -38,7 +38,7 @@ const fru = 2583
 # ----------------------------------------------------
 # 2) Tiempo + parámetros nominales Zenteno
 # ----------------------------------------------------
-th  = 240.0   # horizonte (h)
+th  = 48.0   # horizonte (h)
 nfe = 12      # nº FEs
 hm  = fill(th/nfe, nfe)
 

@@ -13,7 +13,9 @@ using Plots
 using Dates
 using Random
 using Printf
-const MOI = JuMP.MathOptInterface
+using MathOptInterface
+using JLD2
+const MOI = MathOptInterface
 
 # ---------------------------------------------
 # Paths e IO
@@ -23,12 +25,58 @@ const ESTIMA_DIR = BASE_DIR
 const PLOTS_DIR  = joinpath(ESTIMA_DIR, "plots")
 isdir(PLOTS_DIR) || mkpath(PLOTS_DIR)
 
+function _sanitize_experiment_name(str::AbstractString)
+    clean = strip(str)
+    isempty(clean) && return "default"
+    return replace(clean, r"[^0-9A-Za-z._-]+" => "_")
+end
+
+const EXPERIMENT_TOKEN = _sanitize_experiment_name(get(ENV, "EXPERIMENT", "default"))
+const EXPERIMENT_DIR = joinpath(PLOTS_DIR, EXPERIMENT_TOKEN)
+isdir(EXPERIMENT_DIR) || mkpath(EXPERIMENT_DIR)
+
 # Matriz estequiometrica y cotas de flujos
 S     = readdlm(joinpath(ESTIMA_DIR, "S.csv"), ',')
 lbraw = readdlm(joinpath(ESTIMA_DIR, "lb.csv"), ',')
 ubraw = readdlm(joinpath(ESTIMA_DIR, "ub.csv"), ',')
 lb    = lbraw isa AbstractVector ? copy(lbraw) : copy(lbraw[:,1])
 ub    = ubraw isa AbstractVector ? copy(ubraw) : copy(ubraw[:,1])
+
+const ETHYL_ACETATE_ROW = 2023
+const ETHYL_ACETATE_EX_RXN = begin
+    row = view(S, ETHYL_ACETATE_ROW, :)
+    nz = findall(!iszero, row)
+    if isempty(nz)
+        nothing
+    else
+        pos = findfirst(k -> row[k] < 0.0, nz)
+        nz[pos === nothing ? 1 : pos]
+    end
+end
+
+const MOLAR_MASS_ETHYL_ACETATE = 88.106 # g / mol
+
+const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
+const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
+
+function _load_reduced_sets(path::String)
+    if !isfile(path)
+        return nothing
+    end
+    try
+        return JLD2.jldopen(path, "r") do f
+            (read(f, "A"), read(f, "C"), read(f, "F"))
+        end
+    catch err
+        @warn "No se pudieron cargar reduced_sets" path err
+        return nothing
+    end
+end
+
+const reduced_sets = REDUCED_MODE ? _load_reduced_sets(REDUCED_SETS_PATH) : nothing
+if REDUCED_MODE && reduced_sets === nothing
+    @warn "REDUCED_MODE=1 sin reduced_sets.jld2; se usara el modelo completo" REDUCED_SETS_PATH
+end
 
 # ---------------------------------------------
 # Indices y tamanos del GEM
@@ -56,6 +104,7 @@ end
 # ---------------------------------------------
 const nc = 5 # X,N,G,F,E
 const NOISE_SEED = 1234
+const DEFAULT_LINEAR_SOLVER = "mumps"
 
 const MU0_nom   = 0.141665
 const YXN_nom   = 9.80576
@@ -97,7 +146,7 @@ c0 = copy(C0_INIT)
 # Discretizacion
 nfe = 12
 ncp = 3
-th  = 48.0
+th  = 120.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
@@ -118,6 +167,41 @@ const n_up = 2
 cs = ones(nc)
 vs = ones(nv)
 
+function _build_reduced_axes()
+    if !REDUCED_MODE || reduced_sets === nothing
+        return collect(1:nv), collect(1:nm)
+    end
+    A_sets, C_sets, _ = reduced_sets
+    K = Int[]
+    for i in 1:nfe
+        if i <= length(A_sets)
+            append!(K, A_sets[i])
+        end
+        if i <= length(C_sets)
+            append!(K, C_sets[i])
+        end
+    end
+    append!(K, (glu, fru))
+    K = unique(K)
+    sort!(K)
+    M = Int[]
+    for mc in 1:nm
+        for k in K
+            if S[mc, k] != 0.0
+                push!(M, mc)
+                break
+            end
+        end
+    end
+    M = unique(M)
+    sort!(M)
+    return K, M
+end
+
+const K_AX, M_AX = _build_reduced_axes()
+const FLUX_INDEX_SET = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
+const MET_INDEX_SET = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nm) : M_AX
+
 const MEAS_STATES = (3, 4, 5) # G, F, E
 const NOISE_REL_STD = 0.10
 
@@ -130,10 +214,165 @@ const radau_nodes = (0.15505, 0.64495, 1.0)
 Random.seed!(NOISE_SEED)
 
 # ---------------------------------------------
+# Configuracion Ipopt/Pardiso
+# ---------------------------------------------
+
+function configure_pardiso_defaults()
+    solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+    !(solver in ("pardiso", "pardisomkl")) && return
+    set_default!(name::AbstractString, value::AbstractString) =
+        isempty(strip(get(ENV, name, ""))) && (ENV[name] = value)
+
+    set_default!("PARDISO_MTYPE", "-2")
+    set_default!("PARDISO_IPARM_0", "1")
+    set_default!("PARDISO_IPARM_1", "2")
+    set_default!("PARDISO_IPARM_4", "0")
+    set_default!("PARDISO_IPARM_7", "2")
+    set_default!("PARDISO_IPARM_9", "13")
+    set_default!("PARDISO_IPARM_10", "1")
+    set_default!("PARDISO_IPARM_12", "1")
+    set_default!("PARDISO_IPARM_18", "-1")
+    set_default!("PARDISO_IPARM_24", "1")
+    set_default!("PARDISO_IPARM_26", "1")
+    set_default!("PARDISO_IPARM_34", "1")
+    set_default!("PARDISO_IPARM_59", "1")
+    println("[IPOPT] Pardiso defaults configured.")
+end
+
+function configure_custom_ipopt()
+    get(ENV, "USE_DEFAULT_IPOPT", "0") == "1" && return
+    function parent_chain(path::String; max_depth::Int=8)
+        acc = String[]
+        cur = abspath(path)
+        for _ in 1:max_depth
+            push!(acc, cur)
+            parent = dirname(cur)
+            parent == cur && break
+            cur = parent
+        end
+        return acc
+    end
+
+    root = get(ENV, "IPOPT_DLL_DIR", get(ENV, "PANUA_IPOPT_DIR", get(ENV, "PANUA_IPOPT_ROOT", "")))
+    if isempty(strip(root))
+        for p in parent_chain(BASE_DIR)
+            dirs = filter(d -> startswith(lowercase(basename(d)), "panua-ipopt"), readdir(p; join=true))
+            for d in dirs
+                if isfile(joinpath(d, "lib", "libipopt.dll")) || isfile(joinpath(d, "libipopt.dll"))
+                    root = d
+                    ENV["PANUA_IPOPT_ROOT"] = root
+                    println("[IPOPT] Auto-detected PANUA_IPOPT_ROOT=", root)
+                    break
+                end
+            end
+            !isempty(strip(root)) && break
+        end
+    end
+    if isempty(strip(root))
+        return
+    end
+
+    cand_lib = isfile(joinpath(root, "lib", "libipopt.dll")) ? joinpath(root, "lib", "libipopt.dll") : joinpath(root, "libipopt.dll")
+    isfile(cand_lib) || return
+    dll_dir = dirname(cand_lib)
+    ENV["JULIA_IPOPT_LIBRARY_PATH"] = cand_lib
+    ENV["PATH"] = dll_dir * ";" * get(ENV, "PATH", "")
+    ipopt_root_bin = joinpath(root, "bin")
+    if isdir(ipopt_root_bin)
+        ENV["PATH"] = ipopt_root_bin * ";" * ENV["PATH"]
+    end
+    if dll_dir != root
+        ENV["PATH"] = root * ";" * ENV["PATH"]
+    end
+
+    pard_dir = get(ENV, "IPOPT_PARDISO_DLL_DIR", get(ENV, "PARDISO_DLL_DIR", ""))
+    if isempty(strip(pard_dir))
+        for p in parent_chain(BASE_DIR)
+            dirs = filter(d -> startswith(lowercase(basename(d)), "panua-pardiso"), readdir(p; join=true))
+            for d in dirs
+                if isfile(joinpath(d, "lib", "libpardiso.dll")) || isfile(joinpath(d, "libpardiso.dll"))
+                    pard_dir = d
+                    ENV["PARDISO_DLL_DIR"] = pard_dir
+                    println("[IPOPT] Auto-detected PARDISO_DLL_DIR=", pard_dir)
+                    break
+                end
+            end
+            !isempty(strip(pard_dir)) && break
+        end
+    end
+    if !isempty(strip(pard_dir)) && isdir(pard_dir)
+        pard_lib_dir = isdir(joinpath(pard_dir, "lib")) ? joinpath(pard_dir, "lib") : pard_dir
+        if isfile(joinpath(pard_lib_dir, "libpardiso.dll"))
+            ENV["PATH"] = pard_lib_dir * ";" * get(ENV, "PATH", "")
+            pard_root_bin = joinpath(pard_dir, "bin")
+            if isdir(pard_root_bin)
+                ENV["PATH"] = pard_root_bin * ";" * ENV["PATH"]
+            end
+            if pard_lib_dir != pard_dir
+                ENV["PATH"] = pard_dir * ";" * ENV["PATH"]
+            end
+            if isempty(strip(get(ENV, "PARDISO_LIC_PATH", ""))) && isempty(strip(get(ENV, "PARDISO_LICENSE_FILE", "")))
+                lic_path = ""
+                lic_file = ""
+                candidates = String[]
+                push!(candidates, pard_dir)
+                for p in parent_chain(BASE_DIR)
+                    push!(candidates, p)
+                    push!(candidates, joinpath(p, "panua-licenses"))
+                end
+                for d in candidates
+                    f = joinpath(d, "panua.lic")
+                    if isfile(f)
+                        lic_path = d
+                        lic_file = f
+                        break
+                    end
+                end
+                if !isempty(lic_path)
+                    ENV["PARDISO_LIC_PATH"] = lic_path
+                    ENV["PARDISO_LICENSE_FILE"] = lic_file
+                    println("[IPOPT] Found panua.lic at ", lic_file)
+                else
+                    println("[IPOPT] WARNING: panua.lic not found.")
+                end
+            end
+        else
+            println("[IPOPT] Pardiso directory found but libpardiso.dll missing: ", pard_lib_dir)
+        end
+    end
+    if isempty(strip(get(ENV, "PARDISOLICMESSAGE", "")))
+        ENV["PARDISOLICMESSAGE"] = "1"
+    end
+    if isempty(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+        ENV["IPOPT_LINEAR_SOLVER"] = "pardiso"
+    end
+    configure_pardiso_defaults()
+    println("[IPOPT] Custom Ipopt library: ", cand_lib)
+end
+
+function maybe_enable_pardiso_from_env!()
+    flag = lowercase(strip(get(ENV, "MPCC_USE_PARDISO", "0")))
+    if flag in ("1", "true", "yes", "pardiso")
+        ENV["IPOPT_LINEAR_SOLVER"] = strip(get(ENV, "IPOPT_LINEAR_SOLVER", "pardiso"))
+    end
+end
+
+maybe_enable_pardiso_from_env!()
+configure_custom_ipopt()
+configure_pardiso_defaults()
+
+# ---------------------------------------------
 # Herramientas de simulacion/plot
 # ---------------------------------------------
 const STATE_LABELS = ("X", "N", "G", "F", "E")
 const STATE_COLORS = (:royalblue, :forestgreen, :firebrick, :darkorange, :purple)
+const STATE_MIN_CONC = (
+    1e-6,  # X: biomasa no debe anularse numéricamente
+    1e-5,  # N: nitrógeno puede agotarse pero mantenemos piso suave
+    1e-4,  # G: glucosa
+    1e-4,  # F: fructosa
+    1e-6,  # E: etanol
+)
 
 struct ZentenoPlotParams
     mu0::Float64
@@ -224,6 +463,149 @@ function plot_post_solution(t_pre, states_pre, t_post, states_post, tgrid_data, 
     println("[PLOT] Guardado ", save_path)
 end
 
+function _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
+    if mpcc_tgrid === nothing || mpcc_states === nothing
+        return nothing
+    end
+    rxn_idx = ETHYL_ACETATE_EX_RXN
+    if rxn_idx === nothing
+        @warn "No se encontro ninguna reaccion asociada a la fila $(ETHYL_ACETATE_ROW) de S"
+        return nothing
+    end
+    nfe = size(mpcc_states, 2)
+    flux_vals = Vector{Float64}(undef, nfe)
+    for i in 1:nfe
+        flux_var = try
+            v_var[rxn_idx, i]
+        catch err
+            @warn "El MPCC no contiene la reaccion de ethyl acetate en el conjunto de variables" rxn_idx err
+            return nothing
+        end
+        flux_val = safe_value(flux_var, NaN)
+        if !isfinite(flux_val)
+            @warn "El flujo de ethyl acetate no es finito" step=i flux=flux_val
+            return nothing
+        end
+        flux_vals[i] = flux_val
+    end
+    time_rate = _build_time_rate_arrays(mpcc_tgrid, mpcc_states, flux_vals)
+    time_rate === nothing && return nothing
+    times, rates = time_rate
+    isempty(times) && return nothing
+    concentrations = _cumulative_trapezoid(times, rates)
+    return (times=times, concentrations=concentrations)
+end
+
+function _build_time_rate_arrays(mpcc_tgrid, mpcc_states, flux_values)
+    nfe = size(mpcc_states, 2)
+    ncp = size(mpcc_states, 3)
+    if length(flux_values) != nfe || size(mpcc_tgrid, 1) != nfe || size(mpcc_tgrid, 2) != ncp
+        @warn "Dimensiones incompatibles al construir la serie de ethyl acetate" nfe ncp mpcc_size=size(mpcc_tgrid) flux_len=length(flux_values)
+        return nothing
+    end
+    npts = nfe * ncp
+    times = Vector{Float64}(undef, npts)
+    rates = Vector{Float64}(undef, npts)
+    idx = 1
+    for i in 1:nfe
+        flux = Float64(flux_values[i])
+        for j in 1:ncp
+            biomass = Float64(mpcc_states[1, i, j])
+            if !isfinite(biomass)
+                @warn "Concentracion de biomasa no definida al construir la serie de ethyl acetate" collocation=(i, j)
+                return nothing
+            end
+            times[idx] = mpcc_tgrid[i, j]
+            rates[idx] = flux * biomass
+            idx += 1
+        end
+    end
+    perm = sortperm(times)
+    return times[perm], rates[perm]
+end
+
+function _cumulative_trapezoid(times, values)
+    n = length(times)
+    concentrations = zeros(Float64, n)
+    for idx in 2:n
+        dt = max(Float64(times[idx] - times[idx - 1]), 0.0)
+        concentrations[idx] = concentrations[idx - 1] + 0.5 * (Float64(values[idx]) + Float64(values[idx - 1])) * dt
+    end
+    return concentrations
+end
+
+function _natural_cubic_coefficients(x::Vector{Float64}, y::Vector{Float64})
+    n = length(x)
+    @assert n == length(y)
+    h = diff(x)
+    alpha = zeros(Float64, n)
+    for i in 2:(n-1)
+        alpha[i] = (3.0 / h[i]) * (y[i+1] - y[i]) - (3.0 / h[i-1]) * (y[i] - y[i-1])
+    end
+    lvec = ones(Float64, n)
+    mu = zeros(Float64, n)
+    z = zeros(Float64, n)
+    for i in 2:(n-1)
+        lvec[i] = 2.0 * (x[i+1] - x[i-1]) - h[i-1] * mu[i-1]
+        mu[i] = h[i] / lvec[i]
+        z[i] = (alpha[i] - h[i-1] * z[i-1]) / lvec[i]
+    end
+    c = zeros(Float64, n)
+    b = zeros(Float64, n-1)
+    d = zeros(Float64, n-1)
+    a = copy(y[1:n-1])
+    for j in (n-1):-1:1
+        c[j] = z[j] - mu[j] * c[j+1]
+        b[j] = (y[j+1] - y[j]) / h[j] - (h[j] * (c[j+1] + 2.0 * c[j])) / 3.0
+        d[j] = (c[j+1] - c[j]) / (3.0 * h[j])
+    end
+    return (a=a, b=b, c=c, d=d, x=x)
+end
+
+function _evaluate_natural_cubic(coeffs, t::Float64)
+    idx = clamp(searchsortedlast(coeffs.x, t), 1, length(coeffs.a))
+    delta_t = t - coeffs.x[idx]
+    return coeffs.a[idx] + coeffs.b[idx] * delta_t + coeffs.c[idx] * delta_t^2 + coeffs.d[idx] * delta_t^3
+end
+
+function _sample_cubic_spline(times::Vector{Float64}, values::Vector{Float64}; nsamples::Int=400)
+    n = length(times)
+    if n < 2 || (times[end] - times[1]) <= 0
+        return copy(times), copy(values)
+    end
+    coeffs = _natural_cubic_coefficients(times, values)
+    ts = collect(range(times[1], times[end]; length=nsamples))
+    vals = Vector{Float64}(undef, length(ts))
+    for (idx, t) in enumerate(ts)
+        vals[idx] = _evaluate_natural_cubic(coeffs, t)
+    end
+    return ts, vals
+end
+
+function plot_ethyl_acetate_concentration(mpcc_tgrid, mpcc_states, v_var; title_str::AbstractString, save_path::AbstractString)
+    series = _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
+    if series === nothing
+        @warn "No se pudo construir la serie de concentracion de ethyl acetate"
+        return false
+    end
+    times = Float64.(series.times)
+    concentrations_mmol = Float64.(series.concentrations)
+    isempty(times) && return false
+    concentrations_g = concentrations_mmol .* (MOLAR_MASS_ETHYL_ACETATE / 1000.0)
+    line_t, line_vals = _sample_cubic_spline(times, concentrations_g)
+    plt = plot(size=(900, 400))
+    scatter!(plt, times, concentrations_g;
+        color=:darkorange, ms=5, alpha=0.9, label="Colocaciones MPCC")
+    plot!(plt, line_t, line_vals;
+        color=:navy, lw=2, label="Spline interpolado")
+    xlabel!(plt, "tiempo [h]")
+    ylabel!(plt, "concentración ethyl acetate [g/L]")
+    title!(plt, title_str)
+    savefig(plt, save_path)
+    println("[PLOT] Guardado ", save_path)
+    return true
+end
+
 sanitize_token(str::AbstractString) = replace(str, r"[^0-9A-Za-z]+" => "_")
 
 function short_token(str::AbstractString; maxlen::Int=10)
@@ -240,7 +622,7 @@ function result_file_prefix(; wall_time::Float64, nfe::Int, status, primal_statu
     feas_tok = "f$(short_token(string(primal_status); maxlen=6))"
     term_tok = "t$(short_token(string(status); maxlen=6))"
     stamp = Dates.format(Dates.now(), "yyyymmdd_HHmmss")
-    return joinpath(PLOTS_DIR, "MPCCpost_$(wall_tok)_nfe$(nfe)_$(feas_tok)_$(term_tok)_$(stamp)")
+    return joinpath(EXPERIMENT_DIR, "MPCCpost_$(wall_tok)_nfe$(nfe)_$(feas_tok)_$(term_tok)_$(stamp)")
 end
 
 function write_diagnostic_report(path_prefix::AbstractString; wall_time::Float64, status, primal_status,
@@ -278,9 +660,27 @@ end
 
 maxabs(arr::AbstractArray) = isempty(arr) ? 0.0 : maximum(abs, arr)
 
+function unwrap_ipopt_optimizer(model::Model)
+    opt = JuMP.backend(model)
+    while true
+        if opt isa MOI.Bridges.AbstractBridgeOptimizer
+            opt = opt.model
+            continue
+        elseif opt isa MOI.Utilities.CachingOptimizer
+            opt = opt.optimizer
+            opt === nothing && return nothing
+            continue
+        elseif typeof(opt) == Ipopt.Optimizer
+            return opt
+        else
+            return nothing
+        end
+    end
+end
+
 function collect_ipopt_stats(model::Model)
-    backend = JuMP.backend(model)
-    optimizer = getfield(backend, :optimizer)
+    optimizer = unwrap_ipopt_optimizer(model)
+    optimizer === nothing && return nothing
     inner = optimizer.inner
     inner isa Ipopt.IpoptProblem || return nothing
     nvar = inner.n
@@ -292,7 +692,7 @@ function collect_ipopt_stats(model::Model)
     grad_lag_x = zeros(Float64, nvar)
     constr_violation = zeros(Float64, ncon)
     compl_g = zeros(Float64, ncon)
-    try
+    success = try
         Ipopt.GetIpoptCurrentViolations(
             inner,
             false,
@@ -306,10 +706,11 @@ function collect_ipopt_stats(model::Model)
             constr_violation,
             compl_g,
         )
-    catch err
-        @warn "No se pudo obtener violaciones de Ipopt" err
-        return nothing
+        true
+    catch
+        false
     end
+    success || return nothing
     dual_inf = maxabs(grad_lag_x)
     primal_inf = max(maxabs(x_L_violation), maxabs(x_U_violation))
     constraint_violation = maxabs(constr_violation)
@@ -400,9 +801,9 @@ t_pre = nothing
 states_pre = nothing
 try
     pre_params = ZentenoPlotParams(exp(theta0[1]), exp(theta0[2]), exp(theta0[3]))
-    t_pre_sim, states_pre_sim = simulate_zenteno(pre_params)
-    t_pre = t_pre_sim
-    states_pre = states_pre_sim
+    local_t_pre, local_states_pre = simulate_zenteno(pre_params)
+    global t_pre = local_t_pre
+    global states_pre = local_states_pre
 catch err
     @warn "No se pudo simular la ODE previa a la optimizacion" err
 end
@@ -416,7 +817,11 @@ set_optimizer_attribute(m, "print_level", 5)
 set_optimizer_attribute(m, "tol", 1e-4)
 set_optimizer_attribute(m, "acceptable_iter", 5)
 set_optimizer_attribute(m, "acceptable_tol", 1e-2)
-set_optimizer_attribute(m, "linear_solver", "mumps")
+linear_solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+if isempty(linear_solver)
+    linear_solver = DEFAULT_LINEAR_SOLVER
+end
+set_optimizer_attribute(m, "linear_solver", linear_solver)
 
 if haskey(ENV, "J_IPOPT_MAX_ITER")
     try
@@ -433,15 +838,32 @@ end
     cdot[1:nc, 1:ph, 1:ncp]
     FO
     teta[1:np]
-    v[1:nv, 1:nfe]
-    lambda_[1:nm, 1:nfe]
-    alpha_U[1:nv, 1:nfe]
-    alpha_L[1:nv, 1:nfe]
-    alpha_upt[1:n_up, 1:nfe]
-    FO_U[1:nv, 1:nfe]
-    FO_L[1:nv, 1:nfe]
-    FO_upt[1:n_up, 1:nfe]
     hv[1:nfe]
+end)
+
+if !REDUCED_MODE || reduced_sets === nothing
+    @variables(m, begin
+        v[1:nv, 1:nfe]
+        lambda_[1:nm, 1:nfe]
+        alpha_U[1:nv, 1:nfe]
+        alpha_L[1:nv, 1:nfe]
+        FO_U[1:nv, 1:nfe]
+        FO_L[1:nv, 1:nfe]
+    end)
+else
+    @variables(m, begin
+        v[K_AX, 1:nfe]
+        lambda_[M_AX, 1:nfe]
+        alpha_U[K_AX, 1:nfe]
+        alpha_L[K_AX, 1:nfe]
+        FO_U[K_AX, 1:nfe]
+        FO_L[K_AX, 1:nfe]
+    end)
+end
+
+@variables(m, begin
+    alpha_upt[1:n_up, 1:nfe]
+    FO_upt[1:n_up, 1:nfe]
 end)
 
 for k in 1:np
@@ -449,7 +871,7 @@ for k in 1:np
 end
 
 for i in 1:ph, j in 1:ncp, l in 1:nc
-    set_start_value(c[l, i, j], c0[l])
+    set_start_value(c[l, i, j], max(c0[l], STATE_MIN_CONC[l]))
     set_start_value(cdot[l, i, j], 0.0)
 end
 for i in 1:nfe
@@ -458,12 +880,13 @@ end
 
 for i in 1:nc
     c0[i] = c0[i] / cs[i]
+    c0[i] = max(c0[i], STATE_MIN_CONC[i])
 end
 
 @NLobjective(m, Min,
     omega * FO +
     sum(
-        sum(-phi1 * FO_L[mc, i] - phi3 * FO_U[mc, i] for mc in 1:nv) +
+        sum(-phi1 * FO_L[mc, i] - phi3 * FO_U[mc, i] for mc in FLUX_INDEX_SET) +
         phi2 * FO_upt[1, i] + phi2 * FO_upt[2, i]
         for i in 1:nfe
     )
@@ -510,26 +933,86 @@ const Yxf = YXF_nom
     teta_LB[p=1:np], teta[p] >= LB[p]
     teta_UB[p=1:np], teta[p] <= UB[p]
 
-    Sc[mc=1:nm, i=1:nfe],  sum(S[mc,k] * v[k,i] * vs[k] for k in 1:nv) == 0
-    v_UB[mc=1:nv, i=1:nfe], v[mc,i]*vs[mc] - ub[mc] <= 0
-    v_LB[mc=1:nv, i=1:nfe], -v[mc,i]*vs[mc] + lb[mc] <= 0
-
-    c_LB[l=1:nc, i=1:nfe, j=1:ncp], -c[l,i,j] <= 0
+    c_LB[l=1:nc, i=1:nfe, j=1:ncp], STATE_MIN_CONC[l] - c[l,i,j] <= 0
 
     MFE1, sum(hv[i] for i in 1:nfe) == th
     MFE3[i=1:nfe], hv[i] >= 0.0
     MFE4[i=1:nfe], hv[i] >= (1.0 - var_h) * hm[1]
     MFE5[i=1:nfe], hv[i] <= (1.0 + var_h) * hm[1]
-
-    Lagr[mc=1:nv, i=1:nfe],
-        d[mc] + w * v[mc,i] * vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] +
-        up[mc] * alpha_upt[1,i] + up2[mc] * alpha_upt[2,i] +
-        sum(S[k,mc] * lambda_[k,i] for k in 1:nm) == 0
-
-    alpha1_LB[mc=1:nv, i=1:nfe], alpha_L[mc,i] <= 0
     alpha4_LB[mc=1:n_up, i=1:nfe], alpha_upt[mc,i] <= 0
-    alpha1_UB[mc=1:nv, i=1:nfe], alpha_U[mc,i] >= 0
 end)
+
+if !REDUCED_MODE || reduced_sets === nothing
+    @constraints(m, begin
+        Sc[mc=1:nm, i=1:nfe],  sum(S[mc,k] * v[k,i] * vs[k] for k in 1:nv) == 0
+        v_UB[mc=1:nv, i=1:nfe], v[mc,i]*vs[mc] - ub[mc] <= 0
+        v_LB[mc=1:nv, i=1:nfe], -v[mc,i]*vs[mc] + lb[mc] <= 0
+        Lagr[mc=1:nv, i=1:nfe],
+            d[mc] + w * v[mc,i] * vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] +
+            up[mc] * alpha_upt[1,i] + up2[mc] * alpha_upt[2,i] +
+            sum(S[k,mc] * lambda_[k,i] for k in 1:nm) == 0
+        alpha1_LB[mc=1:nv, i=1:nfe], alpha_L[mc,i] <= 0
+        alpha1_UB[mc=1:nv, i=1:nfe], alpha_U[mc,i] >= 0
+    end)
+else
+    @constraints(m, begin
+        v_UB[k=K_AX, i=1:nfe], v[k,i]*vs[k] - ub[k] <= 0
+        v_LB[k=K_AX, i=1:nfe], -v[k,i]*vs[k] + lb[k] <= 0
+        alpha1_LB[k=K_AX, i=1:nfe], alpha_L[k,i] <= 0
+        alpha1_UB[k=K_AX, i=1:nfe], alpha_U[k,i] >= 0
+    end)
+    A_sets, C_sets, _ = reduced_sets
+    for i in 1:nfe
+        Ai = (i <= length(A_sets)) ? A_sets[i] : Int[]
+        Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+        Ri = union(Ai, Ci)
+        active_mc = Int[]
+        for mc in 1:nm
+            for k in Ri
+                if S[mc, k] != 0.0
+                    push!(active_mc, mc)
+                    break
+                end
+            end
+        end
+        active_mc = unique(active_mc)
+        sort!(active_mc)
+        for mc in active_mc
+            nz_rxn = Int[]
+            for k in Ri
+                if S[mc, k] != 0.0 && (k in K_AX)
+                    push!(nz_rxn, k)
+                end
+            end
+            isempty(nz_rxn) && continue
+            @constraint(m, sum(S[mc, k] * v[k,i] * vs[k] for k in nz_rxn) == 0)
+        end
+    end
+    for i in 1:nfe
+        Ci = (i <= length(C_sets)) ? C_sets[i] : Int[]
+        nonC = setdiff(K_AX, Ci)
+        for k in nonC
+            @constraint(m, alpha_L[k, i] == 0.0)
+            @constraint(m, alpha_U[k, i] == 0.0)
+        end
+        for k in Ci
+            if !(k in K_AX)
+                continue
+            end
+            nz_met = Int[]
+            for r in M_AX
+                if S[r, k] != 0.0
+                    push!(nz_met, r)
+                end
+            end
+            @constraint(m,
+                d[k] + w * v[k,i] * vs[k] + alpha_L[k,i] + alpha_U[k,i] +
+                up[k] * alpha_upt[1,i] + up2[k] * alpha_upt[2,i] +
+                sum(S[r,k] * lambda_[r,i] for r in nz_met) == 0
+            )
+        end
+    end
+end
 
 @NLconstraints(m, begin
     dX[i=1:ph, j=1:ncp], cdot[1,i,j] == (mu_j[i,j] - Kd_j[i,j]) * c[1,i,j]
@@ -538,15 +1021,24 @@ end)
     dF[i=1:ph, j=1:ncp], cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate * phiF_j[i,j]) * c[1,i,j]
     dE[i=1:ph, j=1:ncp], cdot[5,i,j] == (betaG_j[i,j] + betaF_j[i,j]) * c[1,i,j]
 
-    FO1[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb[mc]) * alpha_L[mc,i]
-    FO2[mc=1:nv, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
-
     FO3_upt[i=1:nfe], FO_upt[1,i] == (-v[glu,i]*vs[glu]) * alpha_upt[1,i]
     FO4_upt[i=1:nfe], FO_upt[2,i] == (-v[fru,i]*vs[fru]) * alpha_upt[2,i]
 
     FO_def,
         FO == sum((data[l,i,j] - c[l,i,j])^2 for l in MEAS_STATES, i in 1:ph, j in 1:ncp)
 end)
+
+if !REDUCED_MODE || reduced_sets === nothing
+    @NLconstraints(m, begin
+        FO1[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb[mc]) * alpha_L[mc,i]
+        FO2[mc=1:nv, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+    end)
+else
+    @NLconstraints(m, begin
+        FO1_red[mc=K_AX, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb[mc]) * alpha_L[mc,i]
+        FO2_red[mc=K_AX, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+    end)
+end
 
 # ---------------------------------------------
 # Resolver
@@ -603,6 +1095,11 @@ try
         mpcc_tgrid, mpcc_states;
         title_str="MPCC post: $(status) / $(pr_status)",
         save_path=plot_output_path,
+    )
+    plot_ethyl_acetate_concentration(
+        mpcc_tgrid, mpcc_states, v;
+        title_str="Ethyl acetate MPCC: $(status) / $(pr_status)",
+        save_path=result_prefix * "_ethyl_acetate.png",
     )
 catch err
     @warn "No se pudo generar el grafico posterior a la optimizacion" err
