@@ -146,10 +146,11 @@ c0 = copy(C0_INIT)
 # Discretizacion
 nfe = 12
 ncp = 3
-th  = 120.0
+th  = 240.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
+const HM_REFERENCE = vec(hm)
 var_h = 1.0
 
 # Pesos MPCC
@@ -373,6 +374,30 @@ const STATE_MIN_CONC = (
     1e-4,  # F: fructosa
     1e-6,  # E: etanol
 )
+const FREEZE_DEPLETED_STATES = get(ENV, "FREEZE_DEPLETED_STATES", "1") == "1"
+const FREEZE_NITROGEN = get(ENV, "FREEZE_NITROGEN", "1") == "1"
+const STATE_FREEZE_ELIGIBLE = (
+    false,
+    FREEZE_NITROGEN,
+    true,
+    true,
+    false,
+)
+const STATE_FREEZE_THRESH = (
+    1.0e-5,
+    5.0e-5,
+    5.0e-4,
+    5.0e-4,
+    1.0e-5,
+)
+const STATE_FREEZE_REL_FRAC = (
+    0.0,
+    0.05,
+    0.02,
+    0.02,
+    0.0,
+)
+const STATE_FREEZE_MIN_CONSEC_FE = 2
 
 struct ZentenoPlotParams
     mu0::Float64
@@ -606,6 +631,123 @@ function plot_ethyl_acetate_concentration(mpcc_tgrid, mpcc_states, v_var; title_
     return true
 end
 
+@inline function _state_depleted(l::Int, value::Real)
+    abs_thresh = STATE_FREEZE_THRESH[l]
+    rel_frac = STATE_FREEZE_REL_FRAC[l]
+    rel_cond = rel_frac > 0 && value <= rel_frac * C0_INIT[l]
+    return value <= abs_thresh || rel_cond
+end
+
+function freeze_phase_from_time(h_lengths::AbstractVector{<:Real}, freeze_time::Real)
+    freeze_time <= 0.0 && return 1
+    acc = 0.0
+    for (idx, len) in enumerate(h_lengths)
+        acc += len
+        if freeze_time <= acc + 1e-9
+            return idx
+        end
+    end
+    return length(h_lengths) + 1
+end
+
+function detect_state_activity_from_data(data_vals::Array{Float64,3}, h_lengths::AbstractVector{<:Real})
+    phases = fill(nfe + 1, nc)
+    times = fill(NaN, nc)
+    below = zeros(Int, nc)
+    prefix = zeros(Float64, nfe)
+    acc = 0.0
+    for i in 1:nfe
+        prefix[i] = acc
+        acc += h_lengths[i]
+    end
+    for i in 1:nfe
+        for l in 1:nc
+            STATE_FREEZE_ELIGIBLE[l] || continue
+            depleted = false
+            for j in 1:ncp
+                if _state_depleted(l, data_vals[l, i, j])
+                    depleted = true
+                    break
+                end
+            end
+            if depleted
+                below[l] += 1
+                if below[l] == STATE_FREEZE_MIN_CONSEC_FE && phases[l] > nfe
+                    phases[l] = i
+                    times[l] = prefix[i]
+                end
+            else
+                below[l] = 0
+            end
+        end
+    end
+    return phases, times
+end
+
+function detect_state_activity_from_presim(t_vals::AbstractVector{<:Real}, states_dense::AbstractMatrix{<:Real}, h_lengths::AbstractVector{<:Real})
+    phases = fill(nfe + 1, nc)
+    times = fill(NaN, nc)
+    states_cols = size(states_dense, 2)
+    for l in 1:nc
+        STATE_FREEZE_ELIGIBLE[l] || continue
+        freeze_time = nothing
+        for idx in 1:states_cols
+            if _state_depleted(l, states_dense[l, idx])
+                freeze_time = t_vals[idx]
+                break
+            end
+        end
+        freeze_time === nothing && continue
+        phase = freeze_phase_from_time(h_lengths, freeze_time)
+        phases[l] = phase
+        times[l] = freeze_time
+    end
+    return phases, times
+end
+
+function build_state_activity_schedule(data_vals::Array{Float64,3}, h_lengths::AbstractVector{<:Real};
+        t_pre_dense=nothing, states_pre_dense=nothing)
+    mask = trues(nc, nfe)
+    freeze_phase = fill(nfe + 1, nc)
+    freeze_time = fill(NaN, nc)
+
+    if t_pre_dense !== nothing && states_pre_dense !== nothing
+        phases_pre, times_pre = detect_state_activity_from_presim(t_pre_dense, states_pre_dense, h_lengths)
+        for l in 1:nc
+            if phases_pre[l] < freeze_phase[l]
+                freeze_phase[l] = phases_pre[l]
+                freeze_time[l] = times_pre[l]
+            end
+        end
+    end
+
+    phases_data, times_data = detect_state_activity_from_data(data_vals, h_lengths)
+    for l in 1:nc
+        if phases_data[l] < freeze_phase[l]
+            freeze_phase[l] = phases_data[l]
+            freeze_time[l] = times_data[l]
+        end
+    end
+
+    for l in 1:nc
+        if freeze_phase[l] <= nfe
+            for ii in freeze_phase[l]:nfe
+                mask[l, ii] = false
+            end
+        end
+    end
+    return mask, freeze_phase, freeze_time
+end
+
+function summarize_freeze_schedule(freeze_phase::AbstractVector{<:Integer}, freeze_time::AbstractVector)
+    for l in 1:nc
+        if freeze_phase[l] <= nfe
+            approx_time = isfinite(freeze_time[l]) ? freeze_time[l] : sum(HM_REFERENCE[1:freeze_phase[l]-1])
+            @info "Estado se congelara tras agotarse" state=STATE_LABELS[l] phase=freeze_phase[l] approx_time_h=approx_time
+        end
+    end
+end
+
 sanitize_token(str::AbstractString) = replace(str, r"[^0-9A-Za-z]+" => "_")
 
 function short_token(str::AbstractString; maxlen::Int=10)
@@ -807,6 +949,21 @@ try
 catch err
     @warn "No se pudo simular la ODE previa a la optimizacion" err
 end
+
+state_activity_mask = trues(nc, nfe)
+state_freeze_phase = fill(nfe + 1, nc)
+state_freeze_time = fill(NaN, nc)
+if FREEZE_DEPLETED_STATES
+    state_activity_mask, state_freeze_phase, state_freeze_time =
+        build_state_activity_schedule(data, HM_REFERENCE;
+            t_pre_dense=(t_pre === nothing ? nothing : t_pre),
+            states_pre_dense=(states_pre === nothing ? nothing : states_pre))
+    summarize_freeze_schedule(state_freeze_phase, state_freeze_time)
+else
+    @info "FREEZE_DEPLETED_STATES=0 -> no se congelaran especies agotadas"
+end
+
+state_is_active(l::Int, i::Int) = (!FREEZE_DEPLETED_STATES || state_activity_mask[l, i])
 
 # ---------------------------------------------
 # Modelo JuMP
@@ -1014,13 +1171,35 @@ else
     end
 end
 
-@NLconstraints(m, begin
-    dX[i=1:ph, j=1:ncp], cdot[1,i,j] == (mu_j[i,j] - Kd_j[i,j]) * c[1,i,j]
-    dN[i=1:ph, j=1:ncp], cdot[2,i,j] == -(mu_j[i,j] / Yxn) * c[1,i,j]
-    dG[i=1:ph, j=1:ncp], cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate * phiG_j[i,j]) * c[1,i,j]
-    dF[i=1:ph, j=1:ncp], cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate * phiF_j[i,j]) * c[1,i,j]
-    dE[i=1:ph, j=1:ncp], cdot[5,i,j] == (betaG_j[i,j] + betaF_j[i,j]) * c[1,i,j]
+for i in 1:ph, j in 1:ncp
+    if state_is_active(1, i)
+        @NLconstraint(m, cdot[1,i,j] == (mu_j[i,j] - Kd_j[i,j]) * c[1,i,j])
+    else
+        @constraint(m, cdot[1,i,j] == 0.0)
+    end
+    if state_is_active(2, i)
+        @NLconstraint(m, cdot[2,i,j] == -(mu_j[i,j] / Yxn) * c[1,i,j])
+    else
+        @constraint(m, cdot[2,i,j] == 0.0)
+    end
+    if state_is_active(3, i)
+        @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate * phiG_j[i,j]) * c[1,i,j])
+    else
+        @constraint(m, cdot[3,i,j] == 0.0)
+    end
+    if state_is_active(4, i)
+        @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate * phiF_j[i,j]) * c[1,i,j])
+    else
+        @constraint(m, cdot[4,i,j] == 0.0)
+    end
+    if state_is_active(5, i)
+        @NLconstraint(m, cdot[5,i,j] == (betaG_j[i,j] + betaF_j[i,j]) * c[1,i,j])
+    else
+        @constraint(m, cdot[5,i,j] == 0.0)
+    end
+end
 
+@NLconstraints(m, begin
     FO3_upt[i=1:nfe], FO_upt[1,i] == (-v[glu,i]*vs[glu]) * alpha_upt[1,i]
     FO4_upt[i=1:nfe], FO_upt[2,i] == (-v[fru,i]*vs[fru]) * alpha_upt[2,i]
 

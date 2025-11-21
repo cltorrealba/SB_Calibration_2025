@@ -1,0 +1,11 @@
+timestamp=2025-11-19T18:01:01.400
+termination_status=LOCALLY_INFEASIBLE
+primal_status=INFEASIBLE_POINT
+wall_time_s=5558.2210
+objective=546906.6580006749
+FO_value=5403.270096648713
+iter_count=NaN
+dual_infeasibility=NaN
+primal_infeasibility=NaN
+constraint_violation=NaN
+complementarity=NaN
