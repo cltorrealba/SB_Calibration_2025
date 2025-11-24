@@ -2,7 +2,7 @@
 
 julia_version = "1.12.1"
 manifest_format = "2.0"
-project_hash = "8fea8eede363bb1d4c7479c4dff683c4234f158a"
+project_hash = "9075d9b119d0df340e7246ed4b03e3d50c7dc55e"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "8be2ae325471fc20b11c27bb34b518541d07dd3a"
@@ -895,6 +895,18 @@ git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
 uuid = "076d061b-32b6-4027-95e0-9a2c6f6d7e74"
 version = "0.2.0"
 
+[[deps.HiGHS]]
+deps = ["HiGHS_jll", "MathOptIIS", "MathOptInterface", "PrecompileTools", "SparseArrays"]
+git-tree-sha1 = "7eaca80074d6389bbf83e4dfb1eaf6b3cd78d150"
+uuid = "87dc4568-4c63-4d18-b0c0-bb2238e4078b"
+version = "1.20.1"
+
+[[deps.HiGHS_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl", "METIS_jll", "OpenBLAS32_jll", "Zlib_jll"]
+git-tree-sha1 = "e0539aa3405df00e963a9a56d5e903a280f328e7"
+uuid = "8fd58aa0-07eb-5a78-9b36-339c94fd15ea"
+version = "1.12.0+0"
+
 [[deps.Hwloc_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "XML2_jll", "Xorg_libpciaccess_jll"]
 git-tree-sha1 = "3d468106a05408f9f7b6f161d9e7715159af247b"
@@ -1340,6 +1352,12 @@ version = "0.1.8"
 deps = ["Base64", "JuliaSyntaxHighlighting", "StyledStrings"]
 uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
 version = "1.11.0"
+
+[[deps.MathOptIIS]]
+deps = ["MathOptInterface"]
+git-tree-sha1 = "31d4a6353ea00603104f11384aa44dd8b7162b28"
+uuid = "8c4f8055-bd93-4160-a86b-a0c04941dbff"
+version = "0.1.1"
 
 [[deps.MathOptInterface]]
 deps = ["BenchmarkTools", "CodecBzip2", "CodecZlib", "DataStructures", "ForwardDiff", "JSON3", "LinearAlgebra", "MutableArithmetics", "NaNMath", "OrderedCollections", "PrecompileTools", "Printf", "SparseArrays", "SpecialFunctions", "Test"]

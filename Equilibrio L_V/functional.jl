@@ -1,4 +1,4 @@
-﻿using Clapeyron
+using Clapeyron
 using DifferentialEquations
 using Plots
 using LinearAlgebra
@@ -6,8 +6,8 @@ using LinearAlgebra
 # ==========================================
 # 1. Termodinámica (Clapeyron)
 # ==========================================
-# Especies: agua, etanol y un aroma (ethyl acetate en este caso)
-species = ["water", "ethanol", "ethylacetate"]
+# Especies: agua, etanol y el aroma (ethyl hexanoate)
+species = ["water", "ethanol", "isoamylacetate"]
 
 # Listado de especies UNIFAC para avisar si falta alguna
 const UNIFAC_GROUPS_CSV = normpath(joinpath(dirname(pathof(Clapeyron)), "..", "database", "Activity", "UNIFAC", "UNIFAC_groups.csv"))
@@ -68,7 +68,7 @@ function build_activity_model(species)
         return nothing
     end
 end
-MODEL_UNIFAC = build_activity_model(species)
+model = build_activity_model(species)
 
 # Parámetros puros desde la base de datos + fallback manual
 const SPECIES_PARAM_LOCATIONS = [
@@ -81,6 +81,8 @@ const MANUAL_SPECIES_FALLBACK = Dict(
     "water" => (mw = 18.015, psat = (type = :custom, eval = (T -> exp(23.1964 - 3816.44 / (T - 46.13))))),
     "ethanol" => (mw = 46.07, psat = (type = :custom, eval = (T -> exp(23.8381 - 3803.98 / (T - 41.68))))),
     "ethyl hexanoate" => (mw = 144.21, psat = (type = :custom, eval = (T -> exp(20.7 - 3550.0 / (T - 60.0))))),
+    # Fallback aproximado para isoamyl acetate, usando ajuste exp(a - b/T) con datos 25-50 °C (P≈0.5-2.1 kPa)
+    "isoamylacetate" => (mw = 130.18, psat = (type = :custom, eval = (T -> exp(24.16 - 5330.0 / T)))),
 )
 
 function fetch_species_properties(species::Vector{String})
@@ -152,24 +154,6 @@ end
 
 const SPECIES_PROPERTIES = fetch_species_properties(species)
 const MW = SPECIES_PROPERTIES.mw
-debug_partition(model, T, x_molar) = begin
-    gamma = begin
-        if model === nothing
-            ones(length(x_molar))
-        else
-            try
-                lnγ = activity_coefficient(model, P_atm, T, x_molar)
-                any(isnan, lnγ) ? ones(length(x_molar)) : exp.(lnγ)
-            catch
-                ones(length(x_molar))
-            end
-        end
-    end
-    p_sat = [psat_from_data(T, i) for i in eachindex(species)]
-    Ki = (gamma .* p_sat) ./ P_atm
-    println("DEBUG partition @T=$(T): x=$(x_molar), p_sat=$(p_sat), gamma=$(gamma), Ki=$(Ki)")
-    return Ki
-end
 
 function psat_from_data(T::Float64, idx::Int)
     params = SPECIES_PROPERTIES.psat[idx]
@@ -332,15 +316,14 @@ end
 # 3. Stripping de aroma usando Clapeyron
 # ==========================================
 function calculate_partition_coefficient(model, T, x_molar)
-    gamma_cap = 1e3
     gamma = ones(length(x_molar))
     if model !== nothing
         try
             ln_gamma = activity_coefficient(model, P_atm, T, x_molar)
-            if any(x -> !isfinite(x), ln_gamma)
-                @warn "UNIFAC devolvio NaN/Inf en gamma; se usa idealidad en su lugar." T=T x=x_molar ln_gamma=ln_gamma
+            if any(isnan, ln_gamma)
+                @warn "UNIFAC devolvio NaN en gamma; se usa idealidad en su lugar." T=T x=x_molar
             else
-                gamma .= clamp.(exp.(ln_gamma), 0.0, gamma_cap)
+                gamma .= exp.(ln_gamma)
             end
         catch err
             @warn "Fallo calculo de gamma; se usa idealidad (gamma=1)." exception=err T=T x=x_molar
@@ -352,7 +335,7 @@ function calculate_partition_coefficient(model, T, x_molar)
         p_sat = map(x -> isnan(x) ? 0.0 : x, p_sat)
     end
     Ki_termo = (gamma .* p_sat) ./ P_atm
-    Ki_termo = map(x -> isfinite(x) ? clamp(x, 0.0, 100.0) : 0.0, Ki_termo) # cap para evitar explosiones numéricas
+    Ki_termo = map(x -> isfinite(x) ? x : 0.0, Ki_termo)
     rho_L = 1000.0
     rho_G = (P_atm / (R * T)) * 44.01
     MW_mix = sum(x_molar .* MW)
@@ -375,7 +358,7 @@ function aroma_ode!(du, u, p, t)
     w_water = max(1.0 - w_eth - 1e-6, 1e-6)
     moles = [w_water/18.015, w_eth/46.07, 1e-6/144.21]
     x_molar = moles ./ sum(moles)
-    K_part = calculate_partition_coefficient(p.model, T, x_molar)
+    K_part = calculate_partition_coefficient(model, T, x_molar)
     Q_CO2 = p.co2_func(t)
     du[1] = - (Q_CO2 / V_liq) * K_part * C_aroma
     if !isfinite(du[1])
@@ -387,12 +370,12 @@ end
 # ==========================================
 # 4. Secuencia completa: fermentación -> flujo CO2 -> stripping
 # ==========================================
-function run_workflow(; th=120.0, nfe=18, ncp=3, c0=c0_default, T_steps=[(0.0,15.0),(24.0,27.0)], N_pulses=Float64[], pulse_amounts=Float64[], pulse_width=1.0, aroma_init=10.0, V_liq=100.0, lag_t50=8.0, lag_k=2.0, activity_model=MODEL_UNIFAC, ferm_override=nothing)
-    ferm = isnothing(ferm_override) ? run_fermentation(th=th, nfe=nfe, ncp=ncp, c0=c0, T_steps=T_steps, N_pulses=N_pulses, pulse_amounts=pulse_amounts, pulse_width=pulse_width, lag_t50=lag_t50, lag_k=lag_k) : ferm_override
+function run_workflow(; th=120.0, nfe=18, ncp=3, c0=c0_default, T_steps=[(0.0,15.0),(24.0,27.0)], N_pulses=Float64[], pulse_amounts=Float64[], pulse_width=1.0, aroma_init=10.0, V_liq=100.0, lag_t50=8.0, lag_k=2.0)
+    ferm = run_fermentation(th=th, nfe=nfe, ncp=ncp, c0=c0, T_steps=T_steps, N_pulses=N_pulses, pulse_amounts=pulse_amounts, pulse_width=pulse_width, lag_t50=lag_t50, lag_k=lag_k)
     sol = ferm.sol
     params = ferm.params
     co2_func = t -> co2_vol_flow(t, sol, params; V_liq=V_liq)
-    aroma_prob = ODEProblem(aroma_ode!, [aroma_init], (0.0, th), (; sol=sol, Tfun=ferm.Tfun, co2_func=co2_func, V_liq=V_liq, model=activity_model))
+    aroma_prob = ODEProblem(aroma_ode!, [aroma_init], (0.0, th), (; sol=sol, Tfun=ferm.Tfun, co2_func=co2_func, V_liq=V_liq))
     # Desactivamos autodiff (ForwardDiff) porque la func. de flujo CO2 interpola la solución del primer ODE,
     # y no es diferenciable; así evitamos fallos en Rodas5 por AD.
     aroma_solver = Rodas5(autodiff=false)
@@ -403,27 +386,21 @@ end
 # ==========================================
 # 5. Ejecutar y graficar
 # ==========================================
-common_kwargs = (
+ferm_res = run_workflow(
     T_steps=[(0.0,15.0),(30.0,18.0),(60.0,15.0)],
     N_pulses=[24.0, 72.0],
     pulse_amounts=[0.05, 0.05],
-    aroma_init=10.0,
+    aroma_init=1000.0,
     pulse_width=4.0,
     lag_t50=8.0,
     lag_k=2.0,
 )
-
-# Ejecutamos una sola fermentación y la reutilizamos
-ferm_base = run_fermentation(; th=120.0, nfe=18, ncp=3, c0=c0_default, T_steps=common_kwargs.T_steps, N_pulses=common_kwargs.N_pulses, pulse_amounts=common_kwargs.pulse_amounts, pulse_width=common_kwargs.pulse_width, lag_t50=common_kwargs.lag_t50, lag_k=common_kwargs.lag_k)
-
-unifac_res = run_workflow(; th=120.0, nfe=18, ncp=3, c0=c0_default, activity_model=MODEL_UNIFAC, ferm_override=ferm_base, common_kwargs...)
-ideal_res  = run_workflow(; th=120.0, nfe=18, ncp=3, c0=c0_default, activity_model=nothing, ferm_override=ferm_base, common_kwargs...)
-
-sol = ferm_base.sol
-co2_func = unifac_res.co2_func
-Tfun = ferm_base.Tfun
-N_pulses = common_kwargs.N_pulses
-pulse_amounts = common_kwargs.pulse_amounts
+sol = ferm_res.ferm.sol
+aroma_sol = ferm_res.aroma
+co2_func = ferm_res.co2_func
+Tfun = ferm_res.ferm.Tfun
+N_pulses = ferm_res.N_pulses
+pulse_amounts = ferm_res.pulse_amounts
 
 t_dense = collect(range(sol.t[1], sol.t[end]; length=400))
 state_labels = ["X","N","G","F","E"]
@@ -438,11 +415,7 @@ if !isempty(N_pulses)
     vline!(p_temp, N_pulses; lc=:gray, ls=:dash, label="pulsos N")
 end
 
-p_aroma = plot(unifac_res.aroma; label="Aroma UNIFAC (mg/L)", lw=2, title="Perdida de aroma por stripping", xlabel="Tiempo (h)", legend=:topright)
-plot!(p_aroma, ideal_res.aroma; label="Aroma ideal (mg/L)", lw=2, ls=:dash)
-
-debug_partition(MODEL_UNIFAC, ferm_base.Tfun(0.0), [0.999999,1e-6,1e-6]) # debug: UNIFAC
-debug_partition(nothing, ferm_base.Tfun(0.0), [0.999999,1e-6,1e-6]) # debug: idealidad
+p_aroma = plot(aroma_sol; label="Aroma (mg/L)", lw=2, title="Perdida de aroma por stripping", xlabel="Tiempo (h)", legend=:topright)
 
 lay = grid(4,2, widths=[0.5,0.5], heights=[0.25,0.25,0.25,0.25])
 fig = plot(

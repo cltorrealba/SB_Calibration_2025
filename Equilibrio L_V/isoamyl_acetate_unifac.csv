@@ -1,2 +1,6 @@
+Clapeyron Database File,
+custom UNIFAC groups for isoamyl acetate [csvtype = groups,grouptype = UNIFACDortmund]
 species,groups
-isoamyl acetate,"CH3COO:1; CH2:2; CH:1; CH3:2"
+isoamyl acetate,"[""CH3""=>3,""CH""=>1,""CH2""=>2,""COO""=>1]"
+isoamylacetate,"[""CH3""=>3,""CH""=>1,""CH2""=>2,""COO""=>1]"
+isoamylacetate~|~isopentyl acetate~|~3-methylbutyl ethanoate,"[""CH3""=>3,""CH""=>1,""CH2""=>2,""COO""=>1]"

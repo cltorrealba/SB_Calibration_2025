@@ -9,13 +9,13 @@ using Ipopt
 using LinearAlgebra
 using DelimitedFiles
 using DifferentialEquations
+using Clapeyron
 using Plots
 using Dates
 using Random
 using Printf
 using MathOptInterface
 using JLD2
-using JSON3
 const MOI = MathOptInterface
 
 # ---------------------------------------------
@@ -57,10 +57,203 @@ end
 
 const MOLAR_MASS_ETHYL_ACETATE = 88.106 # g / mol
 
+# Perfil de temperatura por defecto (horas, °C): 0-24h 15°C, 24-48h 18°C, 48+ 23°C
+const TEMP_PROFILE_STEPS_C = [
+    (0.0, 15.0),
+    (24.0, 18.0),
+    (48.0, 23.0),
+]
+const TEMP_TRANSITION_WIDTH_H = 0.5 # suavizado en las transiciones para evitar discontinuidades
+
+# ---------------------------------------------
+# Termodinámica para stripping de aromas (Clapeyron)
+# ---------------------------------------------
+const AROMA_SPECIES = ["water", "ethanol", "ethylacetate"]
+
+const UNIFAC_GROUPS_CSV = normpath(joinpath(dirname(pathof(Clapeyron)), "..", "database", "Activity", "UNIFAC", "UNIFAC_groups.csv"))
+const ISOAMYL_USER_GROUPS = joinpath(@__DIR__, "isoamyl_acetate_unifac.csv")
+
+function _normalize_unifac_entry(entry::AbstractString)
+    return lowercase(strip(String(entry)))
+end
+
+function _load_available_unifac_species(db_path::AbstractString)
+    if !isfile(db_path)
+        @warn "No se encontro la tabla de especies UNIFAC en Clapeyron." path=db_path
+        return String[]
+    end
+    lines = readlines(db_path)
+    length(lines) <= 3 && return String[]
+    species_list = String[]
+    for line in lines[4:end]
+        stripped = strip(line)
+        isempty(stripped) && continue
+        first_col = split(stripped, ','; limit=2)[1]
+        cleaned = replace(replace(first_col, '"' => ""), "~|~" => " / ")
+        push!(species_list, cleaned)
+    end
+    return species_list
+end
+
+const USER_UNIFAC_SPECIES = _load_available_unifac_species(ISOAMYL_USER_GROUPS)
+const AVAILABLE_UNIFAC_SPECIES = vcat(_load_available_unifac_species(UNIFAC_GROUPS_CSV), USER_UNIFAC_SPECIES)
+
+function _build_unifac_model(species::Vector{String})
+    synonyms = String[]
+    for entry in AVAILABLE_UNIFAC_SPECIES
+        parts = split(entry, "/")
+        for p in parts
+            norm = _normalize_unifac_entry(p)
+            push!(synonyms, norm)
+            push!(synonyms, replace(norm, " " => ""))
+        end
+    end
+    available = Set(synonyms)
+    missing = [s for s in species if !(_normalize_unifac_entry(s) in available)]
+    if !isempty(missing)
+        @info "UNIFAC no disponible para algunos componentes; se usara idealidad (gamma=1)." faltantes=missing
+        return nothing
+    end
+    try
+        group_locs = isfile(ISOAMYL_USER_GROUPS) ? [ISOAMYL_USER_GROUPS] : String[]
+        return UNIFAC(species; group_userlocations=group_locs)
+    catch err
+        @warn "No se pudieron construir parametros UNIFAC; se usara idealidad." exception=err
+        return nothing
+    end
+end
+
+const MODEL_UNIFAC = nothing#_build_unifac_model(AROMA_SPECIES)
+
+const SPECIES_PARAM_LOCATIONS = [
+    "properties/molarmass.csv",
+    "properties/critical.csv",
+    "Correlations/saturation_correlations/dippr101_like.csv",
+]
+
+const MANUAL_SPECIES_FALLBACK = Dict(
+    "water" => (mw = 18.015, psat = (type = :custom, eval = (T -> exp(23.1964 - 3816.44 / (T - 46.13))))),
+    "ethanol" => (mw = 46.07, psat = (type = :custom, eval = (T -> exp(23.8381 - 3803.98 / (T - 41.68))))),
+)
+
+function _fetch_species_properties(species::Vector{String})
+    n = length(species)
+    mw = fill(NaN, n)
+    psat = Vector{Union{Nothing, NamedTuple}}(undef, n)
+    psat .= nothing
+    manual_keys = Set(keys(MANUAL_SPECIES_FALLBACK))
+    to_query_idx = [i for i in 1:n if !(lowercase(strip(species[i])) in manual_keys)]
+    to_query = species[to_query_idx]
+    params = nothing
+    if !isempty(to_query)
+        try
+            params = getparams(
+                to_query,
+                SPECIES_PARAM_LOCATIONS;
+                verbose=false,
+                ignore_missing_singleparams=["A","B","C","D","E","Tmin","Tmax"],
+            )
+        catch err
+            @warn "No se pudieron recuperar parametros puros desde Clapeyron." exception=err
+        end
+    end
+    if params !== nothing
+        mw_param = get(params, "Mw", nothing)
+        if mw_param !== nothing
+            for (loc_idx, global_idx) in enumerate(to_query_idx)
+                if !mw_param.ismissingvalues[loc_idx]
+                    mw[global_idx] = mw_param.values[loc_idx]
+                end
+            end
+        end
+        dippr_keys = ["A","B","C","D","E","Tmin","Tmax"]
+        if all(k -> haskey(params, k), dippr_keys)
+            dippr_data = Dict(k => collect(params[k].values) for k in dippr_keys)
+            for (loc_idx, global_idx) in enumerate(to_query_idx)
+                if any(params[k].ismissingvalues[loc_idx] for k in dippr_keys)
+                    continue
+                end
+                vals = (dippr_data["A"][loc_idx], dippr_data["B"][loc_idx], dippr_data["C"][loc_idx],
+                        dippr_data["D"][loc_idx], dippr_data["E"][loc_idx], dippr_data["Tmin"][loc_idx], dippr_data["Tmax"][loc_idx])
+                if all(x -> !isnan(x), vals)
+                    psat[global_idx] = (type=:dippr, A=vals[1], B=vals[2], C=vals[3], D=vals[4], E=vals[5], Tmin=vals[6], Tmax=vals[7])
+                end
+            end
+        end
+    end
+    for (i, comp) in pairs(species)
+        name_key = lowercase(strip(comp))
+        fallback = get(MANUAL_SPECIES_FALLBACK, name_key, nothing)
+        if isnan(mw[i]) && fallback !== nothing
+            mw[i] = fallback.mw
+        end
+        if psat[i] === nothing && fallback !== nothing
+            psat[i] = fallback.psat
+        end
+        if isnan(mw[i])
+            @warn "No se encontro masa molar para $(comp); se usa 1.0 g/mol."
+            mw[i] = 1.0
+        end
+        if psat[i] === nothing
+            @warn "No hay correlacion psat para $(comp); se aproxima a cero."
+            psat[i] = (type=:none,)
+        end
+    end
+    return (mw=mw, psat=psat)
+end
+
+const AROMA_SPECIES_PROPS = _fetch_species_properties(AROMA_SPECIES)
+const AROMA_MW = AROMA_SPECIES_PROPS.mw
+
+function psat_from_data(T::Float64, idx::Int)
+    params = AROMA_SPECIES_PROPS.psat[idx]
+    typ = params.type
+    if typ === :dippr
+        if !(params.Tmin <= T <= params.Tmax)
+            @warn "Temperatura fuera del rango DIPPR para $(AROMA_SPECIES[idx])." T=T range=(params.Tmin, params.Tmax)
+        end
+        return exp(params.A + params.B / T + params.C * log(T) + params.D * T^params.E)
+    elseif typ === :custom
+        return params.eval(T)
+    else
+        return 0.0
+    end
+end
+
+function calculate_partition_coefficient(model, T, x_molar)
+    gamma_cap = 1e3
+    gamma = ones(length(x_molar))
+    if model !== nothing
+        try
+            ln_gamma = activity_coefficient(model, P_ATM, T, x_molar)
+            if any(x -> !isfinite(x), ln_gamma)
+                @warn "UNIFAC devolvio NaN/Inf; se usa idealidad." T=T x=x_molar ln_gamma=ln_gamma
+            else
+                gamma .= clamp.(exp.(ln_gamma), 0.0, gamma_cap)
+            end
+        catch err
+            @warn "Fallo calculo gamma; se usa idealidad." exception=err T=T x=x_molar
+        end
+    end
+    p_sat = [psat_from_data(T, i) for i in eachindex(AROMA_SPECIES)]
+    if any(isnan, p_sat)
+        @warn "psat NaN detectado; se fuerzan a cero." T=T p_sat=p_sat
+        p_sat = map(x -> isnan(x) ? 0.0 : x, p_sat)
+    end
+    Ki_termo = (gamma .* p_sat) ./ P_ATM
+    Ki_termo = map(x -> isfinite(x) ? clamp(x, 0.0, 100.0) : 0.0, Ki_termo)
+    rho_L = 1000.0
+    MW_mix = sum(x_molar .* AROMA_MW)
+    if !isfinite(MW_mix) || MW_mix <= 0
+        @warn "MW_mix no finito; se usa valor de respaldo." MW_mix=MW_mix
+        MW_mix = 50.0
+    end
+    H_cc = Ki_termo .* (P_ATM / (R*T)) ./ (rho_L ./ MW_mix)
+    return isfinite(H_cc[3]) ? H_cc[3] : 0.0
+end
+
 const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
 const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
-const RUN_FVA_REDUCTION_REQUEST = get(ENV, "RUN_FVA_REDUCTION", "0") == "1"
-const AUTO_BUILD_REDUCED = get(ENV, "AUTO_BUILD_REDUCED", "1") == "1"
 
 function _load_reduced_sets(path::String)
     if !isfile(path)
@@ -74,6 +267,11 @@ function _load_reduced_sets(path::String)
         @warn "No se pudieron cargar reduced_sets" path err
         return nothing
     end
+end
+
+const reduced_sets = REDUCED_MODE ? _load_reduced_sets(REDUCED_SETS_PATH) : nothing
+if REDUCED_MODE && reduced_sets === nothing
+    @warn "REDUCED_MODE=1 sin reduced_sets.jld2; se usara el modelo completo" REDUCED_SETS_PATH
 end
 
 # ---------------------------------------------
@@ -120,13 +318,44 @@ const betaG0_nom = 1.41182
 const betaF0_nom = 8.49482
 
 const R = 8.314
+const P_ATM = 101325.0 # Pa
 const T_const = try parse(Float64, get(ENV, "T_CONST", "293.15")) catch; 293.15 end
+const FERMENTER_VOLUME_L = try parse(Float64, get(ENV, "FERMENTER_VOL_L", "100.0")) catch; 100.0 end
 const eps = 1e-9
+
+function _smooth_step(t, t0, width)
+    0.5 * (1.0 + tanh((t - t0) / max(width, 1e-6)))
+end
+
+function temperature_profile_builder(steps)
+    sorted = sort(steps; by=x->x[1])
+    # tomamos tres escalones: T1 hasta t1, T2 hasta t2, T3 en adelante
+    t1, T1 = sorted[1]
+    t2, T2 = sorted[min(2, length(sorted))]
+    t3, T3 = sorted[min(3, length(sorted))]
+    w = TEMP_TRANSITION_WIDTH_H
+    function Tfun(t)
+        s1 = _smooth_step(t, t1, w)  # sube de 0 a 1 alrededor de t1
+        s2 = _smooth_step(t, t2, w)  # sube de 0 a 1 alrededor de t2
+        # mezcla suave: T1 + (T2-T1)*s1 + (T3-T2)*s2
+        Tc = T1 + (T2 - T1) * s1 + (T3 - T2) * s2
+        return Tc + 273.15
+    end
+    return Tfun
+end
+
+const T_PROFILE = temperature_profile_builder(TEMP_PROFILE_STEPS_C)
 
 death_rate(E) = begin
     Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
     s = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
     base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const))
+    base * s
+end
+death_rate_T(E, T) = begin
+    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+    s = 0.5 * (1.0 + tanh(0.5 * (T - Td)))
+    base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T - 305.65)) / (305.65 * R * T))
     base * s
 end
 
@@ -135,7 +364,6 @@ const np = 3
 const theta0 = log.([0.1, 0.1, 0.8])
 LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom])
 UB = log.([2.0*MU0_nom, 2.0*YEG_nom, 2.0*YEF_nom])
-const ESTIMATE_PARAMETERS = get(ENV, "ESTIMATE_PARAMS", "1") == "1"
 
 # Condiciones iniciales
 X0 = 0.5; N0 = 0.14; G0 = 110.0; F0 = 110.0; E0 = 0.0
@@ -143,9 +371,9 @@ const C0_INIT = [X0, N0, G0, F0, E0]
 c0 = copy(C0_INIT)
 
 # Discretizacion
-nfe = 18
+nfe = 12
 ncp = 3
-th  = 240.0
+th  = 72.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
@@ -166,449 +394,6 @@ const n_up = 2
 
 cs = ones(nc)
 vs = ones(nv)
-
-const FVA_PARAM_SAMPLES = max(1, try parse(Int, get(ENV, "FVA_PARAM_SAMPLES", "1")) catch; 6 end)
-const FVA_PERTURB_FRACTION = try parse(Float64, get(ENV, "FVA_PERTURB_FRAC", "0.2")) catch; 0.2 end
-const FVA_PARAM_SEED = try parse(Int, get(ENV, "FVA_PARAM_SEED", "2025")) catch; 2025 end
-const FVA_PFBA_EPS = try parse(Float64, get(ENV, "FVA_PFBA_EPS", "1e-7")) catch; 1e-7 end
-const FVA_MAG_THRESH = try parse(Float64, get(ENV, "FVA_MAG_THRESH", "1e-5")) catch; 1e-5 end
-const FVA_RANGE_EPS = try parse(Float64, get(ENV, "FVA_RANGE_EPS", "1e-6")) catch; 1e-6 end
-const FVA_MAX_CHECKS = max(1, try parse(Int, get(ENV, "FVA_MAX_CHECKS", "50")) catch; 600 end)
-const FVA_PROGRESS_STEP = max(1, try parse(Int, get(ENV, "FVA_PROGRESS_STEP", "1")) catch; 1 end)
-const FVA_GROWTH_GAP = try parse(Float64, get(ENV, "FVA_GROWTH_GAP", "1e-6")) catch; 1e-6 end
-const FVA_RESULTS_PATH = get(ENV, "FVA_RESULTS_PATH", REDUCED_SETS_PATH)
-const FVA_INNER_PROGRESS = max(1, try parse(Int, get(ENV, "FVA_INNER_PROGRESS", "50")) catch; 50 end)
-const FVA_METADATA_DIR = get(ENV, "FVA_METADATA_DIR", joinpath(EXPERIMENT_DIR, "exp_seed_FVA"))
-
-const HAVE_HIGHS = Base.find_package("HiGHS") !== nothing
-const HAVE_GLPK  = Base.find_package("GLPK") !== nothing
-const HAVE_CLP   = Base.find_package("Clp") !== nothing
-if HAVE_HIGHS
-    import HiGHS
-end
-if HAVE_GLPK
-    import GLPK
-end
-if HAVE_CLP
-    import Clp
-end
-
-struct ReducedModeFVAConfig
-    horizon::Float64
-    nfe::Int
-    samples::Int
-    perturbation_fraction::Float64
-    pfba_eps::Float64
-    mag_thresh::Float64
-    range_eps::Float64
-    max_checks::Int
-    growth_gap::Float64
-    progress_step::Int
-    results_path::String
-    seed::Int
-end
-
-mutable struct PFBAWorkspace
-    model::Model
-    v::Vector{VariableRef}
-    z::Vector{VariableRef}
-    sum_abs::JuMP.AffExpr
-end
-
-_sorted_unique!(vec::Vector{Int}) = (isempty(vec) && return vec; sort!(vec); unique!(vec); vec)
-
-function _select_lp_optimizer()
-    if HAVE_HIGHS
-        return HiGHS.Optimizer
-    elseif HAVE_GLPK
-        return GLPK.Optimizer
-    elseif HAVE_CLP
-        return Clp.Optimizer
-    else
-        @warn "[FVA] No HiGHS/GLPK/Clp available; se utilizara Ipopt para el preprocesamiento LP."
-        return Ipopt.Optimizer
-    end
-end
-
-function _build_fva_metadata(cfg::ReducedModeFVAConfig)
-    Dict(
-        "script" => abspath(@__FILE__),
-        "mpcc_grid" => Dict(
-            "nfe" => nfe,
-            "ncp" => ncp,
-            "horizon_h" => th,
-            "hm_reference" => "uniform ($(th)/$(nfe))",
-        ),
-        "thermo_conditions" => Dict(
-            "T_const_K" => T_const,
-            "R" => R,
-        ),
-        "initial_states" => Dict(
-            "X0" => C0_INIT[1],
-            "N0" => C0_INIT[2],
-            "G0" => C0_INIT[3],
-            "F0" => C0_INIT[4],
-            "E0" => C0_INIT[5],
-        ),
-        "parameter_estimation" => Dict(
-            "enabled" => ESTIMATE_PARAMETERS,
-            "estimated_logs" => ["mu0", "Yeg", "Yef"],
-            "theta0" => collect(theta0),
-            "bounds" => Dict("LB" => collect(LB), "UB" => collect(UB)),
-        ),
-        "nominal_parameters" => Dict(
-            "mu0" => MU0_nom,
-            "YXN" => YXN_nom,
-            "YXG" => YXG_nom,
-            "YXF" => YXF_nom,
-            "YEG" => YEG_nom,
-            "YEF" => YEF_nom,
-            "Kn0" => Kn0_nom,
-            "Kg0" => Kg0_nom,
-            "Kf0" => Kf0_nom,
-            "Kig0" => Kig0_nom,
-            "Kie0" => Kie0_nom,
-            "Kd0" => Kd0_nom,
-            "betaG0" => betaG0_nom,
-            "betaF0" => betaF0_nom,
-        ),
-        "fva_pipeline_config" => Dict(
-            "samples" => cfg.samples,
-            "perturbation_fraction" => cfg.perturbation_fraction,
-            "seed" => cfg.seed,
-            "pfba_eps" => cfg.pfba_eps,
-            "mag_thresh" => cfg.mag_thresh,
-            "range_eps" => cfg.range_eps,
-            "max_checks" => cfg.max_checks,
-            "progress_step" => cfg.progress_step,
-            "inner_progress" => FVA_INNER_PROGRESS,
-            "growth_gap" => cfg.growth_gap,
-            "results_path" => cfg.results_path,
-        ),
-        "solver_selection_order" => [
-            HAVE_HIGHS ? "HiGHS" : nothing,
-            HAVE_GLPK  ? "GLPK"  : nothing,
-            HAVE_CLP   ? "Clp"   : nothing,
-            "Ipopt (fallback)",
-        ] |> filter(!isnothing),
-        "notes" => Dict(
-            "comment" => "Reduced sets almacenan A, C, F por FE; se recomienda recalcular si cambian nfe/th/parametros.",
-            "saved_sets" => ["A", "C", "F", "metadata"],
-        ),
-    )
-end
-
-function maybe_write_fva_metadata(cfg::ReducedModeFVAConfig)
-    dir = FVA_METADATA_DIR
-    isempty(strip(dir)) && return nothing
-    isdir(dir) || mkpath(dir)
-    timestamp = Dates.format(Dates.now(), "yyyy_mm_dd_HHmmss")
-    path = joinpath(dir, "condiciones_FVA_" * timestamp * ".json")
-    metadata = _build_fva_metadata(cfg)
-    open(path, "w") do io
-        JSON3.write(io, metadata; indent=4)
-    end
-    println("[FVA] Metadata guardada en $path")
-    return path
-end
-
-function _build_pfba_workspace()
-    model = Model(_select_lp_optimizer())
-    set_silent(model)
-    try
-        set_optimizer_attribute(model, "log_to_console", false)
-    catch
-    end
-    @variable(model, lb[k] <= v[k=1:nv] <= ub[k])
-    @variable(model, z[1:nv] >= 0.0)
-    @constraint(model, stoich[mc=1:nm], sum(S[mc,k] * v[k] for k in 1:nv) == 0)
-    @constraint(model, v_upper[k=1:nv], v[k] - z[k] <= 0)
-    @constraint(model, v_lower[k=1:nv], -v[k] - z[k] <= 0)
-    sum_abs = @expression(model, sum(z[k] for k in 1:nv))
-    return PFBAWorkspace(model, v, z, sum_abs)
-end
-
-function _sample_parameter_sets(cfg::ReducedModeFVAConfig)
-    rng = MersenneTwister(cfg.seed)
-    samples = Vector{NamedTuple{(:mu0, :Yeg, :Yef), NTuple{3, Float64}}}()
-    push!(samples, (mu0=MU0_nom, Yeg=YEG_nom, Yef=YEF_nom))
-    while length(samples) < cfg.samples
-        deltas = 1 .+ cfg.perturbation_fraction .* (2 .* rand(rng, 3) .- 1)
-        push!(samples, (
-            mu0 = MU0_nom * deltas[1],
-            Yeg = YEG_nom * deltas[2],
-            Yef = YEF_nom * deltas[3],
-        ))
-    end
-    return samples
-end
-
-function _compute_uptake_profile(sample; nfe::Int, horizon::Float64)
-    fe_len = horizon / max(1, nfe)
-    eval_times = collect(fe_len:fe_len:horizon)
-    mu_T = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
-    Kg_T = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
-    b_T  = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
-    mrate_val = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
-    function rhs!(du, u, p, t)
-        X, N, G, F, E = u
-        mu_val = sample.mu0 * mu_T * (N / (N + Kn0_nom * Kg_T + eps))
-        betaG = betaG0_nom * b_T *
-            (G / (G + Kg0_nom * Kg_T + eps)) *
-            (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
-        betaF = betaF0_nom * b_T *
-            (F / (F + Kf0_nom * Kg_T + eps)) *
-            (Kig0_nom * Kg_T / (G + Kig0_nom * Kg_T + eps)) *
-            (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
-        denom = G + F + eps
-        phiG = G / denom
-        phiF = F / denom
-        du[1] = (mu_val - death_rate(E)) * X
-        du[2] = -(mu_val / YXN_nom) * X
-        du[3] = -((mu_val / YXG_nom) + (betaG / sample.Yeg) + mrate_val * phiG) * X
-        du[4] = -((mu_val / YXF_nom) + (betaF / sample.Yef) + mrate_val * phiF) * X
-        du[5] = (betaG + betaF) * X
-        return nothing
-    end
-    profile = (glu=zeros(Float64, nfe), fru=zeros(Float64, nfe))
-    try
-        prob = ODEProblem(rhs!, copy(C0_INIT), (0.0, horizon))
-        sol = solve(prob, Rodas5(); reltol=1e-7, abstol=1e-9, saveat=max(fe_len / 5, 0.1))
-        for (idx, tval) in enumerate(eval_times)
-            state = sol(tval)
-            N = max(state[2], 1e-8)
-            G = max(state[3], 1e-8)
-            F = max(state[4], 1e-8)
-            E = max(state[5], 1e-8)
-            mu_val = sample.mu0 * mu_T * (N / (N + Kn0_nom * Kg_T + eps))
-            betaG = betaG0_nom * b_T *
-                (G / (G + Kg0_nom * Kg_T + eps)) *
-                (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
-            betaF = betaF0_nom * b_T *
-                (F / (F + Kf0_nom * Kg_T + eps)) *
-                (Kig0_nom * Kg_T / (G + Kig0_nom * Kg_T + eps)) *
-                (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
-            denom = G + F + eps
-            phiG = G / denom
-            phiF = F / denom
-            profile.glu[idx] = (mu_val / YXG_nom) + (betaG / sample.Yeg) + mrate_val * phiG
-            profile.fru[idx] = (mu_val / YXF_nom) + (betaF / sample.Yef) + mrate_val * phiF
-        end
-    catch err
-        @warn "[FVA] No se pudo integrar la ODE Zenteno para el FVA; se usaran tasas nominales." horizon nfe err
-        fallback_g = (MU0_nom / YXG_nom) + (betaG0_nom / YEG_nom)
-        fallback_f = (MU0_nom / YXF_nom) + (betaF0_nom / YEF_nom)
-        profile.glu .= fallback_g
-        profile.fru .= fallback_f
-    end
-    return profile
-end
-
-function _solve_single_variable!(model::Model, var::VariableRef, sense::MOI.OptimizationSense)
-    if sense == MOI.MIN_SENSE
-        @objective(model, Min, var)
-    else
-        @objective(model, Max, var)
-    end
-    optimize!(model)
-    status = termination_status(model)
-    if status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED
-        return value(var)
-    end
-    return NaN
-end
-
-function solve_pfba_fe!(
-        ws::PFBAWorkspace,
-        uptake_glu::Union{Nothing, Float64},
-        uptake_fru::Union{Nothing, Float64},
-        cfg::ReducedModeFVAConfig;
-        sample_idx::Int,
-        fe_idx::Int)
-    m = ws.model
-    if uptake_glu !== nothing && 1 <= glu <= nv
-        JuMP.set_lower_bound(ws.v[glu], uptake_glu)
-        JuMP.set_upper_bound(ws.v[glu], uptake_glu)
-    end
-    if uptake_fru !== nothing && 1 <= fru <= nv
-        JuMP.set_lower_bound(ws.v[fru], uptake_fru)
-        JuMP.set_upper_bound(ws.v[fru], uptake_fru)
-    end
-    growth_con = nothing
-    checked = 0
-    try
-        @objective(m, Max, ws.v[obj])
-        optimize!(m)
-        status = termination_status(m)
-        (status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED) || error("PFBA etapa 1 no convergio en muestra $sample_idx FE $fe_idx (status=$status)")
-        obj_val = value(ws.v[obj])
-        growth_con = @constraint(m, ws.v[obj] >= (1.0 - cfg.growth_gap) * obj_val)
-        @objective(m, Min, ws.sum_abs)
-        optimize!(m)
-        status = termination_status(m)
-        (status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED) || error("PFBA etapa 2 no convergio en muestra $sample_idx FE $fe_idx (status=$status)")
-        vstar = [value(ws.v[k]) for k in 1:nv]
-        Ai = Int[]
-        Fi = Int[]
-        near_zero = Int[]
-        for k in 1:nv
-            val = vstar[k]
-            if !isfinite(val)
-                push!(Fi, k)
-                continue
-            end
-            if abs(val) >= cfg.pfba_eps
-                push!(Ai, k)
-            else
-                push!(Fi, k)
-                if abs(val) < cfg.mag_thresh
-                    push!(near_zero, k)
-                end
-            end
-        end
-        if length(near_zero) > cfg.max_checks
-            println("[FVA]        Muestra $(sample_idx) FE $(fe_idx): se limitaran los analisis a $(cfg.max_checks) reacciones de $(length(near_zero)).")
-            near_zero = near_zero[1:cfg.max_checks]
-        elseif !isempty(near_zero)
-            println("[FVA]        Muestra $(sample_idx) FE $(fe_idx): ejecutando FVA sobre $(length(near_zero)) reacciones.")
-        end
-        Ci_extra = Int[]
-        checked = length(near_zero)
-        for (idx, k) in enumerate(near_zero)
-            lb_val = _solve_single_variable!(m, ws.v[k], MOI.MIN_SENSE)
-            ub_val = _solve_single_variable!(m, ws.v[k], MOI.MAX_SENSE)
-            if !isfinite(lb_val) || !isfinite(ub_val)
-                push!(Ci_extra, k)
-                println("[FVA]        Advertencia: FVA no determino rango para reaccion $k en muestra $(sample_idx) FE $(fe_idx); se mantendra como candidata.")
-                continue
-            end
-            if (ub_val - lb_val) > cfg.range_eps
-                push!(Ci_extra, k)
-            end
-            if (idx % FVA_INNER_PROGRESS == 0) || idx == length(near_zero)
-                println("[FVA]          Avance FVA muestra $(sample_idx) FE $(fe_idx): $(idx)/$(length(near_zero)) reacciones evaluadas (ultima=$k).")
-            end
-        end
-        Ci = vcat(Ai, Ci_extra)
-        _sorted_unique!(Ai)
-        _sorted_unique!(Ci)
-        if !isempty(Ci_extra)
-            Fi = setdiff(Fi, Ci_extra)
-        end
-        _sorted_unique!(Fi)
-        return Ai, Ci, Fi, checked
-    finally
-        growth_con !== nothing && JuMP.delete(m, growth_con)
-        @objective(m, Max, ws.v[obj])
-    end
-end
-
-function run_reduced_mode_fva_pipeline(cfg::ReducedModeFVAConfig)
-    println("[FVA] ------------------------------------------------------------")
-    println("[FVA] Lanzando pipeline FVA para reduced mode.")
-    println("[FVA] Horizonte=$(cfg.horizon) h | nfe=$(cfg.nfe) | muestras=$(cfg.samples) | perturbacion=±$(round(cfg.perturbation_fraction * 100; digits=2))%")
-    samples = _sample_parameter_sets(cfg)
-    workspace = _build_pfba_workspace()
-    A_acc = [Int[] for _ in 1:cfg.nfe]
-    C_acc = [Int[] for _ in 1:cfg.nfe]
-    F_acc = Vector{Union{Nothing, Set{Int}}}(undef, cfg.nfe)
-    fill!(F_acc, nothing)
-    for (sample_idx, sample) in enumerate(samples)
-        println("[FVA] Muestra $(sample_idx)/$(length(samples)) -> mu0=$(round(sample.mu0; digits=5)), Yeg=$(round(sample.Yeg; digits=5)), Yef=$(round(sample.Yef; digits=5))")
-        profile = _compute_uptake_profile(sample; nfe=cfg.nfe, horizon=cfg.horizon)
-        for fe_idx in 1:cfg.nfe
-            uptake_glu =  (1 <= glu <= nv) ? clamp(-profile.glu[fe_idx], lb[glu], ub[glu]) : nothing
-            uptake_fru =  (1 <= fru <= nv) ? clamp(-profile.fru[fe_idx], lb[fru], ub[fru]) : nothing
-            Ai, Ci, Fi, checked = solve_pfba_fe!(workspace, uptake_glu, uptake_fru, cfg;
-                sample_idx=sample_idx, fe_idx=fe_idx)
-            append!(A_acc[fe_idx], Ai)
-            append!(C_acc[fe_idx], Ci)
-            Fi_set = Set(Fi)
-            if F_acc[fe_idx] === nothing
-                F_acc[fe_idx] = Fi_set
-            else
-                intersect!(F_acc[fe_idx], Fi_set)
-            end
-            if (fe_idx % cfg.progress_step == 0) || fe_idx == cfg.nfe
-                println("[FVA]    FE $(fe_idx)/$(cfg.nfe) (muestra $(sample_idx)): |A|=$(length(Ai)) |C|=$(length(Ci)) |F|=$(length(Fi)) FVA_checks=$checked")
-            end
-        end
-    end
-    for i in 1:cfg.nfe
-        _sorted_unique!(A_acc[i])
-        _sorted_unique!(C_acc[i])
-    end
-    F_final = Vector{Vector{Int}}(undef, cfg.nfe)
-    for i in 1:cfg.nfe
-        if F_acc[i] === nothing
-            F_final[i] = sort!(setdiff(collect(1:nv), C_acc[i]))
-        else
-            F_final[i] = sort!(collect(F_acc[i]))
-        end
-    end
-    out_dir = dirname(cfg.results_path)
-    isdir(out_dir) || mkpath(out_dir)
-    metadata = Dict(
-        "timestamp" => string(Dates.now()),
-        "horizon" => cfg.horizon,
-        "nfe" => cfg.nfe,
-        "samples" => length(samples),
-        "perturbation_fraction" => cfg.perturbation_fraction,
-        "pfba_eps" => cfg.pfba_eps,
-        "range_eps" => cfg.range_eps,
-        "mag_thresh" => cfg.mag_thresh,
-        "max_checks" => cfg.max_checks,
-    )
-    save(cfg.results_path, "A", A_acc, "C", C_acc, "F", F_final, "metadata", metadata)
-    println("[FVA] Reduced sets guardados en $(cfg.results_path)")
-    for i in 1:cfg.nfe
-        println("[FVA]    FE $(i): |A|=$(length(A_acc[i])) |C|=$(length(C_acc[i])) |F|=$(length(F_final[i]))")
-    end
-    maybe_write_fva_metadata(cfg)
-    println("[FVA] ------------------------------------------------------------")
-    return (A_acc, C_acc, F_final)
-end
-
-need_auto_reduction = AUTO_BUILD_REDUCED && REDUCED_MODE && !isfile(REDUCED_SETS_PATH)
-pipeline_sets = nothing
-if RUN_FVA_REDUCTION_REQUEST || need_auto_reduction
-    cfg = ReducedModeFVAConfig(
-        th,
-        nfe,
-        FVA_PARAM_SAMPLES,
-        FVA_PERTURB_FRACTION,
-        FVA_PFBA_EPS,
-        FVA_MAG_THRESH,
-        FVA_RANGE_EPS,
-        FVA_MAX_CHECKS,
-        FVA_GROWTH_GAP,
-        FVA_PROGRESS_STEP,
-        FVA_RESULTS_PATH,
-        FVA_PARAM_SEED,
-    )
-    try
-        global pipeline_sets = run_reduced_mode_fva_pipeline(cfg)
-    catch err
-        @warn "[FVA] Pipeline reduced-mode fallo; se intentara cargar conjuntos existentes" err
-        global pipeline_sets = nothing
-    end
-end
-
-const reduced_sets = begin
-    if REDUCED_MODE
-        if pipeline_sets === nothing
-            _load_reduced_sets(REDUCED_SETS_PATH)
-        else
-            pipeline_sets
-        end
-    else
-        nothing
-    end
-end
-if REDUCED_MODE && reduced_sets === nothing
-    @warn "REDUCED_MODE=1 sin reduced_sets.jld2; se usara el modelo completo" REDUCED_SETS_PATH
-end
-
 
 function _build_reduced_axes()
     if !REDUCED_MODE || reduced_sets === nothing
@@ -657,30 +442,8 @@ const radau_nodes = (0.15505, 0.64495, 1.0)
 Random.seed!(NOISE_SEED)
 
 # ---------------------------------------------
-# Configuracion Ipopt/Pardiso
+# Configuracion Ipopt
 # ---------------------------------------------
-
-function configure_pardiso_defaults()
-    solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
-    !(solver in ("pardiso", "pardisomkl")) && return
-    set_default!(name::AbstractString, value::AbstractString) =
-        isempty(strip(get(ENV, name, ""))) && (ENV[name] = value)
-
-    set_default!("PARDISO_MTYPE", "-2")
-    set_default!("PARDISO_IPARM_0", "1")
-    set_default!("PARDISO_IPARM_1", "2")
-    set_default!("PARDISO_IPARM_4", "0")
-    set_default!("PARDISO_IPARM_7", "2")
-    set_default!("PARDISO_IPARM_9", "13")
-    set_default!("PARDISO_IPARM_10", "1")
-    set_default!("PARDISO_IPARM_12", "1")
-    set_default!("PARDISO_IPARM_18", "-1")
-    set_default!("PARDISO_IPARM_24", "1")
-    set_default!("PARDISO_IPARM_26", "1")
-    set_default!("PARDISO_IPARM_34", "1")
-    set_default!("PARDISO_IPARM_59", "1")
-    println("[IPOPT] Pardiso defaults configured.")
-end
 
 function configure_custom_ipopt()
     get(ENV, "USE_DEFAULT_IPOPT", "0") == "1" && return
@@ -727,82 +490,9 @@ function configure_custom_ipopt()
     if dll_dir != root
         ENV["PATH"] = root * ";" * ENV["PATH"]
     end
-
-    pard_dir = get(ENV, "IPOPT_PARDISO_DLL_DIR", get(ENV, "PARDISO_DLL_DIR", ""))
-    if isempty(strip(pard_dir))
-        for p in parent_chain(BASE_DIR)
-            dirs = filter(d -> startswith(lowercase(basename(d)), "panua-pardiso"), readdir(p; join=true))
-            for d in dirs
-                if isfile(joinpath(d, "lib", "libpardiso.dll")) || isfile(joinpath(d, "libpardiso.dll"))
-                    pard_dir = d
-                    ENV["PARDISO_DLL_DIR"] = pard_dir
-                    println("[IPOPT] Auto-detected PARDISO_DLL_DIR=", pard_dir)
-                    break
-                end
-            end
-            !isempty(strip(pard_dir)) && break
-        end
-    end
-    if !isempty(strip(pard_dir)) && isdir(pard_dir)
-        pard_lib_dir = isdir(joinpath(pard_dir, "lib")) ? joinpath(pard_dir, "lib") : pard_dir
-        if isfile(joinpath(pard_lib_dir, "libpardiso.dll"))
-            ENV["PATH"] = pard_lib_dir * ";" * get(ENV, "PATH", "")
-            pard_root_bin = joinpath(pard_dir, "bin")
-            if isdir(pard_root_bin)
-                ENV["PATH"] = pard_root_bin * ";" * ENV["PATH"]
-            end
-            if pard_lib_dir != pard_dir
-                ENV["PATH"] = pard_dir * ";" * ENV["PATH"]
-            end
-            if isempty(strip(get(ENV, "PARDISO_LIC_PATH", ""))) && isempty(strip(get(ENV, "PARDISO_LICENSE_FILE", "")))
-                lic_path = ""
-                lic_file = ""
-                candidates = String[]
-                push!(candidates, pard_dir)
-                for p in parent_chain(BASE_DIR)
-                    push!(candidates, p)
-                    push!(candidates, joinpath(p, "panua-licenses"))
-                end
-                for d in candidates
-                    f = joinpath(d, "panua.lic")
-                    if isfile(f)
-                        lic_path = d
-                        lic_file = f
-                        break
-                    end
-                end
-                if !isempty(lic_path)
-                    ENV["PARDISO_LIC_PATH"] = lic_path
-                    ENV["PARDISO_LICENSE_FILE"] = lic_file
-                    println("[IPOPT] Found panua.lic at ", lic_file)
-                else
-                    println("[IPOPT] WARNING: panua.lic not found.")
-                end
-            end
-        else
-            println("[IPOPT] Pardiso directory found but libpardiso.dll missing: ", pard_lib_dir)
-        end
-    end
-    if isempty(strip(get(ENV, "PARDISOLICMESSAGE", "")))
-        ENV["PARDISOLICMESSAGE"] = "1"
-    end
-    if isempty(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
-        ENV["IPOPT_LINEAR_SOLVER"] = "pardiso"
-    end
-    configure_pardiso_defaults()
     println("[IPOPT] Custom Ipopt library: ", cand_lib)
 end
-
-function maybe_enable_pardiso_from_env!()
-    flag = lowercase(strip(get(ENV, "MPCC_USE_PARDISO", "0")))
-    if flag in ("1", "true", "yes", "pardiso")
-        ENV["IPOPT_LINEAR_SOLVER"] = strip(get(ENV, "IPOPT_LINEAR_SOLVER", "pardiso"))
-    end
-end
-
-maybe_enable_pardiso_from_env!()
 configure_custom_ipopt()
-configure_pardiso_defaults()
 
 # ---------------------------------------------
 # Herramientas de simulacion/plot
@@ -845,6 +535,7 @@ struct ZentenoPlotParams
     mu0::Float64
     Yeg::Float64
     Yef::Float64
+    Tfun::Function
 end
 
 function build_time_grid_from_lengths(lengths::AbstractVector{<:Real})
@@ -863,10 +554,11 @@ const DATA_TIME_GRID = build_time_grid_from_lengths(fill(h, nfe))
 
 function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     X, N, G, F, E = u
-    mu_T =  exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
-    Kg_T =  exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
-    b_T  =  exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
-    mrate = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
+    T = p.Tfun(t)
+    mu_T =  exp(59453.0 * (T - 300.0) / (300.0 * R * T))
+    Kg_T =  exp(46055.0 * (T - 293.15) / (293.15 * R * T))
+    b_T  =  exp(11000.0 * (T - 296.15) / (296.15 * R * T))
+    mrate = 0.01 * exp(37681.0 * (T - 293.30) / (293.30 * R * T))
     denom = G + F + eps
     phiG = G / denom
     phiF = F / denom
@@ -879,8 +571,8 @@ function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
         (Kig0_nom * Kg_T / (G + Kig0_nom * Kg_T + eps)) *
         (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
     Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
-    s_sw = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
-    Kd_val = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * s_sw
+    s_sw = 0.5 * (1.0 + tanh(0.5 * (T - Td)))
+    Kd_val = Kd0_nom * exp(0.0415 * E + (130000.0 * (T - 305.65)) / (305.65 * R * T)) * s_sw
     du[1] = (mu - Kd_val) * X
     du[2] = -(mu / YXN_nom) * X
     du[3] = -((mu / YXG_nom) + (betaG / p.Yeg) + mrate * phiG) * X
@@ -931,6 +623,16 @@ function plot_post_solution(t_pre, states_pre, t_post, states_post, tgrid_data, 
 end
 
 function _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
+    prod_series = _build_ethyl_acetate_production_series(mpcc_tgrid, mpcc_states, v_var)
+    prod_series === nothing && return nothing
+    times = prod_series.times
+    rates = prod_series.rates_mmol
+    isempty(times) && return nothing
+    concentrations = _cumulative_trapezoid(times, rates)
+    return (times=times, concentrations=concentrations)
+end
+
+function _build_ethyl_acetate_production_series(mpcc_tgrid, mpcc_states, v_var)
     if mpcc_tgrid === nothing || mpcc_states === nothing
         return nothing
     end
@@ -958,9 +660,7 @@ function _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
     time_rate = _build_time_rate_arrays(mpcc_tgrid, mpcc_states, flux_vals)
     time_rate === nothing && return nothing
     times, rates = time_rate
-    isempty(times) && return nothing
-    concentrations = _cumulative_trapezoid(times, rates)
-    return (times=times, concentrations=concentrations)
+    return (times=times, rates_mmol=rates, rates_g=rates .* (MOLAR_MASS_ETHYL_ACETATE / 1000.0))
 end
 
 function _build_time_rate_arrays(mpcc_tgrid, mpcc_states, flux_values)
@@ -1001,6 +701,51 @@ function _cumulative_trapezoid(times, values)
     return concentrations
 end
 
+function _deduplicate_series(times::Vector{Float64}, values::Vector{Vector{Float64}}; atol::Float64=1e-8)
+    isempty(times) && return times, values
+    unique_times = Float64[]
+    unique_vals = [Float64[] for _ in values]
+    last_t = NaN
+    for (i, t) in enumerate(times)
+        if i == 1 || abs(t - last_t) > atol
+            push!(unique_times, t)
+            for (arr, v) in zip(unique_vals, values)
+                push!(arr, v[i])
+            end
+            last_t = t
+        else
+            for (arr, v) in zip(unique_vals, values)
+                arr[end] = v[i]
+            end
+        end
+    end
+    return unique_times, unique_vals
+end
+
+function _build_piecewise_linear(times::Vector{Float64}, values::Vector{Float64}; default::Float64=0.0)
+    n = length(times)
+    if n == 0
+        return (t -> default)
+    elseif n == 1
+        val = values[1]
+        return (t -> val)
+    end
+    function f(t)
+        if t <= times[1]
+            return values[1]
+        elseif t >= times[end]
+            return values[end]
+        end
+        k = clamp(searchsortedlast(times, t), 1, n-1)
+        t0 = times[k]; t1 = times[k+1]
+        v0 = values[k]; v1 = values[k+1]
+        dt = t1 - t0
+        dt == 0.0 && return v0
+        return v0 + (v1 - v0) * (t - t0) / dt
+    end
+    return f
+end
+
 function _natural_cubic_coefficients(x::Vector{Float64}, y::Vector{Float64})
     n = length(x)
     @assert n == length(y)
@@ -1035,6 +780,103 @@ function _evaluate_natural_cubic(coeffs, t::Float64)
     return coeffs.a[idx] + coeffs.b[idx] * delta_t + coeffs.c[idx] * delta_t^2 + coeffs.d[idx] * delta_t^3
 end
 
+function _build_cubic_interpolant(times::Vector{Float64}, values::Vector{Float64})
+    n = length(times)
+    if n == 0
+        return (t -> 0.0)
+    elseif n == 1
+        val = values[1]
+        return (t -> val)
+    end
+    coeffs = _natural_cubic_coefficients(times, values)
+    tmin, tmax = times[1], times[end]
+    return t -> _evaluate_natural_cubic(coeffs, clamp(t, tmin, tmax))
+end
+
+function _build_state_interpolator(mpcc_tgrid, mpcc_states)
+    nt = length(mpcc_tgrid)
+    flat_times = vec(mpcc_tgrid)
+    perm = sortperm(flat_times)
+    sorted_times = Float64.(flat_times[perm])
+    state_vals = [Float64.(reshape(mpcc_states[l, :, :], nt))[perm] for l in 1:nc]
+    clean_times, clean_vals = _deduplicate_series(sorted_times, state_vals)
+    interpolants = [_build_cubic_interpolant(clean_times, clean_vals[l]) for l in 1:nc]
+    tspan = (clean_times[1], clean_times[end])
+    function state_at(t)
+        tt = clamp(t, tspan[1], tspan[2])
+        vals = similar(C0_INIT)
+        for l in 1:nc
+            vals[l] = interpolants[l](tt)
+        end
+        return vals
+    end
+    return state_at, tspan
+end
+
+function _build_co2_flow_function(state_fun, params::ZentenoPlotParams; V_liq::Float64, tspan::Tuple{Float64,Float64})
+    function co2_func(t)
+        tt = clamp(t, tspan[1], tspan[2])
+        u = state_fun(tt)
+        du = zeros(length(u))
+        zenteno_ode!(du, u, params, tt)
+        mass_CO2_h = max(du[5], 0.0) * V_liq * 0.95
+        Tloc = params.Tfun(tt)
+        vol_CO2_h = (mass_CO2_h / 44.01) * R * Tloc / P_ATM * 1000.0
+        return max(vol_CO2_h, 0.0)
+    end
+    return co2_func
+end
+
+function _build_partition_function(state_fun; activity_model=MODEL_UNIFAC)
+    function part_func(t)
+        state = state_fun(t)
+        E = max(state[5], 0.0)
+        total_mass = 1000.0
+        w_eth = clamp(E / total_mass, 0.0, 0.8)
+        w_water = max(1.0 - w_eth - 1e-6, 1e-6)
+        moles = [w_water/18.015, w_eth/46.07, 1e-6/MOLAR_MASS_ETHYL_ACETATE]
+        x_molar = moles ./ sum(moles)
+        return calculate_partition_coefficient(activity_model, T_PROFILE(t), x_molar)
+    end
+    return part_func
+end
+
+function _build_save_times(prod_times::Vector{Float64}, tspan_states::Tuple{Float64,Float64})
+    dense = collect(range(tspan_states[1], tspan_states[2]; length=200))
+    return sort(unique(vcat(prod_times, dense)))
+end
+
+function _simulate_ethyl_acetate_with_stripping(mpcc_tgrid, mpcc_states, v_var, params::ZentenoPlotParams;
+        V_liq::Float64=FERMENTER_VOLUME_L, activity_model=MODEL_UNIFAC)
+    prod_series = _build_ethyl_acetate_production_series(mpcc_tgrid, mpcc_states, v_var)
+    prod_series === nothing && return nothing
+    prod_times = Float64.(prod_series.times)
+    prod_rates_g = Float64.(prod_series.rates_mmol) .* (MOLAR_MASS_ETHYL_ACETATE / 1000.0)
+    isempty(prod_times) && return nothing
+    state_fun, tspan_states = _build_state_interpolator(mpcc_tgrid, mpcc_states)
+    prod_func = _build_piecewise_linear(prod_times, prod_rates_g; default=0.0)
+    co2_func = _build_co2_flow_function(state_fun, params; V_liq=V_liq, tspan=tspan_states)
+    part_func = _build_partition_function(state_fun; activity_model=activity_model)
+    tspan = (min(prod_times[1], tspan_states[1]), max(prod_times[end], tspan_states[2]))
+    saveat = _build_save_times(prod_times, tspan_states)
+    function aroma_ode!(du, u, p, t)
+        C = max(u[1], 0.0)
+        prod = max(p.prod_func(t), 0.0)
+        K = max(p.part_func(t), 0.0)
+        Q = max(p.co2_func(t), 0.0)
+        loss_rate = (Q / p.V_liq) * K * C
+        du[1] = prod - loss_rate
+        du[2] = loss_rate * p.V_liq
+    end
+    ode_params = (prod_func=prod_func, co2_func=co2_func, part_func=part_func, V_liq=V_liq)
+    prob = ODEProblem(aroma_ode!, [0.0, 0.0], tspan, ode_params)
+    sol = solve(prob, Rodas5(autodiff=false); saveat=saveat, reltol=1e-8, abstol=1e-10, maxiters=1_000_000)
+    times = sol.t
+    conc = [sol.u[i][1] for i in 1:length(times)]
+    lost = [sol.u[i][2] for i in 1:length(times)]
+    return (times=times, concentration_gL=conc, lost_mass_g=lost, prod_times=prod_times, prod_rates_g=prod_rates_g)
+end
+
 function _sample_cubic_spline(times::Vector{Float64}, values::Vector{Float64}; nsamples::Int=400)
     n = length(times)
     if n < 2 || (times[end] - times[1]) <= 0
@@ -1049,25 +891,45 @@ function _sample_cubic_spline(times::Vector{Float64}, values::Vector{Float64}; n
     return ts, vals
 end
 
-function plot_ethyl_acetate_concentration(mpcc_tgrid, mpcc_states, v_var; title_str::AbstractString, save_path::AbstractString)
-    series = _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
+function plot_ethyl_acetate_concentration(mpcc_tgrid, mpcc_states, v_var, params::ZentenoPlotParams; title_str::AbstractString, save_path::AbstractString)
+    series = _simulate_ethyl_acetate_with_stripping(mpcc_tgrid, mpcc_states, v_var, params)
     if series === nothing
         @warn "No se pudo construir la serie de concentracion de ethyl acetate"
         return false
     end
-    times = Float64.(series.times)
-    concentrations_mmol = Float64.(series.concentrations)
-    isempty(times) && return false
-    concentrations_g = concentrations_mmol .* (MOLAR_MASS_ETHYL_ACETATE / 1000.0)
-    line_t, line_vals = _sample_cubic_spline(times, concentrations_g)
-    plt = plot(size=(900, 400))
-    scatter!(plt, times, concentrations_g;
-        color=:darkorange, ms=5, alpha=0.9, label="Colocaciones MPCC")
+    # Serie base del MPCC (sin perdida) en puntos de colocacion
+    base_series = _build_ethyl_acetate_series(mpcc_tgrid, mpcc_states, v_var)
+    if base_series === nothing
+        @warn "No se pudo construir la serie base de ethyl acetate"
+        return false
+    end
+
+    times_strip = Float64.(series.times)
+    conc_strip_mg = Float64.(series.concentration_gL) .* 1000.0
+    isempty(times_strip) && return false
+
+    times_base = Float64.(base_series.times)
+    conc_base_mg = Float64.(base_series.concentrations) .* MOLAR_MASS_ETHYL_ACETATE # mmol/L * g/mol -> g/L; *1000 -> mg/L
+    conc_base_mg .*= 1.0 # placeholder to emphasize units; already mg after factor above
+
+    # Re-evaluar solucion con perdida en los puntos de colocacion
+    colloc_times = vec(mpcc_tgrid)
+    perm_strip = sortperm(times_strip)
+    strip_interp = _build_cubic_interpolant(times_strip[perm_strip], conc_strip_mg[perm_strip])
+    conc_strip_colloc = strip_interp.(colloc_times)
+
+    line_t, line_vals = _sample_cubic_spline(times_strip, conc_strip_mg)
+    plt = plot(size=(950, 420))
+    scatter!(plt, times_base, conc_base_mg;
+        color=:darkorange, ms=5, alpha=0.9, label="MPCC sin perdida (mg/L)")
+    scatter!(plt, colloc_times, conc_strip_colloc;
+        color=:navy, ms=5, alpha=0.9, marker=:diamond, label="Con perdida (mg/L)")
     plot!(plt, line_t, line_vals;
-        color=:navy, lw=2, label="Spline interpolado")
+        color=:navy, lw=2.5, label="Interpolado con perdida")
     xlabel!(plt, "tiempo [h]")
-    ylabel!(plt, "concentración ethyl acetate [g/L]")
+    ylabel!(plt, "concentracion ethyl acetate [mg/L]")
     title!(plt, title_str)
+    plot!(plt, legend=:topright)
     savefig(plt, save_path)
     println("[PLOT] Guardado ", save_path)
     return true
@@ -1355,13 +1217,14 @@ function _simulate_zenteno_synthetic(; nfe::Int, ncp::Int, th::Float64, c0_vec::
     X = zeros(nc, nsteps)
     X[:, 1] .= c0_vec
 
-    mu_T_val  = exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
-    Kg_T_val  = exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
-    b_T_val   = exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
-    mrate_val = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
-
     for s in 1:(nsteps-1)
         x = X[1, s]; n = X[2, s]; g = X[3, s]; f = X[4, s]; e = X[5, s]
+
+        Tloc = T_PROFILE((s-1)*dt)
+        mu_T_val  = exp(59453.0 * (Tloc - 300.0) / (300.0 * R * Tloc))
+        Kg_T_val  = exp(46055.0 * (Tloc - 293.15) / (293.15 * R * Tloc))
+        b_T_val   = exp(11000.0 * (Tloc - 296.15) / (296.15 * R * Tloc))
+        mrate_val = 0.01 * exp(37681.0 * (Tloc - 293.30) / (293.30 * R * Tloc))
 
         mu_val = MU0_nom * mu_T_val * (n / (n + Kn0_nom * Kg_T_val + eps))
         betaG_val = betaG0_nom * b_T_val *
@@ -1373,8 +1236,8 @@ function _simulate_zenteno_synthetic(; nfe::Int, ncp::Int, th::Float64, c0_vec::
             (Kie0_nom * Kg_T_val / (e + Kie0_nom * Kg_T_val + eps))
 
         Td = -0.0001 * e^3 + 0.0049 * e^2 - 0.1279 * e + 315.89
-        s_sw = 0.5 * (1 + tanh(0.5 * (T_const - Td)))
-        Kd_val = Kd0_nom * exp(0.0415 * e + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * s_sw
+        s_sw = 0.5 * (1 + tanh(0.5 * (Tloc - Td)))
+        Kd_val = Kd0_nom * exp(0.0415 * e + (130000.0 * (Tloc - 305.65)) / (305.65 * R * Tloc)) * s_sw
 
         phiG = g / (g + f + eps)
         phiF = f / (g + f + eps)
@@ -1412,7 +1275,7 @@ data = _simulate_zenteno_synthetic(nfe=nfe, ncp=ncp, th=th, c0_vec=c0)
 t_pre = nothing
 states_pre = nothing
 try
-    pre_params = ZentenoPlotParams(exp(theta0[1]), exp(theta0[2]), exp(theta0[3]))
+    pre_params = ZentenoPlotParams(exp(theta0[1]), exp(theta0[2]), exp(theta0[3]), T_PROFILE)
     local_t_pre, local_states_pre = simulate_zenteno(pre_params)
     global t_pre = local_t_pre
     global states_pre = local_states_pre
@@ -1477,12 +1340,6 @@ end
     hv[1:nfe]
 end)
 
-if !ESTIMATE_PARAMETERS
-    for k in 1:np
-        JuMP.fix(teta[k], theta0[k]; force=true)
-    end
-end
-
 if !REDUCED_MODE || reduced_sets === nothing
     @variables(m, begin
         v[1:nv, 1:nfe]
@@ -1534,11 +1391,26 @@ end
     )
 )
 
-JuMP.register(m, :death_rate, 1, death_rate; autodiff = true)
-@NLexpression(m, mu_T, exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const)))
-@NLexpression(m, Kg_T, exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const)))
-@NLexpression(m, b_T,  exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const)))
-@NLexpression(m, mrate, 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const)))
+const T_STEP1_K = 15.0 + 273.15
+const T_STEP2_K = 18.0 + 273.15
+const T_STEP3_K = 23.0 + 273.15
+
+@NLexpression(m, t_prefix[i=1:ph], sum(hv[k] for k in 1:(i-1)))
+@NLexpression(m, t_colloc[i=1:ph, j=1:ncp], t_prefix[i] + radau_nodes[j] * hv[i])
+@NLexpression(m, T_s1[i=1:ph, j=1:ncp],
+    0.5 * (1.0 + tanh((t_colloc[i,j] - 24.0) / TEMP_TRANSITION_WIDTH_H)))
+@NLexpression(m, T_s2[i=1:ph, j=1:ncp],
+    0.5 * (1.0 + tanh((t_colloc[i,j] - 48.0) / TEMP_TRANSITION_WIDTH_H)))
+@NLexpression(m, T_loc[i=1:ph, j=1:ncp],
+    T_STEP1_K + (T_STEP2_K - T_STEP1_K) * T_s1[i,j] + (T_STEP3_K - T_STEP2_K) * T_s2[i,j])
+@NLexpression(m, mu_T[i=1:ph, j=1:ncp],
+    exp(59453.0 * (T_loc[i,j] - 300.0) / (300.0 * R * T_loc[i,j])))
+@NLexpression(m, Kg_T[i=1:ph, j=1:ncp],
+    exp(46055.0 * (T_loc[i,j] - 293.15) / (293.15 * R * T_loc[i,j])))
+@NLexpression(m, b_T[i=1:ph, j=1:ncp],
+    exp(11000.0 * (T_loc[i,j] - 296.15) / (296.15 * R * T_loc[i,j])))
+@NLexpression(m, mrate[i=1:ph, j=1:ncp],
+    0.01 * exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j])))
 
 @NLexpression(m, mu0, exp(teta[1]))
 @NLexpression(m, Yeg, exp(teta[2]))
@@ -1549,22 +1421,23 @@ const Yxg = YXG_nom
 const Yxf = YXF_nom
 
 @NLexpression(m, mu_j[i=1:ph, j=1:ncp],
-    mu0 * mu_T * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T + eps))
+    mu0 * mu_T[i,j] * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T[i,j] + eps))
 )
 @NLexpression(m, betaG_j[i=1:ph, j=1:ncp],
-    betaG0_nom * b_T *
-    (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T + eps)) *
-    (Kie0_nom * Kg_T / (c[5,i,j] + Kie0_nom * Kg_T + eps))
+    betaG0_nom * b_T[i,j] *
+    (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T[i,j] + eps)) *
+    (Kie0_nom * Kg_T[i,j] / (c[5,i,j] + Kie0_nom * Kg_T[i,j] + eps))
 )
 @NLexpression(m, betaF_j[i=1:ph, j=1:ncp],
-    betaF0_nom * b_T *
-    (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T + eps)) *
-    (Kig0_nom * Kg_T / (c[3,i,j] + Kig0_nom * Kg_T + eps)) *
-    (Kie0_nom * Kg_T / (c[5,i,j] + Kie0_nom * Kg_T + eps))
+    betaF0_nom * b_T[i,j] *
+    (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T[i,j] + eps)) *
+    (Kig0_nom * Kg_T[i,j] / (c[3,i,j] + Kig0_nom * Kg_T[i,j] + eps)) *
+    (Kie0_nom * Kg_T[i,j] / (c[5,i,j] + Kie0_nom * Kg_T[i,j] + eps))
 )
 @NLexpression(m, phiG_j[i=1:ph, j=1:ncp], c[3,i,j] / (c[3,i,j] + c[4,i,j] + eps))
 @NLexpression(m, phiF_j[i=1:ph, j=1:ncp], c[4,i,j] / (c[3,i,j] + c[4,i,j] + eps))
-@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate(c[5,i,j]))
+JuMP.register(m, :death_rate_T, 2, death_rate_T; autodiff = true)
+@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate_T(c[5,i,j], T_loc[i,j]))
 
 @constraints(m, begin
     coll_c_n[l=1:nc, i=2:ph, j=1:ncp],
@@ -1572,8 +1445,7 @@ const Yxf = YXF_nom
     coll_c_0[l=1:nc, j=1:ncp],
         c[l,1,j] == c0[l] + hv[1] * sum(colmat[j,k] * cdot[l,1,k] for k in 1:ncp)
 
-    teta_LB[p=1:np], teta[p] >= LB[p]
-    teta_UB[p=1:np], teta[p] <= UB[p]
+    teta_fix[p=1:np], teta[p] == theta0[p]
 
     c_LB[l=1:nc, i=1:nfe, j=1:ncp], STATE_MIN_CONC[l] - c[l,i,j] <= 0
 
@@ -1668,12 +1540,12 @@ for i in 1:ph, j in 1:ncp
         @constraint(m, cdot[2,i,j] == 0.0)
     end
     if state_is_active(3, i)
-        @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate * phiG_j[i,j]) * c[1,i,j])
+        @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate[i,j] * phiG_j[i,j]) * c[1,i,j])
     else
         @constraint(m, cdot[3,i,j] == 0.0)
     end
     if state_is_active(4, i)
-        @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate * phiF_j[i,j]) * c[1,i,j])
+        @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate[i,j] * phiF_j[i,j]) * c[1,i,j])
     else
         @constraint(m, cdot[4,i,j] == 0.0)
     end
@@ -1682,6 +1554,11 @@ for i in 1:ph, j in 1:ncp
     else
         @constraint(m, cdot[5,i,j] == 0.0)
     end
+    @constraint(m, c[1,i,j] >= STATE_MIN_CONC[1])
+    @constraint(m, c[2,i,j] >= STATE_MIN_CONC[2])
+    @constraint(m, c[3,i,j] >= STATE_MIN_CONC[3])
+    @constraint(m, c[4,i,j] >= STATE_MIN_CONC[4])
+    @constraint(m, c[5,i,j] >= STATE_MIN_CONC[5])
 end
 
 @NLconstraints(m, begin
@@ -1746,7 +1623,7 @@ try
     mu_log  = safe_value(teta[1], theta0[1])
     yeg_log = safe_value(teta[2], theta0[2])
     yef_log = safe_value(teta[3], theta0[3])
-    post_params = ZentenoPlotParams(exp(mu_log), exp(yeg_log), exp(yef_log))
+    post_params = ZentenoPlotParams(exp(mu_log), exp(yeg_log), exp(yef_log), T_PROFILE)
     hv_vals = [safe_value(hv[i], hm[i]) for i in 1:nfe]
     mpcc_tgrid = build_time_grid_from_lengths(hv_vals)
     mpcc_states = Array{Float64}(undef, nc, nfe, ncp)
@@ -1761,7 +1638,7 @@ try
         save_path=plot_output_path,
     )
     plot_ethyl_acetate_concentration(
-        mpcc_tgrid, mpcc_states, v;
+        mpcc_tgrid, mpcc_states, v, post_params;
         title_str="Ethyl acetate MPCC: $(status) / $(pr_status)",
         save_path=result_prefix * "_ethyl_acetate.png",
     )

@@ -1,0 +1,88 @@
+{
+  "script": "MPCC/De Oliveira 2023/Yeast_83/estima/MPCC_Zenteno_basic.jl",
+  "mpcc_grid": {
+    "nfe": 12,
+    "ncp": 3,
+    "horizon_h": 72.0,
+    "hm_reference": "uniform (72/12)"
+  },
+  "thermo_conditions": {
+    "T_const_K": 293.15,
+    "R": 8.314
+  },
+  "initial_states": {
+    "X0": 0.5,
+    "N0": 0.14,
+    "G0": 110.0,
+    "F0": 110.0,
+    "E0": 0.0
+  },
+  "parameter_estimation": {
+    "estimated_logs": [
+      "mu0",
+      "Yeg",
+      "Yef"
+    ],
+    "theta0": [
+      0.1,
+      0.1,
+      0.8
+    ],
+    "bounds": {
+      "LB": [
+        -2.647437344060862,
+        -2.6498048781620227,
+        -0.7243076648095695
+      ],
+      "UB": [
+        -1.2611429829409715,
+        -1.2635105170421321,
+        0.6619866963103211
+      ]
+    }
+  },
+  "nominal_parameters": {
+    "mu0": 0.141665,
+    "YXN": 9.80576,
+    "YXG": 0.394345,
+    "YXF": 0.18622,
+    "YEG": 0.14133,
+    "YEF": 0.96932,
+    "Kn0": 0.226882,
+    "Kg0": 3.1514,
+    "Kf0": 2.97625,
+    "Kig0": 29.5276,
+    "Kie0": 2.99809,
+    "Kd0": 0.0000311736,
+    "betaG0": 1.41182,
+    "betaF0": 8.49482
+  },
+  "fva_pipeline_config": {
+    "samples": 6,
+    "perturbation_fraction": 0.2,
+    "seed": 2025,
+    "pfba_eps": 1e-7,
+    "mag_thresh": 1e-5,
+    "range_eps": 1e-6,
+    "max_checks": 600,
+    "progress_step": 1,
+    "inner_progress": 50,
+    "growth_gap": 1e-6,
+    "results_path": "julia_deploy/results/reduced_sets.jld2"
+  },
+  "solver_selection_order": [
+    "HiGHS",
+    "GLPK",
+    "Clp",
+    "Ipopt (fallback)"
+  ],
+  "notes": {
+    "comment": "FVA only reruns if RUN_FVA_REDUCTION=1 or (REDUCED_MODE=1 and AUTO_BUILD_REDUCED=1 with missing reduced_sets.jld2)",
+    "saved_sets": [
+      "A",
+      "C",
+      "F",
+      "metadata"
+    ]
+  }
+}
