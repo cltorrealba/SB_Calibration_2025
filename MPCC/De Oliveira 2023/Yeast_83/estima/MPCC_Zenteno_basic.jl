@@ -124,6 +124,7 @@ const betaF0_nom = 8.49482
 const R = 8.314
 const T_const = try parse(Float64, get(ENV, "T_CONST", "293.15")) catch; 293.15 end
 const eps = 1e-9
+const MPCC_RELAX_TOL = 1e-3
 
 death_rate(E) = begin
     Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
@@ -139,14 +140,15 @@ LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom])
 UB = log.([2.0*MU0_nom, 2.0*YEG_nom, 2.0*YEF_nom])
 
 # Condiciones iniciales
-X0 = 0.5; N0 = 0.14; G0 = 110.0; F0 = 110.0; E0 = 0.0
+# X0 = 0.5; N0 = 0.14; G0 = 110.0; F0 = 110.0; E0 = 0.0
+X0 = 0.5; N0 = 0.14; G0 = 15.0;  F0 = 15.0;  E0 = 0.0  # <-- USAR ESTO
 const C0_INIT = [X0, N0, G0, F0, E0]
 c0 = copy(C0_INIT)
 
 # Discretizacion
-nfe = 12
+nfe = 10
 ncp = 3
-th  = 240.0
+th  = 50.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
@@ -1004,8 +1006,6 @@ if !REDUCED_MODE || reduced_sets === nothing
         lambda_[1:nm, 1:nfe]
         alpha_U[1:nv, 1:nfe]
         alpha_L[1:nv, 1:nfe]
-        FO_U[1:nv, 1:nfe]
-        FO_L[1:nv, 1:nfe]
     end)
 else
     @variables(m, begin
@@ -1013,22 +1013,22 @@ else
         lambda_[M_AX, 1:nfe]
         alpha_U[K_AX, 1:nfe]
         alpha_L[K_AX, 1:nfe]
-        FO_U[K_AX, 1:nfe]
-        FO_L[K_AX, 1:nfe]
     end)
 end
 
 @variables(m, begin
     alpha_upt[1:n_up, 1:nfe]
-    FO_upt[1:n_up, 1:nfe]
 end)
 
 for k in 1:np
     set_start_value(teta[k], theta0[k])
 end
 
+# Inicialización con datos sintéticos como warm start estable
 for i in 1:ph, j in 1:ncp, l in 1:nc
-    set_start_value(c[l, i, j], max(c0[l], STATE_MIN_CONC[l]))
+    val_init = data[l, i, j]
+    val_init = max(val_init, STATE_MIN_CONC[l])
+    set_start_value(c[l, i, j], val_init)
     set_start_value(cdot[l, i, j], 0.0)
 end
 for i in 1:nfe
@@ -1040,14 +1040,7 @@ for i in 1:nc
     c0[i] = max(c0[i], STATE_MIN_CONC[i])
 end
 
-@NLobjective(m, Min,
-    omega * FO +
-    sum(
-        sum(-phi1 * FO_L[mc, i] - phi3 * FO_U[mc, i] for mc in FLUX_INDEX_SET) +
-        phi2 * FO_upt[1, i] + phi2 * FO_upt[2, i]
-        for i in 1:nfe
-    )
-)
+@NLobjective(m, Min, omega * FO)
 
 JuMP.register(m, :death_rate, 1, death_rate; autodiff = true)
 @NLexpression(m, mu_T, exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const)))
@@ -1226,8 +1219,10 @@ for i in 1:ph, j in 1:ncp
 end
 
 @NLconstraints(m, begin
-    FO3_upt[i=1:nfe], FO_upt[1,i] == (-v[glu,i]*vs[glu]) * alpha_upt[1,i]
-    FO4_upt[i=1:nfe], FO_upt[2,i] == (-v[fru,i]*vs[fru]) * alpha_upt[2,i]
+    FO3_upt_relax[i=1:nfe],
+        (-v[glu,i]*vs[glu]) * alpha_upt[1,i] >= -MPCC_RELAX_TOL
+    FO4_upt_relax[i=1:nfe],
+        (-v[fru,i]*vs[fru]) * alpha_upt[2,i] >= -MPCC_RELAX_TOL
 
     FO_def,
         FO == sum((data[l,i,j] - c[l,i,j])^2 for l in MEAS_STATES, i in 1:ph, j in 1:ncp)
@@ -1235,13 +1230,17 @@ end)
 
 if !REDUCED_MODE || reduced_sets === nothing
     @NLconstraints(m, begin
-        FO1[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i]
-        FO2[mc=1:nv, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+        FO1_relax[mc=1:nv, i=1:nfe],
+            (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i] >= -MPCC_RELAX_TOL
+        FO2_relax[mc=1:nv, i=1:nfe],
+            (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i] >= -MPCC_RELAX_TOL
     end)
 else
     @NLconstraints(m, begin
-        FO1_red[mc=K_AX, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i]
-        FO2_red[mc=K_AX, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+        FO1_red_relax[mc=K_AX, i=1:nfe],
+            (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i] >= -MPCC_RELAX_TOL
+        FO2_red_relax[mc=K_AX, i=1:nfe],
+            (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i] >= -MPCC_RELAX_TOL
     end)
 end
 
