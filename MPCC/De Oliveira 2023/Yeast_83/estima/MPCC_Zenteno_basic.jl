@@ -369,9 +369,9 @@ const STATE_LABELS = ("X", "N", "G", "F", "E")
 const STATE_COLORS = (:royalblue, :forestgreen, :firebrick, :darkorange, :purple)
 const STATE_MIN_CONC = (
     1e-6,  # X: biomasa no debe anularse numéricamente
-    1e-5,  # N: nitrógeno puede agotarse pero mantenemos piso suave
-    1e-4,  # G: glucosa
-    1e-4,  # F: fructosa
+    0.0,   # N: nitrógeno puede agotarse libremente
+    0.0,   # G: glucosa
+    0.0,   # F: fructosa
     1e-6,  # E: etanol
 )
 const FREEZE_DEPLETED_STATES = get(ENV, "FREEZE_DEPLETED_STATES", "1") == "1"
@@ -1099,11 +1099,31 @@ const Yxf = YXF_nom
     alpha4_LB[mc=1:n_up, i=1:nfe], alpha_upt[mc,i] <= 0
 end)
 
+# Constante de suavizado (Monod-like) para evitar división por cero
+const K_smooth = 0.5
+const LB_SELECTOR_GLU = [mc == glu ? 1.0 : 0.0 for mc in 1:nv]
+const LB_SELECTOR_FRU = [mc == fru ? 1.0 : 0.0 for mc in 1:nv]
+
+# Límite inferior dinámico: encoge lb cuando glucosa/fructosa se agotan
+@NLexpression(m, lb_eff[mc=1:nv, i=1:nfe],
+    lb[mc] * (
+        LB_SELECTOR_GLU[mc] * (c[3,i,1] / (c[3,i,1] + K_smooth)) +
+        LB_SELECTOR_FRU[mc] * (c[4,i,1] / (c[4,i,1] + K_smooth)) +
+        (1.0 - LB_SELECTOR_GLU[mc] - LB_SELECTOR_FRU[mc])
+    )
+)
+
 if !REDUCED_MODE || reduced_sets === nothing
     @constraints(m, begin
         Sc[mc=1:nm, i=1:nfe],  sum(S[mc,k] * v[k,i] * vs[k] for k in 1:nv) == 0
         v_UB[mc=1:nv, i=1:nfe], v[mc,i]*vs[mc] - ub[mc] <= 0
-        v_LB[mc=1:nv, i=1:nfe], -v[mc,i]*vs[mc] + lb[mc] <= 0
+    end)
+
+    @NLconstraints(m, begin
+        v_LB_dyn[mc=1:nv, i=1:nfe], -v[mc,i]*vs[mc] + lb_eff[mc,i] <= 0
+    end)
+
+    @constraints(m, begin
         Lagr[mc=1:nv, i=1:nfe],
             d[mc] + w * v[mc,i] * vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] +
             up[mc] * alpha_upt[1,i] + up2[mc] * alpha_upt[2,i] +
@@ -1114,7 +1134,13 @@ if !REDUCED_MODE || reduced_sets === nothing
 else
     @constraints(m, begin
         v_UB[k=K_AX, i=1:nfe], v[k,i]*vs[k] - ub[k] <= 0
-        v_LB[k=K_AX, i=1:nfe], -v[k,i]*vs[k] + lb[k] <= 0
+    end)
+
+    @NLconstraints(m, begin
+        v_LB_dyn_red[k=K_AX, i=1:nfe], -v[k,i]*vs[k] + lb_eff[k,i] <= 0
+    end)
+
+    @constraints(m, begin
         alpha1_LB[k=K_AX, i=1:nfe], alpha_L[k,i] <= 0
         alpha1_UB[k=K_AX, i=1:nfe], alpha_U[k,i] >= 0
     end)
@@ -1209,12 +1235,12 @@ end)
 
 if !REDUCED_MODE || reduced_sets === nothing
     @NLconstraints(m, begin
-        FO1[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb[mc]) * alpha_L[mc,i]
+        FO1[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i]
         FO2[mc=1:nv, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
     end)
 else
     @NLconstraints(m, begin
-        FO1_red[mc=K_AX, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb[mc]) * alpha_L[mc,i]
+        FO1_red[mc=K_AX, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i]
         FO2_red[mc=K_AX, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
     end)
 end
