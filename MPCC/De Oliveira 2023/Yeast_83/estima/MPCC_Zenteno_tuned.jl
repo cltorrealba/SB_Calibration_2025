@@ -142,11 +142,12 @@ function smooth_injection(t, t_shot, dose, width=1.0)
 end
 
 # Parametros estimables
-const np = 3
-const theta_data_params = log.([0.1, 0.1, 0.8]) # parámetros usados para generar los datos sintéticos
+const np = 4
+const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn")
+const theta_data_params = log.([0.1, 0.1, 0.8, YXN_nom]) # parámetros usados para generar los datos sintéticos
 const theta_init_guess = copy(theta_data_params)
-LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom])
-UB = log.([2.0*MU0_nom, 2.0*YEG_nom, 2.0*YEF_nom])
+LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom, 0.5*YXN_nom])
+UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
 
 # Condiciones iniciales (CRASH TEST CONFIG)
 X0 = 0.5; N0 = 0.14; 
@@ -157,18 +158,18 @@ const C0_INIT = [X0, N0, G0, F0, E0]
 c0 = copy(C0_INIT)
 
 # Discretizacion (CRASH TEST CONFIG)
-nfe = 48   
+nfe = 15   
 ncp = 3
-th  = 168.0 
+th  = 72.0 
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
 const HM_REFERENCE = vec(hm)
 var_h = 1.0
 
-const T_INJ_1 = 72.0   # horas
+const T_INJ_1 = 48.0   # horas
 const DOSE_1  = 0.08   # g/L (80 mg/L)
-const WIDTH_1 = 10.0    # ancho de pulso (h)
+const WIDTH_1 = 5.0    # ancho de pulso (h)
 
 # --- OMEGA NEUTRO ---
 w     = 1e-20
@@ -182,7 +183,7 @@ const n_up = 2
 cs = ones(nc)
 vs = ones(nv)
 
-const ESTIMATE_PARAMS = false
+const ESTIMATE_PARAMS = true
 
 function _build_reduced_axes()
     if !REDUCED_MODE || reduced_sets === nothing
@@ -250,7 +251,10 @@ const FREEZE_DEPLETED_STATES = get(ENV, "FREEZE_DEPLETED_STATES", "1") == "1"
 const FREEZE_NITROGEN = get(ENV, "FREEZE_NITROGEN", "1") == "1"
 
 struct ZentenoPlotParams
-    mu0::Float64; Yeg::Float64; Yef::Float64
+    mu0::Float64
+    Yeg::Float64
+    Yef::Float64
+    Yxn::Float64
 end
 
 function build_time_grid_from_lengths(lengths::AbstractVector{<:Real})
@@ -282,7 +286,7 @@ function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     s_sw = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
     Kd_val = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * s_sw
     du[1] = (mu - Kd_val) * X
-    du[2] = -(mu / YXN_nom) * X + smooth_injection(t, T_INJ_1, DOSE_1, WIDTH_1)
+    du[2] = -(mu / p.Yxn) * X + smooth_injection(t, T_INJ_1, DOSE_1, WIDTH_1)
     du[3] = -((mu / YXG_nom) + (betaG / p.Yeg) + mrate * phiG) * X
     du[4] = -((mu / YXF_nom) + (betaF / p.Yef) + mrate * phiF) * X
     du[5] = (betaG + betaF) * X
@@ -484,6 +488,18 @@ end
 
 format_float_token(val::Float64; digits::Int=1) = replace(@sprintf("%.*f", digits, val), "." => "p")
 
+_stat_display(val) = begin
+    if val === nothing
+        "unavailable"
+    elseif val isa Float64 && !isfinite(val)
+        "unavailable"
+    else
+        string(val)
+    end
+end
+
+_format_vector(vec::AbstractVector) = "[" * join((@sprintf("%.6g", v) for v in vec), ", ") * "]"
+
 function result_file_prefix(; wall_time::Float64, nfe::Int, status, primal_status)
     wall_tok = "w$(format_float_token(wall_time))s"
     feas_tok = "f$(short_token(string(primal_status); maxlen=6))"
@@ -504,7 +520,9 @@ function result_file_prefix(; wall_time::Float64, nfe::Int, status, primal_statu
 end
 
 function write_diagnostic_report(path_prefix::AbstractString; wall_time::Float64, status, primal_status,
-        objective::Float64, dual_inf, primal_inf, compl, constr_viol, iter_count, fo_value::Float64)
+        objective::Float64, dual_inf, primal_inf, compl, constr_viol, iter_count, fo_value::Float64,
+        nfe::Int, th::Float64, c0_init::AbstractVector, theta_init_log::AbstractVector,
+        theta_data_log::AbstractVector, theta_final_log::AbstractVector, estimate_params::Bool)
     report_path = path_prefix * ".txt"
     open(report_path, "w") do io
         println(io, "timestamp=", Dates.now())
@@ -513,20 +531,30 @@ function write_diagnostic_report(path_prefix::AbstractString; wall_time::Float64
         println(io, @sprintf("wall_time_s=%.4f", wall_time))
         println(io, "objective=", objective)
         println(io, "FO_value=", fo_value)
-        println(io, "iter_count=", iter_count)
-        println(io, "dual_infeasibility=", dual_inf)
-        println(io, "primal_infeasibility=", primal_inf)
-        println(io, "constraint_violation=", constr_viol)
-        println(io, "complementarity=", compl)
+        println(io, "iter_count=", _stat_display(iter_count))
+        println(io, "dual_infeasibility=", _stat_display(dual_inf))
+        println(io, "primal_infeasibility=", _stat_display(primal_inf))
+        println(io, "constraint_violation=", _stat_display(constr_viol))
+        println(io, "complementarity=", _stat_display(compl))
+        println(io, "nfe=", nfe)
+        println(io, "th_h=", th)
+        println(io, "initial_conditions=", _format_vector(c0_init))
+        println(io, "estimate_params=", estimate_params)
+        println(io, "theta_init_guess_log=", _format_vector(theta_init_log))
+        println(io, "theta_init_guess_exp=", _format_vector(exp.(theta_init_log)))
+        println(io, "theta_data_log=", _format_vector(theta_data_log))
+        println(io, "theta_data_exp=", _format_vector(exp.(theta_data_log)))
+        println(io, "theta_final_log=", _format_vector(theta_final_log))
+        println(io, "theta_final_exp=", _format_vector(exp.(theta_final_log)))
     end
     println("[REPORT] Guardado ", report_path)
 end
 
-function optimizer_attr(m, attr::AbstractString, default=NaN)
+function optimizer_attr(m, attr::AbstractString)
     try
         return get_optimizer_attribute(m, attr)
     catch
-        return default
+        return nothing
     end
 end
 
@@ -609,7 +637,12 @@ end
 # Datos sinteticos
 # ---------------------------------------------
 function _simulate_zenteno_synthetic(; nfe::Int, ncp::Int, th::Float64, c0_vec::Vector{Float64})
-    params = ZentenoPlotParams(exp(theta_data_params[1]), exp(theta_data_params[2]), exp(theta_data_params[3]))
+    params = ZentenoPlotParams(
+        exp(theta_data_params[1]),
+        exp(theta_data_params[2]),
+        exp(theta_data_params[3]),
+        exp(theta_data_params[4]),
+    )
     t_dense, U = simulate_zenteno(params; tspan=(0.0, th))
     data = zeros(nc, nfe, ncp)
     dt = th / nfe
@@ -634,7 +667,12 @@ data = _simulate_zenteno_synthetic(nfe=nfe, ncp=ncp, th=th, c0_vec=c0)
 t_pre = nothing
 states_pre = nothing
 try
-    pre_params = ZentenoPlotParams(exp(theta_data_params[1]), exp(theta_data_params[2]), exp(theta_data_params[3]))
+    pre_params = ZentenoPlotParams(
+        exp(theta_data_params[1]),
+        exp(theta_data_params[2]),
+        exp(theta_data_params[3]),
+        exp(theta_data_params[4]),
+    )
     local_t_pre, local_states_pre = simulate_zenteno(pre_params; tspan=(0.0, th))
     global t_pre = local_t_pre
     global states_pre = local_states_pre
@@ -652,7 +690,7 @@ set_optimizer_attribute(m, "print_level", 5)
 
 # 1. Tolerancia Principal (Objetivo ideal)
 # Relajamos de 1e-4 a 1e-3. Es suficiente precisión para dFBA (flujos ~1000 +/- 1)
-set_optimizer_attribute(m, "tol", 1e-3)
+set_optimizer_attribute(m, "tol", 1e-2)
 
 # 2. Red de Seguridad ("Acceptable Level")
 # Si Ipopt no logra 1e-3, pero se mantiene estable en 1e-1 durante 5 iteraciones, termina con éxito.
@@ -668,7 +706,7 @@ set_optimizer_attribute(m, "dual_inf_tol", 1.0)      # Relajar matemáticas (Dua
 set_optimizer_attribute(m, "compl_inf_tol", 1e-1)     # Complementariedad (ya relajada manualmente, esto es solo el check interno)
 
 # 4. Limpieza
-set_optimizer_attribute(m, "max_iter", 1000) # Darle espacio si avanza lento pero seguro
+set_optimizer_attribute(m, "max_iter", 700) # Darle espacio si avanza lento pero seguro
 
 @variables(m, begin
     c[1:nc, 1:ph, 1:ncp]
@@ -730,7 +768,6 @@ JuMP.register(m, :smooth_injection, 4, smooth_injection; autodiff = true)
 @NLexpression(m, Yeg, exp(teta[2]))
 @NLexpression(m, Yef, exp(teta[3]))
 
-const Yxn = YXN_nom
 const Yxg = YXG_nom
 const Yxf = YXF_nom
 
@@ -740,6 +777,7 @@ const Yxf = YXF_nom
 @NLexpression(m, phiG_j[i=1:ph, j=1:ncp], c[3,i,j] / (c[3,i,j] + c[4,i,j] + eps))
 @NLexpression(m, phiF_j[i=1:ph, j=1:ncp], c[4,i,j] / (c[3,i,j] + c[4,i,j] + eps))
 @NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate(c[5,i,j]))
+@NLexpression(m, Yxn, exp(teta[4]))
 @NLexpression(m, injection_rate[i=1:nfe, j=1:ncp],
     smooth_injection((i - 1 + radau_nodes[j]) * h, T_INJ_1, DOSE_1, WIDTH_1)
 )
@@ -766,16 +804,35 @@ else
     end)
 end
 
-# --- SUAVIZADO ---
-const K_smooth = 1.0 
+# --- SUAVIZADO Y ACOPLAMIENTO DINÁMICO ---
+
+# Constantes de saturación numérica
+const K_smooth = 1.0       # Para Glucosa/Fructosa (Escala ~100 g/L)
+const K_nit_smooth = 0.001  # Para Nitrógeno (Escala ~0.15 g/L)
+
+# Índices de reacciones de intercambio de nitrógeno
+const idx_NH4 = 2536
+const idx_Arg = 2729
+const idx_Gln = 2740
+const idx_Glu = 2738
+const idx_Ser = 2754
+const idx_Thr = 2759
+const idx_Ala = 2723
+const idx_Trp = 2760
+const NITROGEN_SOURCES = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
+
+# Selectores booleanos
 const LB_SELECTOR_GLU = [mc == glu ? 1.0 : 0.0 for mc in 1:nv]
 const LB_SELECTOR_FRU = [mc == fru ? 1.0 : 0.0 for mc in 1:nv]
+const LB_SELECTOR_NIT = [mc in NITROGEN_SOURCES ? 1.0 : 0.0 for mc in 1:nv]
 
+# Límite inferior dinámico multicomponente
 @NLexpression(m, lb_eff[mc=1:nv, i=1:nfe],
     lb[mc] * (
         LB_SELECTOR_GLU[mc] * (c[3,i,1] / (c[3,i,1] + K_smooth)) +
         LB_SELECTOR_FRU[mc] * (c[4,i,1] / (c[4,i,1] + K_smooth)) +
-        (1.0 - LB_SELECTOR_GLU[mc] - LB_SELECTOR_FRU[mc])
+        LB_SELECTOR_NIT[mc] * (c[2,i,1] / (c[2,i,1] + K_nit_smooth)) +
+        (1.0 - LB_SELECTOR_GLU[mc] - LB_SELECTOR_FRU[mc] - LB_SELECTOR_NIT[mc])
     )
 )
 
@@ -856,11 +913,16 @@ end
 result_prefix = result_file_prefix(wall_time=wall_time, nfe=nfe, status=status, primal_status=pr_status)
 plot_output_path = result_prefix * ".png"
 
+theta_final_log = [safe_value(teta[k], theta_data_params[k]) for k in 1:np]
+theta_final_vals = exp.(theta_final_log)
+
 try
-    mu_log  = safe_value(teta[1], theta_data_params[1])
-    yeg_log = safe_value(teta[2], theta_data_params[2])
-    yef_log = safe_value(teta[3], theta_data_params[3])
-    post_params = ZentenoPlotParams(exp(mu_log), exp(yeg_log), exp(yef_log))
+    post_params = ZentenoPlotParams(
+        theta_final_vals[1],
+        theta_final_vals[2],
+        theta_final_vals[3],
+        theta_final_vals[4],
+    )
     hv_vals = [safe_value(hv[i], hm[i]) for i in 1:nfe]
     mpcc_tgrid = build_time_grid_from_lengths(hv_vals)
     mpcc_states = Array{Float64}(undef, nc, nfe, ncp)
@@ -895,4 +957,11 @@ write_diagnostic_report(
     constr_viol=constr_viol,
     iter_count=iter_count,
     fo_value=fo_val,
+    nfe=nfe,
+    th=th,
+    c0_init=C0_INIT,
+    theta_init_log=theta_init_guess,
+    theta_data_log=theta_data_params,
+    theta_final_log=theta_final_log,
+    estimate_params=ESTIMATE_PARAMS,
 )
