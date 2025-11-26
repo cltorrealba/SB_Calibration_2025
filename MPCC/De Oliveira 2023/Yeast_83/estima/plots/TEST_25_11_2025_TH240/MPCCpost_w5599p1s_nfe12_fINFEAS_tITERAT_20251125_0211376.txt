@@ -1,0 +1,11 @@
+timestamp=2025-11-25T02:07:23.448
+termination_status=ITERATION_LIMIT
+primal_status=INFEASIBLE_POINT
+wall_time_s=5599.0880
+objective=2969.2695948445826
+FO_value=2969.2695948445826
+iter_count=NaN
+dual_infeasibility=NaN
+primal_infeasibility=NaN
+constraint_violation=NaN
+complementarity=NaN
