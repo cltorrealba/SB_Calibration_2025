@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env julia
+#!/usr/bin/env julia
 # MPCC_Zenteno_tuned_v3.jl
 # CORRECCIÓN DEFINITIVA: 
 # 1. Inicialización "Clean Slate" para flujos y duales (dejar que Ipopt decida).
@@ -125,32 +125,15 @@ const R = 8.314
 const T_const = try parse(Float64, get(ENV, "T_CONST", "293.15")) catch; 293.15 end
 const eps = 1e-9
 
-# --- PERFIL DE TEMPERATURA DINÁMICA ---
-const T_BASE = T_const
-const T_STEPS = [36.0]
-const T_DELTAS = [5.0]
-const T_STEEP = 1.0
-
-function dynamic_temperature(t)
-    val = T_BASE
-    for idx in eachindex(T_STEPS)
-        sigmoid = 1.0 / (1.0 + exp(-T_STEEP * (t - T_STEPS[idx])))
-        val += T_DELTAS[idx] * sigmoid
-    end
-    return val
-end
-
-function death_rate_T(E, T_val)
-    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
-    s = 0.5 * (1.0 + tanh(0.5 * (T_val - Td)))
-    base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_val - 305.65)) / (305.65 * R * T_val))
-    base * s
-end
-
-death_rate(E) = death_rate_T(E, T_BASE)
-
 # --- CONFIGURACIÓN ROBUSTA ---
 const MPCC_RELAX_TOL = 1.0 
+
+death_rate(E) = begin
+    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+    s = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
+    base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const))
+    base * s
+end
 
 const SQRT_2PI = sqrt(2*pi)
 function smooth_injection(t, t_shot, dose, width=1.0)
@@ -161,10 +144,10 @@ end
 # Parametros estimables
 const np = 4
 const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn")
-const theta_data_params = ([MU0_nom, YEG_nom, YEF_nom, YXN_nom]) # parámetros usados para generar los datos sintéticos
+const theta_data_params = log.([0.1, 0.1, 0.8, YXN_nom]) # parámetros usados para generar los datos sintéticos
+const theta_init_guess = copy(theta_data_params)
 LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom, 0.5*YXN_nom])
 UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
-const theta_init_guess = LB+0.5*(UB - LB)
 
 # Condiciones iniciales (CRASH TEST CONFIG)
 X0 = 0.5; N0 = 0.14; 
@@ -175,7 +158,7 @@ const C0_INIT = [X0, N0, G0, F0, E0]
 c0 = copy(C0_INIT)
 
 # Discretizacion (CRASH TEST CONFIG)
-nfe = 10   
+nfe = 15   
 ncp = 3
 th  = 72.0 
 h   = th / nfe
@@ -185,7 +168,7 @@ const HM_REFERENCE = vec(hm)
 var_h = 1.0
 
 const T_INJ_1 = 48.0   # horas
-const DOSE_1  = 0.10   # g/L (100 mg/L)
+const DOSE_1  = 0.08   # g/L (80 mg/L)
 const WIDTH_1 = 5.0    # ancho de pulso (h)
 
 # --- OMEGA NEUTRO ---
@@ -289,18 +272,19 @@ const DATA_TIME_GRID = build_time_grid_from_lengths(fill(h, nfe))
 
 function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     X, N, G, F, E = u
-    T_curr = dynamic_temperature(t)
-    mu_T =  exp(59453.0 * (T_curr - 300.0) / (300.0 * R * T_curr))
-    Kg_T =  exp(46055.0 * (T_curr - 293.15) / (293.15 * R * T_curr))
-    b_T  =  exp(11000.0 * (T_curr - 296.15) / (296.15 * R * T_curr))
-    mrate = 0.01 * exp(37681.0 * (T_curr - 293.30) / (293.30 * R * T_curr))
+    mu_T =  exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const))
+    Kg_T =  exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const))
+    b_T  =  exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const))
+    mrate = 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const))
     denom = G + F + eps
     phiG = G / denom
     phiF = F / denom
     mu   = p.mu0 * mu_T * (N / (N + Kn0_nom * Kg_T + eps))
     betaG = betaG0_nom * b_T * (G / (G + Kg0_nom * Kg_T + eps)) * (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
     betaF = betaF0_nom * b_T * (F / (F + Kf0_nom * Kg_T + eps)) * (Kig0_nom * Kg_T / (G + Kig0_nom * Kg_T + eps)) * (Kie0_nom * Kg_T / (E + Kie0_nom * Kg_T + eps))
-    Kd_val = death_rate_T(E, T_curr)
+    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+    s_sw = 0.5 * (1.0 + tanh(0.5 * (T_const - Td)))
+    Kd_val = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_const - 305.65)) / (305.65 * R * T_const)) * s_sw
     du[1] = (mu - Kd_val) * X
     du[2] = -(mu / p.Yxn) * X + smooth_injection(t, T_INJ_1, DOSE_1, WIDTH_1)
     du[3] = -((mu / YXG_nom) + (betaG / p.Yeg) + mrate * phiG) * X
@@ -484,36 +468,6 @@ function plot_ethyl_acetate_concentration(mpcc_tgrid, mpcc_states, v_var; title_
         color=:navy, lw=2, label="Spline interpolado")
     xlabel!(plt, "tiempo [h]")
     ylabel!(plt, "concentración ethyl acetate [g/L]")
-    title!(plt, title_str)
-    save_dir = dirname(save_path)
-    isdir(save_dir) || mkpath(save_dir)
-    savefig(plt, save_path)
-    println("[PLOT] Guardado ", save_path)
-    return true
-end
-
-function plot_temperature_profile(t_pre, t_post, mpcc_tgrid; title_str::AbstractString, save_path::AbstractString)
-    plt = plot(size=(900, 400))
-    plotted = false
-    if t_pre !== nothing
-        plot!(plt, t_pre, dynamic_temperature.(t_pre);
-            color=:royalblue, lw=2, linestyle=:dashdot, label="ODE pre")
-        plotted = true
-    end
-    if t_post !== nothing
-        plot!(plt, t_post, dynamic_temperature.(t_post);
-            color=:firebrick, lw=3, label="ODE post")
-        plotted = true
-    end
-    if mpcc_tgrid !== nothing
-        ts_mpcc = vec(mpcc_tgrid)
-        scatter!(plt, ts_mpcc, dynamic_temperature.(ts_mpcc);
-            color=:purple, marker=:diamond, ms=5, alpha=0.9, label="MPCC")
-        plotted = true
-    end
-    plotted || plot!(plt, [0.0], [dynamic_temperature(0.0)]; color=:gray, label="Temp")
-    xlabel!(plt, "tiempo [h]")
-    ylabel!(plt, "Temperatura [K]")
     title!(plt, title_str)
     save_dir = dirname(save_path)
     isdir(save_dir) || mkpath(save_dir)
@@ -747,12 +701,12 @@ set_optimizer_attribute(m, "acceptable_obj_change_tol", 1e-2)
 # 3. Prioridades Específicas (Crucial para MPCC)
 # Queremos que el balance de masa (S*v=0) se respete bien (constr_viol),
 # pero no nos importa tanto si la optimalidad matemática (gradientes/duales) es perfecta.
-set_optimizer_attribute(m, "constr_viol_tol", 1e-2)  # Respetar física (Primal)
+set_optimizer_attribute(m, "constr_viol_tol", 1e-3)  # Respetar física (Primal)
 set_optimizer_attribute(m, "dual_inf_tol", 1.0)      # Relajar matemáticas (Dual) - Los MPCC tienen duales feos por naturaleza
 set_optimizer_attribute(m, "compl_inf_tol", 1e-1)     # Complementariedad (ya relajada manualmente, esto es solo el check interno)
 
 # 4. Limpieza
-set_optimizer_attribute(m, "max_iter", 30) # Darle espacio si avanza lento pero seguro
+set_optimizer_attribute(m, "max_iter", 700) # Darle espacio si avanza lento pero seguro
 
 @variables(m, begin
     c[1:nc, 1:ph, 1:ncp]
@@ -804,9 +758,12 @@ end
 
 @NLobjective(m, Min, omega * FO)
 
+JuMP.register(m, :death_rate, 1, death_rate; autodiff = true)
 JuMP.register(m, :smooth_injection, 4, smooth_injection; autodiff = true)
-JuMP.register(m, :dynamic_temperature, 1, dynamic_temperature; autodiff = true)
-JuMP.register(m, :death_rate_T, 2, death_rate_T; autodiff = true)
+@NLexpression(m, mu_T, exp(59453.0 * (T_const - 300.0) / (300.0 * R * T_const)))
+@NLexpression(m, Kg_T, exp(46055.0 * (T_const - 293.15) / (293.15 * R * T_const)))
+@NLexpression(m, b_T,  exp(11000.0 * (T_const - 296.15) / (296.15 * R * T_const)))
+@NLexpression(m, mrate, 0.01 * exp(37681.0 * (T_const - 293.30) / (293.30 * R * T_const)))
 @NLexpression(m, mu0, exp(teta[1]))
 @NLexpression(m, Yeg, exp(teta[2]))
 @NLexpression(m, Yef, exp(teta[3]))
@@ -814,42 +771,15 @@ JuMP.register(m, :death_rate_T, 2, death_rate_T; autodiff = true)
 const Yxg = YXG_nom
 const Yxf = YXF_nom
 
-@NLexpression(m, T_loc[i=1:ph, j=1:ncp],
-    dynamic_temperature((i - 1 + radau_nodes[j]) * hv[i])
-)
-@NLexpression(m, mu_T_ij[i=1:ph, j=1:ncp],
-    exp(59453.0 * (T_loc[i,j] - 300.0) / (300.0 * R * T_loc[i,j]))
-)
-@NLexpression(m, Kg_T_ij[i=1:ph, j=1:ncp],
-    exp(46055.0 * (T_loc[i,j] - 293.15) / (293.15 * R * T_loc[i,j]))
-)
-@NLexpression(m, b_T_ij[i=1:ph, j=1:ncp],
-    exp(11000.0 * (T_loc[i,j] - 296.15) / (296.15 * R * T_loc[i,j]))
-)
-@NLexpression(m, mrate_ij[i=1:ph, j=1:ncp],
-    0.01 * exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j]))
-)
-
-@NLexpression(m, mu_j[i=1:ph, j=1:ncp],
-    mu0 * mu_T_ij[i,j] * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T_ij[i,j] + eps))
-)
-@NLexpression(m, betaG_j[i=1:ph, j=1:ncp],
-    betaG0_nom * b_T_ij[i,j] *
-    (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T_ij[i,j] + eps)) *
-    (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps))
-)
-@NLexpression(m, betaF_j[i=1:ph, j=1:ncp],
-    betaF0_nom * b_T_ij[i,j] *
-    (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T_ij[i,j] + eps)) *
-    (Kig0_nom * Kg_T_ij[i,j] / (c[3,i,j] + Kig0_nom * Kg_T_ij[i,j] + eps)) *
-    (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps))
-)
+@NLexpression(m, mu_j[i=1:ph, j=1:ncp], mu0 * mu_T * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T + eps)))
+@NLexpression(m, betaG_j[i=1:ph, j=1:ncp], betaG0_nom * b_T * (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T + eps)) * (Kie0_nom * Kg_T / (c[5,i,j] + Kie0_nom * Kg_T + eps)))
+@NLexpression(m, betaF_j[i=1:ph, j=1:ncp], betaF0_nom * b_T * (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T + eps)) * (Kig0_nom * Kg_T / (c[3,i,j] + Kig0_nom * Kg_T + eps)) * (Kie0_nom * Kg_T / (c[5,i,j] + Kie0_nom * Kg_T + eps)))
 @NLexpression(m, phiG_j[i=1:ph, j=1:ncp], c[3,i,j] / (c[3,i,j] + c[4,i,j] + eps))
 @NLexpression(m, phiF_j[i=1:ph, j=1:ncp], c[4,i,j] / (c[3,i,j] + c[4,i,j] + eps))
-@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate_T(c[5,i,j], T_loc[i,j]))
+@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate(c[5,i,j]))
 @NLexpression(m, Yxn, exp(teta[4]))
 @NLexpression(m, injection_rate[i=1:nfe, j=1:ncp],
-    smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_1, DOSE_1, WIDTH_1)
+    smooth_injection((i - 1 + radau_nodes[j]) * h, T_INJ_1, DOSE_1, WIDTH_1)
 )
 
 @constraints(m, begin
@@ -878,7 +808,7 @@ end
 
 # Constantes de saturación numérica
 const K_smooth = 1.0       # Para Glucosa/Fructosa (Escala ~100 g/L)
-const K_nit_smooth = 0.01  # Para Nitrógeno (Escala ~0.15 g/L)
+const K_nit_smooth = 0.001  # Para Nitrógeno (Escala ~0.15 g/L)
 
 # Índices de reacciones de intercambio de nitrógeno
 const idx_NH4 = 2536
@@ -929,8 +859,8 @@ end
 for i in 1:ph, j in 1:ncp
     @NLconstraint(m, cdot[1,i,j] == (mu_j[i,j] - Kd_j[i,j]) * c[1,i,j])
     @NLconstraint(m, cdot[2,i,j] == -(mu_j[i,j] / Yxn) * c[1,i,j] + injection_rate[i,j])
-    @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate_ij[i,j] * phiG_j[i,j]) * c[1,i,j])
-    @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate_ij[i,j] * phiF_j[i,j]) * c[1,i,j])
+    @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate * phiG_j[i,j]) * c[1,i,j])
+    @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate * phiF_j[i,j]) * c[1,i,j])
     @NLconstraint(m, cdot[5,i,j] == (betaG_j[i,j] + betaF_j[i,j]) * c[1,i,j])
 end
 
@@ -942,7 +872,7 @@ end)
 
 if !REDUCED_MODE || reduced_sets === nothing
     @NLconstraints(m, begin
-        FO1_relax[mc=1:nv, i=1:nfe], (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i] >= -MPCC_RELAX_TOL
+        FO1_relax[mc=1:nv, i=1:nfe], (lb_eff[mc,i] - v[mc,i]*vs[mc]) * alpha_L[mc,i] >= -MPCC_RELAX_TOL
         FO2_relax[mc=1:nv, i=1:nfe], (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i] >= -MPCC_RELAX_TOL
     end)
 end
@@ -1010,11 +940,6 @@ try
         mpcc_tgrid, mpcc_states, v;
         title_str="Ethyl acetate MPCC: $(status) / $(pr_status)",
         save_path=result_prefix * "_ethyl_acetate.png",
-    )
-    plot_temperature_profile(
-        t_pre, t_post, mpcc_tgrid;
-        title_str="Perfil de temperatura: $(status) / $(pr_status)",
-        save_path=result_prefix * "_temperature.png",
     )
 catch err
     @warn "No se pudo generar el grafico posterior a la optimizacion" err

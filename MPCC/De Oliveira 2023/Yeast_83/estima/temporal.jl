@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env julia
+#!/usr/bin/env julia
 # MPCC_Zenteno_stripping.jl
 # CORRECCIÓN DEFINITIVA: 
 # 1. Inicialización "Clean Slate" para flujos y duales (dejar que Ipopt decida).
@@ -20,20 +20,17 @@ using CSV
 using HiGHS
 const MOI = MathOptInterface
 
+const EXPORT_PLOT_CSV = get(ENV, "EXPORT_PLOT_CSV", "0") == "1"
+const USE_WARM_START = get(ENV, "USE_WARM_START", "1") == "1"
+const USE_SCHOLTES = true # Variante con relajacion de Scholtes
+
 # ---------------------------------------------
 # Paths e IO
 # ---------------------------------------------
-const EXPORT_PLOT_CSV = get(ENV, "EXPORT_PLOT_CSV", "0") == "1"
-const USE_WARM_START = get(ENV, "USE_WARM_START", "1") == "1"
 const BASE_DIR   = @__DIR__
 const ESTIMA_DIR = BASE_DIR
 const PLOTS_DIR  = joinpath(ESTIMA_DIR, "plots")
 isdir(PLOTS_DIR) || mkpath(PLOTS_DIR)
-
-const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
-const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
-
-const ESTIMATE_PARAMS = true
 
 function _sanitize_experiment_name(str::AbstractString)
     clean = strip(str)
@@ -45,208 +42,12 @@ const EXPERIMENT_TOKEN = _sanitize_experiment_name(get(ENV, "EXPERIMENT", "defau
 const EXPERIMENT_DIR = joinpath(PLOTS_DIR, EXPERIMENT_TOKEN)
 isdir(EXPERIMENT_DIR) || mkpath(EXPERIMENT_DIR)
 
-function _load_reduced_sets(path::String)
-    if !isfile(path)
-        return nothing
-    end
-    try
-        return JLD2.jldopen(path, "r") do f
-            (read(f, "A"), read(f, "C"), read(f, "F"))
-        end
-    catch err
-        @warn "No se pudieron cargar reduced_sets" path err
-        return nothing
-    end
-end
-
-const reduced_sets = REDUCED_MODE ? _load_reduced_sets(REDUCED_SETS_PATH) : nothing
-if REDUCED_MODE && reduced_sets === nothing
-    @warn "REDUCED_MODE=1 sin reduced_sets.jld2; se usara el modelo completo" REDUCED_SETS_PATH
-end
-
-
-# --- FACTORES DE ESCALA MANUAL ---
-const SC_V = 1.0  # escala flujos
-const SC_C = 1.0   # escala sustratos altos (G/F)
-const SC_X = 1.0     # biomasa/N se mantienen en ~1
-
-# ---------------------------------------------
-# Constantes de Penalización MPCC (Faltantes en versión anterior)
-# ---------------------------------------------
-const phi1 = 1e0
-const phi2 = 1e0
-const phi3 = 1e0
-
-# ---------------------------------------------
-# Indices y tamanos del GEM
-# ---------------------------------------------
-
+# Matriz estequiometrica y cotas de flujos
 S     = readdlm(joinpath(ESTIMA_DIR, "S.csv"), ',')
 lbraw = readdlm(joinpath(ESTIMA_DIR, "lb.csv"), ',')
 ubraw = readdlm(joinpath(ESTIMA_DIR, "ub.csv"), ',')
-lb    = lbraw isa AbstractVector ? Float64.(lbraw) : Float64.(lbraw[:,1])
-ub    = ubraw isa AbstractVector ? Float64.(ubraw) : Float64.(ubraw[:,1])
-
-nm = size(S, 1)
-nv = size(S, 2)
-
-const eth = 2630
-const obj = 3414
-const glu = 2588
-const fru = 2583
-const o2  = 2816
-const ATP = 3415
-
-const idx_NH4 = 2536
-const idx_Arg = 2729
-const idx_Gln = 2740
-const idx_Glu = 2738
-const idx_Ser = 2754
-const idx_Thr = 2759
-const idx_Ala = 2723
-const idx_Trp = 2760
-const NITROGEN_SOURCES = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
-
-NITROGEN_SOURCES_RAW = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
-const NITROGEN_SOURCES = filter(x -> 1 <= x <= nv, NITROGEN_SOURCES_RAW)
-
-println("Verificando bounds de fuentes de Nitrógeno...")
-for idx in NITROGEN_SOURCES
-    # Si el límite en el CSV es 0 (cerrado), lo abrimos a un valor grande negativo
-    # La restricción dinámica (L_uptake) será la que realmente mande.
-    if lb[idx] == 0.0
-        println("  -> Abriendo flujo nitrogenado cerrado: índice $idx")
-        lb[idx] = -1000.0 
-    end
-end
-
-# Agrupamos Glucosa, Fructosa y TODAS las fuentes de nitrógeno (filtradas y robustas)
-const UPTAKE_IDXS = vcat((1 <= glu <= nv) ? [glu] : Int[], (1 <= fru <= nv) ? [fru] : Int[], NITROGEN_SOURCES)
-const n_up = length(UPTAKE_IDXS)
-# Selectores constantes para evitar condicionales en NLexpresiones
-const IS_GLU = [x == glu ? 1.0 : 0.0 for x in UPTAKE_IDXS]
-const IS_FRU = [x == fru ? 1.0 : 0.0 for x in UPTAKE_IDXS]
-const IS_NIT = [1.0 - IS_GLU[i] - IS_FRU[i] for i in 1:n_up]
-const SELECT_UPTAKE = [Float64(mc == UPTAKE_IDXS[k]) for mc in 1:nv, k in 1:n_up]
-
-# Agrupamos Glucosa, Fructosa y TODAS las fuentes de nitrógeno, filtrando inválidos
-if 1 <= o2 <= nv; lb[o2] = 0.0; ub[o2] = 0.0; end
-if 1 <= ATP <= nv; lb[ATP] = 0.0; end
-if 1 <= o2 <= nv; lb[o2] = 0.0; ub[o2] = 0.0; end
-if 1 <= ATP <= nv; lb[ATP] = 0.0; end
-
-# ---------------------------------------------
-# Modelo Zenteno (param nominal)
-# ---------------------------------------------
-const nc = 5 # X,N,G,F,E
-const NOISE_SEED = 1234
-const DEFAULT_LINEAR_SOLVER = "mumps"
-
-const MU0_nom   = 0.141665
-const YXN_nom   = 9.80576
-const YXG_nom   = 0.394345
-const YXF_nom   = 0.18622
-const YEG_nom   = 0.14133
-const YEF_nom   = 0.96932
-const Kn0_nom   = 0.226882
-const Kg0_nom   = 3.1514
-const Kf0_nom   = 2.97625
-const Kig0_nom  = 29.5276
-const Kie0_nom  = 2.99809
-const Kd0_nom   = 0.0000311736
-const betaG0_nom = 1.41182
-const betaF0_nom = 8.49482
-
-const R = 8.314
-const T_const = try parse(Float64, get(ENV, "T_CONST", "293.15")) catch; 293.15 end
-const eps = 1e-9
-
-# --- PERFIL DE TEMPERATURA DINÁMICA ---
-const T_BASE = T_const
-const T_STEPS = [36.0, 96.0]   # dos eventos de cambio de T (ajusta valores a gusto)
-const T_DELTAS = [5.0, 3.0]    # salto asociado a cada evento (el 2do default es neutro)
-const T_STEEP = 1.0
-
-function dynamic_temperature(t)
-    val = T_BASE
-    for idx in eachindex(T_STEPS)
-        sigmoid = 1.0 / (1.0 + exp(-T_STEEP * (t - T_STEPS[idx])))
-        val += T_DELTAS[idx] * sigmoid
-    end
-    return val
-end
-
-function death_rate_T(E, T_val)
-    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
-    s = 0.5 * (1.0 + tanh(0.5 * (T_val - Td)))
-    base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_val - 305.65)) / (305.65 * R * T_val))
-    base * s
-end
-
-death_rate(E) = death_rate_T(E, T_BASE)
-
-# --- INYECCIONES SUAVIZADAS ---
-const SQRT_2PI = sqrt(2*pi)
-function smooth_injection(t, t_shot, dose, width=1.0)
-    abs(t - t_shot) > 5 * width && return 0.0
-    return (dose / (width * SQRT_2PI)) * exp(-0.5 * ((t - t_shot) / width)^2)
-end
-
-# SETTINGS PARA ESTIMACION DE PARAMETROS
-const np = 4
-const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn")
-const theta_data_params = log.([MU0_nom, YEG_nom, YEF_nom, YXN_nom])
-const theta_init_guess  = log.([MU0_nom*1.2, YEG_nom*1.2, YEF_nom*1.2, YXN_nom*1.2])
-LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom, 0.5*YXN_nom])
-UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
-
-# Variables observadas y ruido aleatorio
-const MEAS_STATES = (3, 4, 5) # G, F, E
-const NOISE_REL_STD = 0.10
-Random.seed!(NOISE_SEED)
-
-# Condiciones iniciales
-X0 = 0.5; N0 = 0.14; G0 = 110.0; F0 = 110.0; E0 = 0.0
-const C0_INIT = [X0, N0, G0, F0, E0]
-c0 = copy(C0_INIT)
-
-# DISCRETIZACION
-nfe = 6   
-ncp = 3
-th  = 96.0 
-h   = th / nfe
-ph  = nfe
-hm    = fill(h, nfe)'
-const HM_REFERENCE = vec(hm)
-var_h = 1.0
-
-colmat = [
-    0.19681547722366   -0.06553542585020   0.02377097434822;
-    0.39442431473909    0.29207341166523  -0.04154875212600;
-    0.37640306270047    0.51248582618842   0.11111111111111
-]
-const radau_nodes = (0.15505, 0.64495, 1.0)
-
-# OMEGA
-w     = 1e-20
-omega = 1.0 
-d   = zeros(nv); d[obj] = -1.0
-
-cs = ones(nc)
-vs = ones(nv)
-
-# PERFIL U DINAMICO
-const T_INJ_1 = 48.0   # horas
-const DOSE_1  = 0.10   # g/L (100 mg/L)
-const WIDTH_1 = 5.0    # ancho de pulso (h)
-const T_INJ_2 = 72.0   # segundo pulso (ajusta valores)
-const DOSE_2  = 0.10   # g/L (default neutro)
-const WIDTH_2 = 5.0
-
-
-# ---------------------------------------------
-# Configuracion de stripping (CO2 + UNIFAC)
-# ---------------------------------------------
+lb    = lbraw isa AbstractVector ? copy(lbraw) : copy(lbraw[:,1])
+ub    = ubraw isa AbstractVector ? copy(ubraw) : copy(ubraw[:,1])
 
 const ETHYL_ACETATE_ROW = 2023
 const ETHYL_ACETATE_EX_RXN = begin
@@ -338,6 +139,14 @@ end
 
 const MOLAR_MASS_ETHYL_ACETATE = 88.106 # g / mol
 
+# --- FACTORES DE ESCALA MANUAL ---
+const SC_V = 1.0  # escala flujos
+const SC_C = 1.0   # escala sustratos altos (G/F)
+const SC_X = 1.0     # biomasa/N se mantienen en ~1
+
+# ---------------------------------------------
+# Configuracion de stripping (CO2 + UNIFAC)
+# ---------------------------------------------
 const STRIPPING_LIQ_VOLUME = try
     parse(Float64, get(ENV, "STRIP_LIQ_VOL", "100.0"))
 catch
@@ -504,6 +313,154 @@ function partition_coeff_from_state(E_conc::Float64, T::Float64)
     return calculate_partition_coefficient(activity_model, T, x_molar)
 end
 
+const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
+const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
+
+function _load_reduced_sets(path::String)
+    if !isfile(path)
+        return nothing
+    end
+    try
+        return JLD2.jldopen(path, "r") do f
+            (read(f, "A"), read(f, "C"), read(f, "F"))
+        end
+    catch err
+        @warn "No se pudieron cargar reduced_sets" path err
+        return nothing
+    end
+end
+
+const reduced_sets = REDUCED_MODE ? _load_reduced_sets(REDUCED_SETS_PATH) : nothing
+if REDUCED_MODE && reduced_sets === nothing
+    @warn "REDUCED_MODE=1 sin reduced_sets.jld2; se usara el modelo completo" REDUCED_SETS_PATH
+end
+
+# ---------------------------------------------
+# Indices y tamanos del GEM
+# ---------------------------------------------
+nm = size(S, 1)
+nv = size(S, 2)
+
+const eth = 2630
+const obj = 3414
+const glu = 2588
+const fru = 2583
+const o2  = 2816
+const ATP = 3415
+
+if 1 <= o2 <= nv
+    lb[o2] = 0.0
+    ub[o2] = 0.0
+end
+if 1 <= ATP <= nv
+    lb[ATP] = 0.0
+end
+
+# ---------------------------------------------
+# Modelo Zenteno (param nominal)
+# ---------------------------------------------
+const nc = 5 # X,N,G,F,E
+const NOISE_SEED = 1234
+const DEFAULT_LINEAR_SOLVER = "mumps"
+
+const MU0_nom   = 0.141665
+const YXN_nom   = 9.80576
+const YXG_nom   = 0.394345
+const YXF_nom   = 0.18622
+const YEG_nom   = 0.14133
+const YEF_nom   = 0.96932
+const Kn0_nom   = 0.226882
+const Kg0_nom   = 3.1514
+const Kf0_nom   = 2.97625
+const Kig0_nom  = 29.5276
+const Kie0_nom  = 2.99809
+const Kd0_nom   = 0.0000311736
+const betaG0_nom = 1.41182
+const betaF0_nom = 8.49482
+
+const R = 8.314
+const T_const = try parse(Float64, get(ENV, "T_CONST", "293.15")) catch; 293.15 end
+const eps = 1e-9
+
+# --- PERFIL DE TEMPERATURA DINÁMICA ---
+const T_BASE = T_const
+const T_STEPS = [36.0, 96.0]   # dos eventos de cambio de T (ajusta valores a gusto)
+const T_DELTAS = [5.0, 3.0]    # salto asociado a cada evento (el 2do default es neutro)
+const T_STEEP = 1.0
+
+function dynamic_temperature(t)
+    val = T_BASE
+    for idx in eachindex(T_STEPS)
+        sigmoid = 1.0 / (1.0 + exp(-T_STEEP * (t - T_STEPS[idx])))
+        val += T_DELTAS[idx] * sigmoid
+    end
+    return val
+end
+
+function death_rate_T(E, T_val)
+    Td = -0.0001 * E^3 + 0.0049 * E^2 - 0.1279 * E + 315.89
+    s = 0.5 * (1.0 + tanh(0.5 * (T_val - Td)))
+    base = Kd0_nom * exp(0.0415 * E + (130000.0 * (T_val - 305.65)) / (305.65 * R * T_val))
+    base * s
+end
+
+death_rate(E) = death_rate_T(E, T_BASE)
+
+# --- CONFIGURACIÓN ROBUSTA ---
+const MPCC_RELAX_TOL_INIT = 1e-1 # valor inicial grande para homotopía
+
+const SQRT_2PI = sqrt(2*pi)
+function smooth_injection(t, t_shot, dose, width=1.0)
+    abs(t - t_shot) > 5 * width && return 0.0
+    return (dose / (width * SQRT_2PI)) * exp(-0.5 * ((t - t_shot) / width)^2)
+end
+
+# Parametros estimables
+const np = 4
+const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn")
+const theta_data_params = log.([MU0_nom, YEG_nom, YEF_nom, YXN_nom])
+const theta_init_guess  = log.([MU0_nom*1.2, YEG_nom*1.2, YEF_nom*1.2, YXN_nom*1.2])
+LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom, 0.5*YXN_nom])
+UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
+
+# Condiciones iniciales (CRASH TEST CONFIG)
+X0 = 0.5; N0 = 0.14; 
+G0 = 110.0; 
+F0 = 110.0; 
+E0 = 0.0
+const C0_INIT = [X0, N0, G0, F0, E0]
+c0 = copy(C0_INIT)
+
+# Discretizacion (CRASH TEST CONFIG)
+nfe = 6   
+ncp = 3
+th  = 72.0 
+h   = th / nfe
+ph  = nfe
+hm    = fill(h, nfe)'
+const HM_REFERENCE = vec(hm)
+var_h = 1.0
+
+const T_INJ_1 = 48.0   # horas
+const DOSE_1  = 0.10   # g/L (100 mg/L)
+const WIDTH_1 = 5.0    # ancho de pulso (h)
+const T_INJ_2 = 72.0   # segundo pulso (ajusta valores)
+const DOSE_2  = 0.10   # g/L (default neutro)
+const WIDTH_2 = 5.0
+
+# --- OMEGA NEUTRO ---
+w     = 1e-20
+omega = 1.0 
+
+d   = zeros(nv); d[obj] = -1.0
+up  = zeros(nv); up[glu] = 1.0
+up2 = zeros(nv); up2[fru] = 1.0
+const n_up = 2
+
+cs = ones(nc)
+vs = ones(nv)
+
+const ESTIMATE_PARAMS = true
 
 function _build_reduced_axes()
     if !REDUCED_MODE || reduced_sets === nothing
@@ -531,6 +488,30 @@ end
 
 const K_AX, M_AX = _build_reduced_axes()
 
+const MEAS_STATES = (3, 4, 5) # G, F, E
+const NOISE_REL_STD = 0.10
+
+colmat = [
+    0.19681547722366   -0.06553542585020   0.02377097434822;
+    0.39442431473909    0.29207341166523  -0.04154875212600;
+    0.37640306270047    0.51248582618842   0.11111111111111
+]
+const radau_nodes = (0.15505, 0.64495, 1.0)
+Random.seed!(NOISE_SEED)
+
+# ---------------------------------------------
+# Configuracion Ipopt
+# ---------------------------------------------
+function configure_pardiso_defaults()
+    solver = lowercase(strip(get(ENV, "IPOPT_LINEAR_SOLVER", "")))
+    !(solver in ("pardiso", "pardisomkl")) && return
+    set_default!(name, val) = isempty(strip(get(ENV, name, ""))) && (ENV[name] = val)
+    set_default!("PARDISO_MTYPE", "-2")
+    println("[IPOPT] Pardiso defaults configured.")
+end
+configure_pardiso_defaults()
+
+
 # ---------------------------------------------
 # Herramientas de simulacion/plot
 # ---------------------------------------------
@@ -543,6 +524,10 @@ const STATE_MIN_CONC = (
     0.0,   
     1e-6, 
 )
+const STATE_FLOOR = 1e-8
+const FREEZE_DEPLETED_STATES = get(ENV, "FREEZE_DEPLETED_STATES", "1") == "1"
+const FREEZE_NITROGEN = get(ENV, "FREEZE_NITROGEN", "1") == "1"
+
 struct ZentenoPlotParams
     mu0::Float64
     Yeg::Float64
@@ -1354,194 +1339,234 @@ catch err
 end
 
 # ---------------------------------------------
-# MODELO JuMP
+# Modelo JuMP + Configuración de Convergencia "Pragmática"
 # ---------------------------------------------
 m = Model(Ipopt.Optimizer)
 
-# 1. Configuración Básica
-set_optimizer_attribute(m, "linear_solver", "mumps") # O "ma57" si lo tienes, es mejor para MPCC
+set_optimizer_attribute(m, "warm_start_init_point", "yes")
 set_optimizer_attribute(m, "print_level", 5)
-set_optimizer_attribute(m, "max_iter", 1000) # Damos más iteraciones por si el modo adaptativo es lento
+# set_optimizer_attribute(m, "hessian_approximation", "exact")
 
-# 2. Tolerancia Estricta (El objetivo ideal)
-set_optimizer_attribute(m, "tol", 1e-4)
+# Configuración Ipopt reforzada
+set_optimizer_attribute(m, "max_iter", 1000)
+set_optimizer_attribute(m, "tol", 1e-3)
+set_optimizer_attribute(m, "dual_inf_tol", 1000.0)
+set_optimizer_attribute(m, "constr_viol_tol", 1e-2)
+set_optimizer_attribute(m, "acceptable_tol", 1e-1)
+set_optimizer_attribute(m, "acceptable_iter", 15)
+set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based")
 
-# 3. Estrategia de Terminación Aceptable ("Caza-Óptimos")
-# Si el solver se atasca cerca de la solución pero no puede bajar el error dual, se detiene aquí.
-set_optimizer_attribute(m, "acceptable_iter", 5)       # Mantenerse estable 5 iteraciones
-set_optimizer_attribute(m, "acceptable_tol", 1e-1)     # Tolerancia relajada (suficiente para ingeniería)
-set_optimizer_attribute(m, "acceptable_constr_viol_tol", 1e-2) # Violación de restricciones aceptable
-set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e10)   # ¡CRÍTICO! Ignora el ruido dual del MPCC
-set_optimizer_attribute(m, "acceptable_compl_inf_tol", 1e-2)   # Tolerancia de complementariedad
-
-# 4. Estrategia de Barrera (Mu Strategy) - Anti-Rebote
-# "adaptive" es más lento pero mucho más seguro que "monotone" para problemas no convexos.
-set_optimizer_attribute(m, "mu_strategy", "adaptive")
-set_optimizer_attribute(m, "mu_oracle", "quality-function") # Ayuda a elegir mejor el paso adaptativo
-
-# 5. Manejo de Cotas y Escalado
-set_optimizer_attribute(m, "bound_relax_factor", 0.0) # 0.0 para respetar estrictamente c >= 0 (física)
-set_optimizer_attribute(m, "honor_original_bounds", "yes")
-set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based") # A veces ayuda si los flujos tienen escalas muy distintas
 
 @variables(m, begin
     c[1:nc, 1:ph, 1:ncp] >= 0.0
     cdot[1:nc, 1:ph, 1:ncp]
-    FO
-    teta[1:np]
-   
-    v[1:nv, 1:nfe]
-    lambda_[1:nm, 1:nfe]
-    alpha_U[1:nv, 1:nfe]>= 0.0
-    alpha_L[1:nv, 1:nfe]<= 0.0
-    alpha_upt[1:n_up, 1:nfe]<= 0.0
-    
-    FO_U[1:nv, 1:nfe]
-    FO_L[1:nv, 1:nfe]
-    FO_upt[1:n_up, 1:nfe]
-
+    teta[1:np] >= 0.0
     hv[1:nfe] >= 0.0
 end)
 
-# ============================================================
-# PARTE 0: INICIALIZACION
-# ============================================================
+@variable(m, FO >= 0.0)
+
+if !REDUCED_MODE || reduced_sets === nothing
+    @variables(m, begin
+        v_hat[1:nv, 1:nfe]
+        lambda_[1:nm, 1:nfe]           
+        alpha_U[1:nv, 1:nfe] >= 0.0  
+        alpha_L[1:nv, 1:nfe] >= 0.0  
+    end)
+    @expression(m, v[k=1:nv, i=1:nfe], v_hat[k,i] * SC_V)
+else
+    @variables(m, begin
+        v_hat[K_AX, 1:nfe]
+        lambda_[M_AX, 1:nfe]
+        alpha_U[K_AX, 1:nfe] >= 0.0
+        alpha_L[K_AX, 1:nfe] >= 0.0
+    end)
+    @expression(m, v[k=K_AX, i=1:nfe], v_hat[k,i] * SC_V)
+end
+
+@variables(m, begin
+    alpha_upt[1:n_up, 1:nfe] >= 0.0 
+    FO_L[1:nv, 1:nfe]
+    FO_U[1:nv, 1:nfe]
+    FO_upt[1:n_up, 1:nfe]
+end)
+
+# --- INICIALIZACION SOLO ESTADOS ---
 for i in 1:ph, j in 1:ncp, l in 1:nc
-    set_start_value(c[l, i, j], c0[l])
+    val_init = data[l, i, j]
+    val_init = max(val_init, STATE_MIN_CONC[l])
+    set_start_value(c[l, i, j], val_init)
+    set_start_value(cdot[l, i, j], 0.0)
 end
 for i in 1:nfe
     set_start_value(hv[i], hm[i])
 end
-for k in 1:np
-    set_start_value(teta[k], theta_init_guess[k]) 
-end
+for k in 1:np; set_start_value(teta[k], theta_init_guess[k]); end
 
 if USE_WARM_START
-    # Lógica de Warm Start (simplificada)
-    println("[WARM-START] Intentando warm start...")
-    ws_v = generate_warm_start(S, lb, ub, C0_INIT, vec(DATA_TIME_GRID), obj)
-    
-    if ws_v !== nothing
-        # Asignar v
-    else
-        # Cold start fallback
-        for i in 1:nfe, k in 1:nv; set_start_value(v[k,i], 0.0); end
-        for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+    let warm_start_v_matrix = begin
+            println("[WARM-START] Generando trayectoria inicial mediante dFBA secuencial...")
+            target_idx = obj
+            ts_flat = vec(DATA_TIME_GRID)
+            try
+                generate_warm_start(S, lb, ub, C0_INIT, ts_flat, target_idx)
+            catch err
+                @warn "[WARM-START] Fallo la generación LP" err
+                nothing
+            end
+        end
+
+        if warm_start_v_matrix !== nothing
+            println("[WARM-START] Aplicando trayectoria dinamica a las variables v...")
+            v_indices = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
+
+            for i in 1:nfe
+                idx_dense = (i - 1) * ncp + 1
+            for k in v_indices
+                idx_dense <= size(warm_start_v_matrix, 2) || continue
+                val = warm_start_v_matrix[k, idx_dense]
+                set_start_value(v_hat[k, i], val / SC_V)
+                lbk = lb[k]; ubk = ub[k]
+                if abs(val - lbk) < 1e-3
+                    set_start_value(alpha_L[k, i], -1.0)
+                    set_start_value(alpha_U[k, i], 0.0)
+                elseif abs(val - ubk) < 1e-3
+                    set_start_value(alpha_L[k, i], 0.0)
+                    set_start_value(alpha_U[k, i], 1.0)
+                else
+                    set_start_value(alpha_L[k, i], 0.0)
+                    set_start_value(alpha_U[k, i], 0.0)
+                end
+            end
+        end
+            println("[WARM-START] Inicialización completada.")
+        else
+            println("[WARM-START] Se usan valores por defecto (Cold Start).")
+        end
     end
 else
-    # Cold Start
-    for i in 1:nfe, k in 1:nv; set_start_value(v[k,i], 0.0); end
-    for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+    println("[WARM-START] Desactivado. Usando start_values por defecto.")
+    v_indices = (!REDUCED_MODE || reduced_sets === nothing) ? collect(1:nv) : K_AX
+    for i in 1:nfe, k in v_indices
+        set_start_value(v_hat[k, i], 0.0)
+        set_start_value(alpha_L[k, i], 0.0)
+        set_start_value(alpha_U[k, i], 0.0)
+    end
+    for i in 1:nfe
+        set_start_value(alpha_upt[1, i], 0.0)
+        set_start_value(alpha_upt[2, i], 0.0)
+    end
 end
 
-# Normalización C0 local para el modelo
-for i in 1:nc; c0[i] = c0[i] / cs[i]; end
+for i in 1:nc
+    c0[i] = c0[i] / cs[i]
+    c0[i] = max(c0[i], STATE_MIN_CONC[i])
+end
 
-# ============================================================
-# PARTE 1: FUNCION OBJETIVO
-# ============================================================
-@NLobjective(m, Min, 
-    omega * FO + 
-    sum(
-        sum(-phi1*FO_L[mc,i] - phi3*FO_U[mc,i] for mc in 1:nv) + 
-        sum(phi2*FO_upt[k,i] for k in 1:n_up) 
-    for i in 1:nfe)
+# Constantes de suavizado y limite inferior dinamico
+const K_smooth = 1.0       # Para Glucosa/Fructosa (Escala ~100 g/L)
+const K_nit_smooth = 0.001  # Para Nitrógeno (alineado con test.jl)
+const idx_NH4 = 2536
+const idx_Arg = 2729
+const idx_Gln = 2740
+const idx_Glu = 2738
+const idx_Ser = 2754
+const idx_Thr = 2759
+const idx_Ala = 2723
+const idx_Trp = 2760
+const NITROGEN_SOURCES = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
+const LB_SELECTOR_GLU = [mc == glu ? 1.0 : 0.0 for mc in 1:nv]
+const LB_SELECTOR_FRU = [mc == fru ? 1.0 : 0.0 for mc in 1:nv]
+const LB_SELECTOR_NIT = [mc in NITROGEN_SOURCES ? 1.0 : 0.0 for mc in 1:nv]
+@NLexpression(m, lb_eff[mc=1:nv, i=1:nfe],
+    lb[mc] * (
+        LB_SELECTOR_GLU[mc] * (c[3,i,1] / (c[3,i,1] + K_smooth)) +
+        LB_SELECTOR_FRU[mc] * (c[4,i,1] / (c[4,i,1] + K_smooth)) +
+        LB_SELECTOR_NIT[mc] * (c[2,i,1] / (c[2,i,1] + K_nit_smooth)) +
+        (1.0 - LB_SELECTOR_GLU[mc] - LB_SELECTOR_FRU[mc] - LB_SELECTOR_NIT[mc])
+    )
 )
 
-# ============================================================
-# PARTE 2: EXPRESIONES ZENTENO
-# ============================================================
-@NLexpression(m, mu0, exp(teta[1]))
-@NLexpression(m, Yeg, exp(teta[2]))
-@NLexpression(m, Yef, exp(teta[3]))
-@NLexpression(m, Yxn, exp(teta[4]))
+@NLparameter(m, eps_relax == MPCC_RELAX_TOL_INIT)
 
-const Yxg = YXG_nom
-const Yxf = YXF_nom
+@NLexpression(m, prod_L[mc=1:nv, i=1:nfe], (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i])
+@NLexpression(m, prod_U[mc=1:nv, i=1:nfe], (ub[mc] - v[mc,i]*vs[mc]) * alpha_U[mc,i])
+@NLexpression(m, prod_G[i=1:nfe], (-v[glu,i]*vs[glu]) * alpha_upt[1,i])
+@NLexpression(m, prod_F[i=1:nfe], (-v[fru,i]*vs[fru]) * alpha_upt[2,i])
+
+@constraints(m, begin
+    prod_L_hi[mc=1:nv, i=1:nfe], prod_L[mc,i] <=  eps_relax
+    prod_L_lo[mc=1:nv, i=1:nfe], prod_L[mc,i] >= -eps_relax
+    prod_U_hi[mc=1:nv, i=1:nfe], prod_U[mc,i] <=  eps_relax
+    prod_U_lo[mc=1:nv, i=1:nfe], prod_U[mc,i] >= -eps_relax
+    prod_G_hi[i=1:nfe],          prod_G[i]    <=  eps_relax
+    prod_G_lo[i=1:nfe],          prod_G[i]    >= -eps_relax
+    prod_F_hi[i=1:nfe],          prod_F[i]    <=  eps_relax
+    prod_F_lo[i=1:nfe],          prod_F[i]    >= -eps_relax
+end)
+
+@objective(m, Min, FO)
+
 
 JuMP.register(m, :smooth_injection, 4, smooth_injection; autodiff = true)
 JuMP.register(m, :dynamic_temperature, 1, dynamic_temperature; autodiff = true)
 JuMP.register(m, :death_rate_T, 2, death_rate_T; autodiff = true)
 
-@NLexpression(m, T_loc[i=1:ph, j=1:ncp], dynamic_temperature((i - 1 + radau_nodes[j]) * hv[i]))
-@NLexpression(m, mu_T_ij[i=1:ph, j=1:ncp], exp(59453.0 * (T_loc[i,j] - 300.0) / (300.0 * R * T_loc[i,j])))
-@NLexpression(m, Kg_T_ij[i=1:ph, j=1:ncp], exp(46055.0 * (T_loc[i,j] - 293.15) / (293.15 * R * T_loc[i,j])))
-@NLexpression(m, b_T_ij[i=1:ph, j=1:ncp], exp(11000.0 * (T_loc[i,j] - 296.15) / (296.15 * R * T_loc[i,j])))
-@NLexpression(m, mrate_ij[i=1:ph, j=1:ncp], 0.01 * exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j])))
+@NLexpression(m, mu0, exp(teta[1]))
+@NLexpression(m, Yeg, exp(teta[2]))
+@NLexpression(m, Yef, exp(teta[3]))
+const Yxg = YXG_nom
+const Yxf = YXF_nom
 
-@NLexpression(m, mu_j[i=1:ph, j=1:ncp], mu0 * mu_T_ij[i,j] * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T_ij[i,j] + eps)))
-@NLexpression(m, betaG_j[i=1:ph, j=1:ncp], betaG0_nom * b_T_ij[i,j] * (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T_ij[i,j] + eps)) * (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps)))
-@NLexpression(m, betaF_j[i=1:ph, j=1:ncp], betaF0_nom * b_T_ij[i,j] * (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T_ij[i,j] + eps)) * (Kig0_nom * Kg_T_ij[i,j] / (c[3,i,j] + Kig0_nom * Kg_T_ij[i,j] + eps)) * (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps)))
-@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate_T(c[5,i,j], T_loc[i,j]))
-@NLexpression(m, injection_rate[i=1:nfe, j=1:ncp], smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_1, DOSE_1, WIDTH_1) + smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_2, DOSE_2, WIDTH_2))
+@NLexpression(m, T_loc[i=1:ph, j=1:ncp],
+    dynamic_temperature((i - 1 + radau_nodes[j]) * hv[i])
+)
+@NLexpression(m, mu_T_ij[i=1:ph, j=1:ncp],
+    exp(59453.0 * (T_loc[i,j] - 300.0) / (300.0 * R * T_loc[i,j]))
+)
+@NLexpression(m, Kg_T_ij[i=1:ph, j=1:ncp],
+    exp(46055.0 * (T_loc[i,j] - 293.15) / (293.15 * R * T_loc[i,j]))
+)
+@NLexpression(m, b_T_ij[i=1:ph, j=1:ncp],
+    exp(11000.0 * (T_loc[i,j] - 296.15) / (296.15 * R * T_loc[i,j]))
+)
+@NLexpression(m, mrate_ij[i=1:ph, j=1:ncp],
+    0.01 * exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j]))
+)
 
-# ============================================================
-# PARTE 3: DATOS NITROGENO
-# ============================================================
-N_atoms = Dict(idx_NH4 => 1.0, idx_Arg => 4.0, idx_Gln => 2.0, idx_Glu => 1.0, idx_Ser => 1.0, idx_Thr => 1.0, idx_Ala => 1.0, idx_Trp => 2.0)
-N_profile_ratios = Dict(idx_NH4 => 0.40, idx_Arg => 0.20, idx_Gln => 0.10, idx_Glu => 0.05, idx_Ser => 0.05, idx_Thr => 0.05, idx_Ala => 0.05, idx_Trp => 0.10)
+@NLexpression(m, cN_pos[i=1:ph, j=1:ncp], max(c[2,i,j], STATE_FLOOR))
+@NLexpression(m, cG_pos[i=1:ph, j=1:ncp], max(c[3,i,j], STATE_FLOOR))
+@NLexpression(m, cF_pos[i=1:ph, j=1:ncp], max(c[4,i,j], STATE_FLOOR))
+@NLexpression(m, cE_pos[i=1:ph, j=1:ncp], max(c[5,i,j], STATE_FLOOR))
 
-# Build parameter vectors for nonlinear usage (no Base.get in NL expressions)
-N_atoms_vec = ones(nv)
-N_profile_vec = zeros(nv)
-for k in keys(N_atoms)
-    1 <= k <= nv && (N_atoms_vec[k] = N_atoms[k])
-end
-for k in keys(N_profile_ratios)
-    1 <= k <= nv && (N_profile_vec[k] = N_profile_ratios[k])
-end
-const MW_N   = 0.014007
-const MW_GLU = 0.180156
-const MW_FRU = 0.180156
-const MW_ETH = 0.046070
+@NLexpression(m, mu_j[i=1:ph, j=1:ncp],
+    mu0 * mu_T_ij[i,j] * (cN_pos[i,j] / (cN_pos[i,j] + Kn0_nom * Kg_T_ij[i,j] + eps))
+)
+@NLexpression(m, betaG_j[i=1:ph, j=1:ncp],
+    betaG0_nom * b_T_ij[i,j] *
+    (cG_pos[i,j] / (cG_pos[i,j] + Kg0_nom * Kg_T_ij[i,j] + eps)) *
+    (Kie0_nom * Kg_T_ij[i,j] / (cE_pos[i,j] + Kie0_nom * Kg_T_ij[i,j] + eps))
+)
+@NLexpression(m, betaF_j[i=1:ph, j=1:ncp],
+    betaF0_nom * b_T_ij[i,j] *
+    (cF_pos[i,j] / (cF_pos[i,j] + Kf0_nom * Kg_T_ij[i,j] + eps)) *
+    (Kig0_nom * Kg_T_ij[i,j] / (cG_pos[i,j] + Kig0_nom * Kg_T_ij[i,j] + eps)) *
+    (Kie0_nom * Kg_T_ij[i,j] / (cE_pos[i,j] + Kie0_nom * Kg_T_ij[i,j] + eps))
+)
+@NLexpression(m, phiG_j[i=1:ph, j=1:ncp], cG_pos[i,j] / (cG_pos[i,j] + cF_pos[i,j] + eps))
+@NLexpression(m, phiF_j[i=1:ph, j=1:ncp], cF_pos[i,j] / (cG_pos[i,j] + cF_pos[i,j] + eps))
+@NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate_T(cE_pos[i,j], T_loc[i,j]))
+@NLexpression(m, Yxn, exp(teta[4]))
+@NLexpression(m, injection_rate[i=1:nfe, j=1:ncp],
+    smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_1, DOSE_1, WIDTH_1) +
+    smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_2, DOSE_2, WIDTH_2)
+)
 
-# ============================================================
-# PARTE 4: LÍMITES DINÁMICOS
-# ============================================================
-@NLexpressions(m, begin
-# 1. Macro Zenteno (Calculados en GRAMOS/gDW/h)    
-    vx[i=1:ph],  (mu_j[i,3])
-    vg[i=1:ph],  (mu_j[i,3]/Yxg + betaG_j[i,3]/Yeg + mrate_ij[i,3]*(c[3,i,3]/(c[3,i,3]+c[4,i,3])))
-    vf[i=1:ph],  (mu_j[i,3]/YXF_nom + betaF_j[i,3]/Yef + mrate_ij[i,3]*(c[4,i,3]/(c[3,i,3]+c[4,i,3])))
-    vn[i=1:ph],  (mu_j[i,3]/Yxn)
-
-# 2. Desglose del Nitrógeno (Transformación a mmol de METABOLITO)
-    # Fórmula: (gN_total * Ratio) / (MW_N * Atomos) * 1000
-    # MW_N convierte gN -> molN
-    # N_atoms convierte molN -> molMetabolito
-    # 1000 convierte mol -> mmol
-    v_limit_N[k=1:nv, i=1:ph], 
-        (vn[i] * N_profile_vec[k]) / (N_atoms_vec[k] * MW_N)
-
-# 3. Wrapper L_uptake (Todo en mmol)
-    # Convertimos también Glucosa y Fructosa a mmol para que L_uptake sea homogéneo
-    L_uptake[k=1:n_up, i=1:ph], 
-        IS_GLU[k] * (vg[i] / MW_GLU) + 
-        IS_FRU[k] * (vf[i] / MW_FRU) + 
-        IS_NIT[k] * v_limit_N[UPTAKE_IDXS[k], i]
-end)
-
-# ============================================================
-# PARTE 5: RESTRICCIONES
-# ============================================================
 @constraints(m, begin
-    # Colocación
+    coll_c_n[l=1:nc, i=2:ph, j=1:ncp], c[l,i,j] == c[l,i-1,ncp] + hv[i] * sum(colmat[j,k] * cdot[l,i,k] for k in 1:ncp)
     coll_c_0[l=1:nc, j=1:ncp], c[l,1,j] == c0[l] + hv[1] * sum(colmat[j,k] * cdot[l,1,k] for k in 1:ncp)
-    coll_c_n[l=1:nc, i=2:ph, j=1:ncp], c[l,i,j] == c[l,i-1,ncp] + hv[i] * sum(colmat[j,k]*cdot[l,i,k] for k in 1:ncp)
-    
-    # FBA
-    Sc[mc=1:nm,i=1:nfe],  sum(S[mc,k]*v[k,i]*vs[k] for k in 1:nv) == 0
-    v_UB[mc=1:nv, i=1:nfe], v[mc,i]*vs[mc] - ub[mc] <= 0
-    v_LB[mc=1:nv,i=1:nfe], -v[mc,i]*vs[mc] + lb[mc] <= 0
-
-    # Time-step
+    c_LB[l=1:nc, i=1:nfe, j=1:ncp], STATE_MIN_CONC[l] - c[l,i,j] <= 0
     MFE1, sum(hv[i] for i in 1:nfe) == th
-    MFE3[i=1:nfe], hv[i] >= 0.0
-    MFE4[i=1:nfe], hv[i] >= (1.0 - var_h) * hm[1]
-    MFE5[i=1:nfe], hv[i] <= (1.0 + var_h) * hm[1]
-
-    # KKT Lagrangiano
-    Lagr[mc=1:nv,i=1:nfe], d[mc] + w*v[mc,i]*vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] + sum(SELECT_UPTAKE[mc,k] * alpha_upt[k,i] for k in 1:n_up) + sum(S[k,mc]*lambda_[k,i] for k in 1:nm) == 0
 end)
 
 if ESTIMATE_PARAMS
@@ -1555,64 +1580,68 @@ else
     end)
 end
 
-# ============================================================
-# PARTE 6: ODES & COMPLEMENTARIEDAD
-# ============================================================
-if 1 <= obj <= nv
-    @expression(m, v_obj[i=1:nfe], v[obj,i])
+
+if !REDUCED_MODE || reduced_sets === nothing
+    @constraints(m, begin
+        Sc[mc=1:nm, i=1:nfe],  sum(S[mc,k] * v[k,i] * vs[k] for k in 1:nv) == 0
+        v_UB[mc=1:nv, i=1:nfe], v[mc,i]*vs[mc] - ub[mc] <= 0
+    end)
+    @NLconstraints(m, begin
+        v_LB_dyn[mc=1:nv, i=1:nfe], -v[mc,i]*vs[mc] + lb_eff[mc,i] <= 0
+    end)
+    @constraints(m, begin
+        Lagr[mc=1:nv, i=1:nfe],
+            d[mc] + w * v[mc,i] * vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] +
+            up[mc] * alpha_upt[1,i] + up2[mc] * alpha_upt[2,i] +
+            sum(S[k,mc] * lambda_[k,i] for k in 1:nm) == 0
+        alpha1_LB[mc=1:nv, i=1:nfe], alpha_L[mc,i] <= 0
+        alpha1_UB[mc=1:nv, i=1:nfe], alpha_U[mc,i] >= 0
+    end)
 else
-    @expression(m, v_obj[i=1:nfe], 0.0)
+    # (Bloque REDUCED_MODE omitido)
 end
-if 1 <= eth <= nv
-    @expression(m, v_eth[i=1:nfe], v[eth,i])
-else
-    @expression(m, v_eth[i=1:nfe], 0.0)
+
+for i in 1:ph, j in 1:ncp
+    @NLconstraint(m, cdot[1,i,j] == (mu_j[i,j] - Kd_j[i,j]) * c[1,i,j])
+    @NLconstraint(m, cdot[2,i,j] == -(mu_j[i,j] / Yxn) * c[1,i,j] + injection_rate[i,j])
+    @NLconstraint(m, cdot[3,i,j] == -((mu_j[i,j] / Yxg) + (betaG_j[i,j] / Yeg) + mrate_ij[i,j] * phiG_j[i,j]) * c[1,i,j])
+    @NLconstraint(m, cdot[4,i,j] == -((mu_j[i,j] / Yxf) + (betaF_j[i,j] / Yef) + mrate_ij[i,j] * phiF_j[i,j]) * c[1,i,j])
+    @NLconstraint(m, cdot[5,i,j] == (betaG_j[i,j] + betaF_j[i,j]) * c[1,i,j])
 end
 
 @NLconstraints(m, begin
-
-# ==========================================
-    # 1. ECUACIONES DIFERENCIALES (ODES)
-# ==========================================
-
-    m1[i=1:ph, j=1:ncp], cdot[1,i,j] == 
-        (v_obj[i] - Kd_j[i,j]) * c[1,i,j]
-    m2[i=1:ph, j=1:ncp], cdot[2,i,j] == 
-        - MW_N * sum( (-v[UPTAKE_IDXS[k],i] * vs[UPTAKE_IDXS[k]]) * N_atoms_vec[UPTAKE_IDXS[k]] for k in 3:n_up ) * c[1,i,j] + injection_rate[i,j]
-    m3[i=1:ph, j=1:ncp], cdot[3,i,j] == 
-        - MW_GLU * (-v[glu,i]*vs[glu]) * c[1,i,j]
-    m4[i=1:ph, j=1:ncp], cdot[4,i,j] == 
-        - MW_FRU * (-v[fru,i]*vs[fru]) * c[1,i,j]
-    m5[i=1:ph, j=1:ncp], cdot[5,i,j] == 
-        MW_ETH * v_eth[i] * c[1,i,j]
-    
-# ==========================================
-    # 2. RESTRICCIONES DE ACOPLAMIENTO              Uptake Coupling v (mmol) * MW (g/mmol) <= vg (g)
-# ==========================================
-    # Restricción de Crecimiento (Semi-fijación)
-    growth_UB_dyn[i=1:nfe], 
-        v[obj, i] * vs[obj] <= vx[i]
-
-    # Uptake Coupling (Ahora es dimensionalmente correcto: mmol <= mmol)
-    v_LB_uptake[k=1:n_up, i=1:nfe], 
-        -v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i] <= 0
-
-    # Complementariedad (También correcta)
-    FO_upt_cons[k=1:n_up, i=1:nfe],
-        FO_upt[k,i] == (-v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i]) * alpha_upt[k,i]
-
-    # Bounds Complementarity
-    FO1[mc=1:nv,i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] -lb[mc])*alpha_L[mc,i]
-    FO2[mc=1:nv,i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] -ub[mc])*alpha_U[mc,i]
-
-    # Data Fitting
-    m8, FO == sum( sum( sum( (data[i,j,mc]-c[i,j,mc])^2 for i in 1:nc)   for j in 1:ph)   for mc in 1:ncp)
+    FO3_upt_def[i=1:nfe], FO_upt[1,i] == (-v[glu,i]*vs[glu]) * alpha_upt[1,i]
+    FO4_upt_def[i=1:nfe], FO_upt[2,i] == (-v[fru,i]*vs[fru]) * alpha_upt[2,i]
+    FO_def, FO == sum((data[l,i,j] - c[l,i,j])^2 for l in MEAS_STATES, i in 1:ph, j in 1:ncp)
 end)
 
+if !REDUCED_MODE || reduced_sets === nothing
+    @NLconstraints(m, begin
+        FO1_def[mc=1:nv, i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] - lb_eff[mc,i]) * alpha_L[mc,i]
+        FO2_def[mc=1:nv, i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+    end)
+end
 
 println("Iniciando optimizacion robusta V3...")
 t_start = time()
-optimize!(m)
+
+eps_schedule = [1e0, 1e-1]
+for (k, eps_val) in enumerate(eps_schedule)
+    println("[HOMOTOPY] Paso $k, eps_relax = ", eps_val)
+    set_value(eps_relax, eps_val)
+    if k > 1
+        set_optimizer_attribute(m, "warm_start_init_point", "yes")
+    end
+    optimize!(m)
+    status = termination_status(m)
+    pr_status = primal_status(m)
+    println("  status = ", status, " / ", pr_status)
+    if !(status in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED))
+        println("  [HOMOTOPY] Se detiene la secuencia por status no óptimo.")
+        break
+    end
+end
+
 t_end = time()
 
 wall_time = t_end - t_start
