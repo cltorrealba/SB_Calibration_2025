@@ -142,6 +142,52 @@ const nc = 5 # X,N,G,F,E
 const NOISE_SEED = 1234
 const DEFAULT_LINEAR_SOLVER = "mumps"
 
+# ---------------------------------------------
+# Selección de solver lineal (MUMPS por defecto)
+# HSL (MA57/MA77/MA86/MA97) requiere HSL_jll instalado
+# Pardiso requiere configuración de Panua
+# ---------------------------------------------
+const ALLOWED_IPOPT_SOLVERS = Set(["mumps", "spral", "pardiso", "ma57", "ma77", "ma86", "ma97"])
+
+function _prepend_to_path!(dir::AbstractString)
+    isempty(dir) && return
+    if isdir(String(dir))
+        path_now = get(ENV, "PATH", "")
+        dir_norm = replace(String(dir), '\\' => '/')
+        path_norm = replace(path_now, '\\' => '/')
+        occursin(lowercase(dir_norm), lowercase(path_norm)) || (ENV["PATH"] = string(String(dir), ";", path_now))
+    end
+end
+
+function configure_ipopt_env!()
+    solver = lowercase(get(ENV, "IPOPT_LINEAR_SOLVER", DEFAULT_LINEAR_SOLVER))
+    # Pardiso (Panua) – añadir rutas si se solicita
+    if solver == "pardiso"
+        haskey(ENV, "PANUA_IPOPT_DIR") && _prepend_to_path!(joinpath(ENV["PANUA_IPOPT_DIR"], "bin"))
+        haskey(ENV, "IPOPT_PARDISO_DLL_DIR") && _prepend_to_path!(ENV["IPOPT_PARDISO_DLL_DIR"])
+        haskey(ENV, "PANUA_LIC_PATH") && _prepend_to_path!(ENV["PANUA_LIC_PATH"])
+        # Mapear hilos si se define PARDISO_NUM_THREADS
+        if haskey(ENV, "PARDISO_NUM_THREADS")
+            ENV["OMP_NUM_THREADS"] = ENV["PARDISO_NUM_THREADS"]
+            ENV["MKL_NUM_THREADS"] = ENV["PARDISO_NUM_THREADS"]
+        end
+    # HSL (MA57/MA77/MA86/MA97) – Requiere HSL_jll con solvers reales
+    elseif solver in ("ma57", "ma77", "ma86", "ma97")
+        try
+            @eval import HSL_jll
+            # Cargar OpenBLAS32 para soporte LP64 (requerido por HSL)
+            @eval using LinearAlgebra, OpenBLAS32_jll
+            @eval LinearAlgebra.BLAS.lbt_forward(OpenBLAS32_jll.libopenblas)
+            @info "HSL_jll detectado; configurando Ipopt para usar HSL" solver HSL_jll.libhsl_path
+        catch
+            # Silencioso: el fallback a CoinHSL local se maneja en la configuración de Ipopt
+        end
+    end
+    return solver in ALLOWED_IPOPT_SOLVERS ? solver : DEFAULT_LINEAR_SOLVER
+end
+
+const SELECTED_IPOPT_SOLVER = configure_ipopt_env!()
+
 const MU0_nom   = 0.141665
 const YXN_nom   = 9.80576
 const YXG_nom   = 0.394345
@@ -213,7 +259,7 @@ c0 = copy(C0_INIT)
 # DISCRETIZACION
 nfe = 6   
 ncp = 3
-th  = 96.0 
+th  = 40.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
@@ -1359,7 +1405,42 @@ end
 m = Model(Ipopt.Optimizer)
 
 # 1. Configuración Básica
-set_optimizer_attribute(m, "linear_solver", "mumps") # O "ma57" si lo tienes, es mejor para MPCC
+set_optimizer_attribute(m, "linear_solver", SELECTED_IPOPT_SOLVER)
+
+# Si se usa HSL, configurar ruta a libhsl
+if SELECTED_IPOPT_SOLVER in ("ma57", "ma77", "ma86", "ma97")
+    local hsl_configured = false
+    try
+        # Intentar usar HSL_jll si está disponible
+        @eval import HSL_jll
+        # Cargar OpenBLAS32 para soporte LP64 (requerido por HSL)
+        @eval using LinearAlgebra, OpenBLAS32_jll
+        @eval LinearAlgebra.BLAS.lbt_forward(OpenBLAS32_jll.libopenblas)
+        set_optimizer_attribute(m, "hsllib", HSL_jll.libhsl_path)
+        hsl_configured = true
+    catch
+        # Fallback: usar CoinHSL binarios locales
+        coinhsl_path = raw"C:\COIN_HSL\CoinHSL.v2023.11.17.x86_64-w64-mingw32-libgfortran5\bin\libhsl.dll"
+        if isfile(coinhsl_path)
+            set_optimizer_attribute(m, "hsllib", coinhsl_path)
+            hsl_configured = true
+        end
+    end
+    
+    if !hsl_configured
+        @error "No se pudo configurar HSL en Ipopt. HSL_jll no disponible y CoinHSL no encontrado."
+    end
+    
+    # Configuración específica para MA77 (más robusto para problemas grandes)
+    if SELECTED_IPOPT_SOLVER == "ma77"
+        # MA77 usa archivos temporales automáticamente - no configurar ma77_file_base
+        set_optimizer_attribute(m, "ma77_print_level", -1)  # Silenciar MA77
+        set_optimizer_attribute(m, "ma77_order", "metis")   # Reordenamiento con METIS
+        set_optimizer_attribute(m, "ma77_small", 1e-20)     # Umbral para pivotes pequeños
+        set_optimizer_attribute(m, "ma77_u", 0.01)          # Tolerancia de pivoteo
+    end
+end
+
 set_optimizer_attribute(m, "print_level", 5)
 set_optimizer_attribute(m, "max_iter", 1000) # Damos más iteraciones por si el modo adaptativo es lento
 
@@ -1371,7 +1452,7 @@ set_optimizer_attribute(m, "tol", 1e-4)
 set_optimizer_attribute(m, "acceptable_iter", 5)       # Mantenerse estable 5 iteraciones
 set_optimizer_attribute(m, "acceptable_tol", 1e-1)     # Tolerancia relajada (suficiente para ingeniería)
 set_optimizer_attribute(m, "acceptable_constr_viol_tol", 1e-2) # Violación de restricciones aceptable
-set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e10)   # ¡CRÍTICO! Ignora el ruido dual del MPCC
+# set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e10)   # ¡CRÍTICO! Ignora el ruido dual del MPCC
 set_optimizer_attribute(m, "acceptable_compl_inf_tol", 1e-2)   # Tolerancia de complementariedad
 
 # 4. Estrategia de Barrera (Mu Strategy) - Anti-Rebote

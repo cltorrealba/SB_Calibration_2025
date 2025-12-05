@@ -46,7 +46,7 @@ Ubicación: `MPCC/De Oliveira 2023/Yeast_83/estima/julia_deploy`
 - Ejecutable: `experiment_pipeline.jl`
 - Modos soportados: `baseline`, `seed`, `seed_run`, `seed180`, `seed180_bv`, `seed180_cf`, `seed_reduced`, `seed_frozen`, `seed_run_frozen`, `bv_trial`, `compare`, `init_only`.
 
-### Solver por defecto y Pardiso (opt‑in)
+### Solver por defecto y Pardiso/HSL (opt‑in)
 
 - Por defecto: `linear_solver=mumps` para no consumir licencias de Pardiso.
 - Para habilitar Pardiso por corrida, exporta:
@@ -67,6 +67,46 @@ $env:PANUA_LIC_PATH="C:\ruta\panua-licenses"
 Notas:
 - El pipeline silencia el banner de licencia con `PARDISOLICMESSAGE=1` y fija `OMP_NUM_THREADS`/`MKL_NUM_THREADS` si `PARDISO_NUM_THREADS` está definido.
 - Si `IPOPT_LINEAR_SOLVER` no está seteado, se usa MUMPS.
+
+Para habilitar HSL (MA77/MA57/MA86/MA97), necesitas la versión **completa** de `HSL_jll.jl` (no la dummy):
+
+#### Paso 1: Descargar HSL_jll completo
+
+1. Visita https://licences.stfc.ac.uk/product/libhsl
+2. Descarga `HSL_jll.jl.v2024.11.28.zip` (o versión más reciente)
+3. Extrae en una carpeta, por ejemplo: `C:\HSL_jll`
+
+**Nota macOS:** Quitar quarantine antes de extraer:
+```bash
+xattr -d com.apple.quarantine HSL_jll.jl.v2024.11.28.zip
+```
+
+#### Paso 2: Instalar HSL_jll en modo desarrollo
+
+```powershell
+# Desde Julia REPL (una sola vez)
+julia> ]
+pkg> dev C:\HSL_jll  # o la ruta donde extrajiste HSL_jll
+```
+
+#### Paso 3: Usar solver HSL
+
+Luego, por corrida, exporta:
+
+```powershell
+$env:IPOPT_LINEAR_SOLVER="ma77"   # o "ma57" | "ma86" | "ma97"
+julia --project=. .\MPCC_Zenteno_stripping.jl
+```
+
+Notas HSL:
+- **Versión dummy vs completa:** El `HSL_jll` del registro público de Julia es una versión "dummy" sin solvers. Debes descargar e instalar la versión completa desde el sitio de HSL.
+- **Verificar instalación:** Ejecuta `julia --project=. .\check_hsl.jl` para verificar si tienes la versión funcional.
+- Los scripts automáticamente:
+  - Detectan HSL_jll y cargan OpenBLAS32 (LP64 BLAS requerido)
+  - Configuran `hsllib` apuntando a `HSL_jll.libhsl_path`
+  - Si HSL_jll no está funcional, muestran error con instrucciones
+- Compatible con Julia ≥ 1.9 (recomendado para libblastrampoline).
+- Más info: https://github.com/JuliaSmoothOptimizers/HSL.jl
 
 ### Comandos típicos (PowerShell)
 

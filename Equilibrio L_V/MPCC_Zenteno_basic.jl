@@ -15,6 +15,46 @@ using FileIO, JLD2
 using DelimitedFiles
 
 # ---------------------------------------------
+# Solver lineal (por entorno) – MUMPS por defecto
+# y preparación de PATH para DLLs en Windows
+# ---------------------------------------------
+const DEFAULT_LINEAR_SOLVER = "mumps"
+const ALLOWED_IPOPT_SOLVERS = Set(["mumps", "spral", "pardiso", "ma57", "ma77", "ma86", "ma97"])
+
+function _prepend_to_path!(dir::AbstractString)
+    isempty(dir) && return
+    if isdir(String(dir))
+        path_now = get(ENV, "PATH", "")
+        dir_norm = replace(String(dir), '\\' => '/')
+        path_norm = replace(path_now, '\\' => '/')
+        occursin(lowercase(dir_norm), lowercase(path_norm)) || (ENV["PATH"] = string(String(dir), ";", path_now))
+    end
+end
+
+function configure_ipopt_env!()
+    solver = lowercase(get(ENV, "IPOPT_LINEAR_SOLVER", DEFAULT_LINEAR_SOLVER))
+    if solver == "pardiso"
+        haskey(ENV, "PANUA_IPOPT_DIR") && _prepend_to_path!(joinpath(ENV["PANUA_IPOPT_DIR"], "bin"))
+        haskey(ENV, "IPOPT_PARDISO_DLL_DIR") && _prepend_to_path!(ENV["IPOPT_PARDISO_DLL_DIR"])
+        haskey(ENV, "PANUA_LIC_PATH") && _prepend_to_path!(ENV["PANUA_LIC_PATH"])
+        if haskey(ENV, "PARDISO_NUM_THREADS")
+            ENV["OMP_NUM_THREADS"] = ENV["PARDISO_NUM_THREADS"]
+            ENV["MKL_NUM_THREADS"] = ENV["PARDISO_NUM_THREADS"]
+        end
+    elseif solver in ("ma57", "ma77", "ma86", "ma97")
+        try
+            @eval import HSL
+            @info "HSL.jl detectado; solver lineal HSL disponible" solver
+        catch
+            @warn "HSL.jl no instalado; solvers HSL no disponibles. Instala con: import Pkg; Pkg.add(\"HSL\")" solver
+        end
+    end
+    return solver in ALLOWED_IPOPT_SOLVERS ? solver : DEFAULT_LINEAR_SOLVER
+end
+
+const SELECTED_IPOPT_SOLVER = configure_ipopt_env!()
+
+# ---------------------------------------------
 # Paths e IO
 # ---------------------------------------------
 const BASE_DIR   = @__DIR__
@@ -149,7 +189,7 @@ set_optimizer_attribute(m, "print_level", 5)
 set_optimizer_attribute(m, "tol", 1e-4)
 set_optimizer_attribute(m, "acceptable_iter", 5)
 set_optimizer_attribute(m, "acceptable_tol", 1e-2)
-set_optimizer_attribute(m, "linear_solver", "mumps")
+set_optimizer_attribute(m, "linear_solver", SELECTED_IPOPT_SOLVER)
 
 if haskey(ENV, "J_IPOPT_MAX_ITER")
     try
