@@ -44,6 +44,8 @@ end
 const EXPERIMENT_TOKEN = _sanitize_experiment_name(get(ENV, "EXPERIMENT", "default"))
 const EXPERIMENT_DIR = joinpath(PLOTS_DIR, EXPERIMENT_TOKEN)
 isdir(EXPERIMENT_DIR) || mkpath(EXPERIMENT_DIR)
+const WARM_START_FILE = joinpath(EXPERIMENT_DIR, "warm_start_seed.jld2")
+
 
 function _load_reduced_sets(path::String)
     if !isfile(path)
@@ -73,8 +75,8 @@ const SC_X = 1.0     # biomasa/N se mantienen en ~1
 # ---------------------------------------------
 # Constantes de Penalización MPCC (Faltantes en versión anterior)
 # ---------------------------------------------
-const phi1 = 1e0
-const phi2 = 1e0
+const phi1 = 1e2
+const phi2 = 1e2
 const phi3 = 1e0
 
 # ---------------------------------------------
@@ -118,6 +120,7 @@ for idx in NITROGEN_SOURCES
         println("  -> Abriendo flujo nitrogenado cerrado: índice $idx")
         lb[idx] = -1000.0 
     end
+    ub[idx] == 0.0
 end
 
 # Agrupamos Glucosa, Fructosa y TODAS las fuentes de nitrógeno (filtradas y robustas)
@@ -248,7 +251,7 @@ UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
 
 # Variables observadas y ruido aleatorio
 const MEAS_STATES = (3, 4, 5) # G, F, E
-const NOISE_REL_STD = 0.10
+const NOISE_REL_STD = 0.0
 Random.seed!(NOISE_SEED)
 
 # Condiciones iniciales
@@ -263,8 +266,7 @@ th  = 40.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
-const HM_REFERENCE = vec(hm)
-var_h = 1.0
+var_h = 0.0
 
 colmat = [
     0.19681547722366   -0.06553542585020   0.02377097434822;
@@ -275,9 +277,8 @@ const radau_nodes = (0.15505, 0.64495, 1.0)
 
 # OMEGA
 w     = 1e-20
-omega = 1.0 
+omega = 0
 d   = zeros(nv); d[obj] = -1.0
-
 cs = ones(nc)
 vs = ones(nv)
 
@@ -1442,7 +1443,7 @@ if SELECTED_IPOPT_SOLVER in ("ma57", "ma77", "ma86", "ma97")
 end
 
 set_optimizer_attribute(m, "print_level", 5)
-set_optimizer_attribute(m, "max_iter", 1000) # Damos más iteraciones por si el modo adaptativo es lento
+set_optimizer_attribute(m, "max_iter", 500) # Damos más iteraciones por si el modo adaptativo es lento
 
 # 2. Tolerancia Estricta (El objetivo ideal)
 set_optimizer_attribute(m, "tol", 1e-4)
@@ -1498,14 +1499,46 @@ for k in 1:np
 end
 
 if USE_WARM_START
-    # Lógica de Warm Start (simplificada)
-    println("[WARM-START] Intentando warm start...")
-    ws_v = generate_warm_start(S, lb, ub, C0_INIT, vec(DATA_TIME_GRID), obj)
-    
-    if ws_v !== nothing
-        # Asignar v
+    # Warm Start: primero intenta cargar semilla guardada; si no hay, se arranca en cero (sin pFBA)
+    local seed_loaded = false
+    if isfile(WARM_START_FILE)
+        try
+            JLD2.jldopen(WARM_START_FILE, "r") do f
+                if haskey(f, "v_seed")
+                    v_seed = read(f, "v_seed")
+                    for i in 1:nfe, k in 1:nv
+                        set_start_value(v[k, i], v_seed[k, i])
+                    end
+                end
+                if haskey(f, "alpha_upt_seed")
+                    au_seed = read(f, "alpha_upt_seed")
+                    for i in 1:nfe, k in 1:n_up
+                        set_start_value(alpha_upt[k, i], au_seed[k, i])
+                    end
+                end
+                if haskey(f, "teta_seed")
+                    teta_seed = read(f, "teta_seed")
+                    for k in 1:min(np, length(teta_seed))
+                        set_start_value(teta[k], teta_seed[k])
+                    end
+                end
+                if haskey(f, "hv_seed")
+                    hv_seed = read(f, "hv_seed")
+                    for i in 1:min(nfe, length(hv_seed))
+                        set_start_value(hv[i], hv_seed[i])
+                    end
+                end
+            end
+            seed_loaded = true
+            println("[WARM-START] Semilla cargada desde ", WARM_START_FILE)
+        catch err
+            @warn "[WARM-START] No se pudo cargar la semilla guardada; usando pFBA" err
+        end
     else
-        # Cold start fallback
+        println("[WARM-START] No hay semilla en ", WARM_START_FILE, "; inicio sin warm start guardado.")
+    end
+    if !seed_loaded
+        println("[WARM-START] Sin semilla guardada; inicio en cero (sin pFBA).")
         for i in 1:nfe, k in 1:nv; set_start_value(v[k,i], 0.0); end
         for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
     end
@@ -1723,6 +1756,108 @@ if (stats = collect_ipopt_stats(m)) !== nothing
     constr_viol = stats.constraint_violation
     iter_count = stats.iter_count
 end
+
+function _max_with_idx(name, arr)
+    vals = abs.(arr)
+    mx, idx = findmax(vals)
+    println(@sprintf("%-16s max=%.3e at %s raw=%.3e", name, mx, idx, arr[idx]))
+end
+
+function report_residuals()
+    try
+        vval  = value.(v)
+        cval  = value.(c)
+        hvval = value.(hv)
+        cdval = value.(cdot)
+        alL   = value.(alpha_L)
+        alU   = value.(alpha_U)
+        alUp  = value.(alpha_upt)
+        lam   = value.(lambda_)
+        Llim  = value.(L_uptake)
+        vxval = value.(vx)
+
+        coll0 = [cval[l,1,j] - (c0[l] + hvval[1] * sum(colmat[j,k] * cdval[l,1,k] for k in 1:ncp))
+                 for l in 1:nc, j in 1:ncp]
+        colln = [cval[l,i,j] - (cval[l,i-1,ncp] + hvval[i] * sum(colmat[j,k] * cdval[l,i,k] for k in 1:ncp))
+                 for l in 1:nc, i in 2:ph, j in 1:ncp]
+        fba   = [sum(S[mc,k] * vval[k,i] * vs[k] for k in 1:nv) for mc in 1:nm, i in 1:nfe]
+        ubv   = [vval[mc,i] * vs[mc] - ub[mc] for mc in 1:nv, i in 1:nfe]
+        lbv   = [-vval[mc,i] * vs[mc] + lb[mc] for mc in 1:nv, i in 1:nfe]
+        lagr  = [d[mc] + w * vval[mc,i] * vs[mc] + alL[mc,i] + alU[mc,i] +
+                 sum(SELECT_UPTAKE[mc,k] * alUp[k,i] for k in 1:n_up) +
+                 sum(S[k,mc] * lam[k,i] for k in 1:nm)
+                 for mc in 1:nv, i in 1:nfe]
+        grow  = (1 <= obj <= nv) ? [vval[obj,i] * vs[obj] - vxval[i] for i in 1:nfe] : zeros(nfe)
+        upt   = [-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i] for k in 1:n_up, i in 1:nfe]
+        foL   = [(vval[mc,i] * vs[mc] - lb[mc]) * alL[mc,i] for mc in 1:nv, i in 1:nfe]
+        foU   = [(vval[mc,i] * vs[mc] - ub[mc]) * alU[mc,i] for mc in 1:nv, i in 1:nfe]
+        fou   = [(-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i]) * alUp[k,i] for k in 1:n_up, i in 1:nfe]
+
+        println("=== Post-solve residuals ===")
+        _max_with_idx("colloc0", coll0)
+        _max_with_idx("collocN", colln)
+        _max_with_idx("FBA", fba)
+        _max_with_idx("v UB", ubv)
+        _max_with_idx("v LB", lbv)
+        _max_with_idx("Lagr", lagr)
+        _max_with_idx("growth_UB", grow)
+        _max_with_idx("uptake", upt)
+        _max_with_idx("FO_L", foL)
+        _max_with_idx("FO_U", foU)
+        _max_with_idx("FO_upt", fou)
+        println(@sprintf("%-16s min=%.3e", "c min", minimum(cval)))
+    catch err
+        @warn "No se pudieron imprimir residuales" err
+    end
+end
+
+function report_uptake_details()
+    try
+        vval  = value.(v)
+        Llim  = value.(L_uptake)
+        au    = value.(alpha_upt)
+        upt   = [-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i] for k in 1:n_up, i in 1:nfe]
+        mx, idx = findmax(abs.(upt))
+        k = idx.I[1]; i = idx.I[2]; mc = UPTAKE_IDXS[k]
+        println("=== Uptake detail ===")
+        println("UPTAKE_IDXS = ", UPTAKE_IDXS)
+        println(@sprintf("max uptake viol=%.3e at k=%d (mc=%d) i=%d raw=%.3e L_upt=%.3e v=%.3e alpha_upt=%.3e FO_upt=%.3e",
+            mx, k, mc, i, upt[k,i], Llim[k,i], vval[mc,i], au[k,i], value(FO_upt[k,i])))
+        for kk in 1:min(n_up, 5)
+            jmax = min(nfe, 3)
+            vals_upt = [upt[kk, j] for j in 1:jmax]
+            vals_L   = [Llim[kk, j] for j in 1:jmax]
+            vals_v   = [vval[UPTAKE_IDXS[kk], j] for j in 1:jmax]
+            println(@sprintf("k=%d mc=%d upt[1..%d]=%s L_upt[1..%d]=%s v[mc,1..%d]=%s",
+                kk, UPTAKE_IDXS[kk], jmax, string(vals_upt), jmax, string(vals_L), jmax, string(vals_v)))
+        end
+    catch err
+        @warn "No se pudo imprimir detalle de uptake" err
+    end
+end
+function save_warm_start_seed(path::AbstractString)
+    try
+        v_seed = zeros(nv, nfe)
+        for i in 1:nfe, k in 1:nv
+            v_seed[k, i] = safe_value(v[k, i], 0.0)
+        end
+        alpha_upt_seed = zeros(n_up, nfe)
+        for i in 1:nfe, k in 1:n_up
+            alpha_upt_seed[k, i] = safe_value(alpha_upt[k, i], 0.0)
+        end
+        hv_seed = [safe_value(hv[i], hm[i]) for i in 1:nfe]
+        teta_seed = [safe_value(teta[k], theta_data_params[k]) for k in 1:np]
+        JLD2.jldsave(path; v_seed=v_seed, alpha_upt_seed=alpha_upt_seed, hv_seed=hv_seed, teta_seed=teta_seed,
+                     omega=omega, phi1=phi1, phi2=phi2, phi3=phi3, timestamp=Dates.now())
+        println("[WARM-START] Semilla guardada en ", path)
+    catch err
+        @warn "[WARM-START] No se pudo guardar la semilla" err
+    end
+end
+
+report_residuals()
+report_uptake_details()
+save_warm_start_seed(WARM_START_FILE)
 
 result_prefix = result_file_prefix(wall_time=wall_time, nfe=nfe, status=status, primal_status=pr_status)
 plot_output_path = result_prefix * ".png"
