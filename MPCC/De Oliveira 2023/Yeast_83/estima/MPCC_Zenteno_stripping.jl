@@ -33,7 +33,7 @@ isdir(PLOTS_DIR) || mkpath(PLOTS_DIR)
 const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
 const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
 
-const ESTIMATE_PARAMS = true
+const ESTIMATE_PARAMS = false
 
 function _sanitize_experiment_name(str::AbstractString)
     clean = strip(str)
@@ -83,60 +83,168 @@ const phi3 = 1e0
 # Indices y tamanos del GEM
 # ---------------------------------------------
 
-S     = readdlm(joinpath(ESTIMA_DIR, "S.csv"), ',')
-lbraw = readdlm(joinpath(ESTIMA_DIR, "lb.csv"), ',')
-ubraw = readdlm(joinpath(ESTIMA_DIR, "ub.csv"), ',')
+S     = readdlm(joinpath(ESTIMA_DIR, "S_hen.csv"), ',')
+lbraw = readdlm(joinpath(ESTIMA_DIR, "lb_hen.csv"), ',')
+ubraw = readdlm(joinpath(ESTIMA_DIR, "ub_hen.csv"), ',')
 lb    = lbraw isa AbstractVector ? Float64.(lbraw) : Float64.(lbraw[:,1])
 ub    = ubraw isa AbstractVector ? Float64.(ubraw) : Float64.(ubraw[:,1])
 
 nm = size(S, 1)
 nv = size(S, 2)
 
-const eth = 2630
-const obj = 3414
-const glu = 2588
-const fru = 2583
-const o2  = 2816
-const ATP = 3415
+# --- IDs de reacciones y metabolitos exportados desde MATLAB ---
+const RXN_IDS = readlines(joinpath(ESTIMA_DIR, "rxn_ids.txt"))
+const MET_IDS = readlines(joinpath(ESTIMA_DIR, "met_ids.txt"))
 
-const idx_NH4 = 2536
-const idx_Arg = 2729
-const idx_Gln = 2740
-const idx_Glu = 2738
-const idx_Ser = 2754
-const idx_Thr = 2759
-const idx_Ala = 2723
-const idx_Trp = 2760
-const NITROGEN_SOURCES = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
+const RXN_INDEX = Dict{String, Int}(rxn => i for (i, rxn) in pairs(RXN_IDS))
+const MET_INDEX = Dict{String, Int}(met => i for (i, met) in pairs(MET_IDS))
 
-NITROGEN_SOURCES_RAW = [idx_NH4, idx_Arg, idx_Gln, idx_Glu, idx_Ser, idx_Thr, idx_Ala, idx_Trp]
-const NITROGEN_SOURCES = filter(x -> 1 <= x <= nv, NITROGEN_SOURCES_RAW)
-
-println("Verificando bounds de fuentes de Nitrógeno...")
-for idx in NITROGEN_SOURCES
-    # Si el límite en el CSV es 0 (cerrado), lo abrimos a un valor grande negativo
-    # La restricción dinámica (L_uptake) será la que realmente mande.
-    if lb[idx] == 0.0
-        println("  -> Abriendo flujo nitrogenado cerrado: índice $idx")
-        lb[idx] = -1000.0 
-    end
-    ub[idx] == 0.0
+get_rxn(name::AbstractString) = get(RXN_INDEX, String(name)) do
+    error("La reacción '" * String(name) * "' no se encontró en RXN_INDEX")
 end
 
-# Agrupamos Glucosa, Fructosa y TODAS las fuentes de nitrógeno (filtradas y robustas)
-const UPTAKE_IDXS = vcat((1 <= glu <= nv) ? [glu] : Int[], (1 <= fru <= nv) ? [fru] : Int[], NITROGEN_SOURCES)
+get_met(name::AbstractString) = get(MET_INDEX, String(name)) do
+    error("El metabolito '" * String(name) * "' no se encontró en MET_INDEX")
+end
+
+# --- Reacciones clave (vía IDs) ---
+const eth = get_rxn("r_1761")   # intercambio de etanol
+const obj = get_rxn("r_4041")   # biomasa pseudoreaction
+const glu = get_rxn("r_1714")   # uptake glucosa
+const fru = get_rxn("r_1709")   # uptake fructosa
+const o2  = get_rxn("r_1992")   # intercambio de oxígeno
+
+# Nitrógeno que ya se usa en las restricciones dinámicas
+const idx_NH4 = get_rxn("r_1654")
+const idx_Arg = get_rxn("r_1879")
+const idx_Gln = get_rxn("r_1891")
+const idx_Glu = get_rxn("r_1889")
+const idx_Ser = get_rxn("r_1906")
+const idx_Thr = get_rxn("r_1911")
+const idx_Ala = get_rxn("r_1873")
+const idx_Trp = get_rxn("r_1912")
+
+const ACTIVE_N_SOURCE_IDS = [
+    "r_1654", # NH4Cl
+    "r_1879", # Arg
+    "r_1891", # Gln
+    "r_1889", # Glu
+    "r_1906", # Ser
+    "r_1911", # Thr
+    "r_1873", # Ala
+    "r_1912", # Trp
+]
+
+const UNUSED_AA_UPTAKE_IDS = [
+    "r_1880", # Asp
+    "r_1883", # Cys
+    "r_1810", # Gly
+    "r_1893", # His
+    "r_1897", # Ile
+    "r_1899", # Leu
+    "r_1900", # Lys
+    "r_1902", # Met
+    "r_1903", # Phe
+    "r_1913", # Tyr
+    "r_1914", # Val
+]
+
+const PRODUCT_RXN_IDS = [
+    "r_1761", # Ethanol exchange
+    "r_1808", # Glycerol exchange
+    "r_1634", # Acetate exchange
+    "r_2056", # Succinate exchange
+    "r_1549", # 2,3-butanediol
+    "r_1546", # Lactate
+    "r_1552", # Malate
+    "r_1765", # Ethyl acetate
+    "r_1867", # Isobutyl acetate
+    "r_1866", # Isobutanol
+    "r_1862", # Isoamyl acetate
+    "r_1865", # Isoamyl alcohol
+]
+
+function apply_anaerobic_model!(S::AbstractMatrix, lb::AbstractVector, ub::AbstractVector)
+    mets_ana = ["s_3714[c]", "s_1198[c]", "s_1203[c]", "s_1207[c]", "s_1212[c]", "s_0529[c]"]
+    rxn_cofactor = get_rxn("r_4598")
+
+    for mid in mets_ana
+        if haskey(MET_INDEX, mid)
+            S[get_met(mid), rxn_cofactor] = 0.0
+        elseif haskey(MET_INDEX, replace(mid, "[c]" => ""))
+            S[get_met(replace(mid, "[c]" => "")), rxn_cofactor] = 0.0
+        end
+    end
+
+    lb[get_rxn("r_1992")] = 0.0      # O2
+    lb[get_rxn("r_1757")] = -1000.0  # ergosterol
+    lb[get_rxn("r_1915")] = -1000.0  # lanosterol
+    lb[get_rxn("r_1994")] = -1000.0  # palmitoleate
+    lb[get_rxn("r_2106")] = -1000.0  # zymosterol
+    lb[get_rxn("r_2134")] = -1000.0  # 14-demethyllanosterol
+    lb[get_rxn("r_2137")] = -1000.0  # ergosta-5,7,22,24(28)-tetraen-3beta-ol
+    lb[get_rxn("r_2189")] = -1000.0  # oleate
+
+    lb[get_rxn("r_0713")] = 0.0      # OAA-malate shuttle (mito)
+    lb[get_rxn("r_0714")] = 0.0      # OAA-malate shuttle (cito)
+    ub[get_rxn("r_0487")] = 0.0      # glycerol dehydrogenase
+
+    return nothing
+end
+
+function configure_uptake_and_products!(lb::AbstractVector, ub::AbstractVector)
+    lb[glu] = -1000.0; ub[glu] = 0.0
+    lb[fru] = -1000.0; ub[fru] = 0.0
+
+    for rxn in ACTIVE_N_SOURCE_IDS
+        idx = get_rxn(rxn)
+        lb[idx] = -1000.0
+        ub[idx] = 0.0
+    end
+
+    for rxn in UNUSED_AA_UPTAKE_IDS
+        idx = get_rxn(rxn)
+        lb[idx] = 0.0
+        ub[idx] = 0.0
+    end
+
+    for rxn in PRODUCT_RXN_IDS
+        idx = get_rxn(rxn)
+        lb[idx] = 0.0
+        ub[idx] = 1000.0
+    end
+
+    return nothing
+end
+
+# --- CORRECCIÓN DE EMERGENCIA: MANTENIMIENTO FLEXIBLE ---
+# Evita que el modelo se vuelva infactible cuando la cinética es baja.
+if length(lb) >= 3414
+    println(">>> RELAJANDO ATP MAINTENANCE (idx 3414) de $(lb[3414]) a 0.0 para evitar infeasibility inicial.")
+    lb[3414] = 0.1
+end
+
+const SIM_MODE = lowercase(get(ENV, "SIM_MODE", "anaerobic"))
+println(">>> SIM_MODE = $(SIM_MODE)")
+
+if SIM_MODE == "anaerobic"
+    apply_anaerobic_model!(S, lb, ub)
+elseif SIM_MODE == "aerobic"
+    # Modelo base tal cual viene del GEM
+else
+    @warn "SIM_MODE desconocido: $(SIM_MODE). Se usa configuración por defecto (modelo base)."
+end
+
+configure_uptake_and_products!(lb, ub)
+
+const NITROGEN_SOURCES = [get_rxn(rid) for rid in ACTIVE_N_SOURCE_IDS]
+const UPTAKE_IDXS = vcat([glu, fru], NITROGEN_SOURCES)
 const n_up = length(UPTAKE_IDXS)
 # Selectores constantes para evitar condicionales en NLexpresiones
 const IS_GLU = [x == glu ? 1.0 : 0.0 for x in UPTAKE_IDXS]
 const IS_FRU = [x == fru ? 1.0 : 0.0 for x in UPTAKE_IDXS]
 const IS_NIT = [1.0 - IS_GLU[i] - IS_FRU[i] for i in 1:n_up]
 const SELECT_UPTAKE = [Float64(mc == UPTAKE_IDXS[k]) for mc in 1:nv, k in 1:n_up]
-
-# Agrupamos Glucosa, Fructosa y TODAS las fuentes de nitrógeno, filtrando inválidos
-if 1 <= o2 <= nv; lb[o2] = 0.0; ub[o2] = 0.0; end
-if 1 <= ATP <= nv; lb[ATP] = 0.0; end
-if 1 <= o2 <= nv; lb[o2] = 0.0; ub[o2] = 0.0; end
-if 1 <= ATP <= nv; lb[ATP] = 0.0; end
 
 # ---------------------------------------------
 # Modelo Zenteno (param nominal)
@@ -1443,7 +1551,7 @@ if SELECTED_IPOPT_SOLVER in ("ma57", "ma77", "ma86", "ma97")
 end
 
 set_optimizer_attribute(m, "print_level", 5)
-set_optimizer_attribute(m, "max_iter", 500) # Damos más iteraciones por si el modo adaptativo es lento
+set_optimizer_attribute(m, "max_iter", 700) # Damos más iteraciones por si el modo adaptativo es lento
 
 # 2. Tolerancia Estricta (El objetivo ideal)
 set_optimizer_attribute(m, "tol", 1e-4)
@@ -1604,7 +1712,7 @@ end
 for k in keys(N_profile_ratios)
     1 <= k <= nv && (N_profile_vec[k] = N_profile_ratios[k])
 end
-const MW_N   = 0.014007
+const MW_N   = 0.014007 #g/mmol
 const MW_GLU = 0.180156
 const MW_FRU = 0.180156
 const MW_ETH = 0.046070
@@ -1628,7 +1736,7 @@ const MW_ETH = 0.046070
         (vn[i] * N_profile_vec[k]) / (N_atoms_vec[k] * MW_N)
 
 # 3. Wrapper L_uptake (Todo en mmol)
-    # Convertimos también Glucosa y Fructosa a mmol para que L_uptake sea homogéneo
+    # Convertimos también Glucosa y Fructosa a mmol para que L_uptake sea homogéneo 1/h : g/mmol = mmol/gh
     L_uptake[k=1:n_up, i=1:ph], 
         IS_GLU[k] * (vg[i] / MW_GLU) + 
         IS_FRU[k] * (vf[i] / MW_FRU) + 
@@ -1672,16 +1780,7 @@ end
 # ============================================================
 # PARTE 6: ODES & COMPLEMENTARIEDAD
 # ============================================================
-if 1 <= obj <= nv
-    @expression(m, v_obj[i=1:nfe], v[obj,i])
-else
-    @expression(m, v_obj[i=1:nfe], 0.0)
-end
-if 1 <= eth <= nv
-    @expression(m, v_eth[i=1:nfe], v[eth,i])
-else
-    @expression(m, v_eth[i=1:nfe], 0.0)
-end
+
 
 @NLconstraints(m, begin
 
@@ -1690,7 +1789,7 @@ end
 # ==========================================
 
     m1[i=1:ph, j=1:ncp], cdot[1,i,j] == 
-        (v_obj[i] - Kd_j[i,j]) * c[1,i,j]
+        (v[obj,i] - Kd_j[i,j]) * c[1,i,j]
     m2[i=1:ph, j=1:ncp], cdot[2,i,j] == 
         - MW_N * sum( (-v[UPTAKE_IDXS[k],i] * vs[UPTAKE_IDXS[k]]) * N_atoms_vec[UPTAKE_IDXS[k]] for k in 3:n_up ) * c[1,i,j] + injection_rate[i,j]
     m3[i=1:ph, j=1:ncp], cdot[3,i,j] == 
@@ -1698,20 +1797,20 @@ end
     m4[i=1:ph, j=1:ncp], cdot[4,i,j] == 
         - MW_FRU * (-v[fru,i]*vs[fru]) * c[1,i,j]
     m5[i=1:ph, j=1:ncp], cdot[5,i,j] == 
-        MW_ETH * v_eth[i] * c[1,i,j]
+        MW_ETH * v[eth,i] * c[1,i,j]
     
 # ==========================================
-    # 2. RESTRICCIONES DE ACOPLAMIENTO              Uptake Coupling v (mmol) * MW (g/mmol) <= vg (g)
+    # 2. RESTRICCIONES DE ACOPLAMIENTO            
 # ==========================================
     # Restricción de Crecimiento (Semi-fijación)
     growth_UB_dyn[i=1:nfe], 
         v[obj, i] * vs[obj] <= vx[i]
 
-    # Uptake Coupling (Ahora es dimensionalmente correcto: mmol <= mmol)
+    # Uptake Coupling 
     v_LB_uptake[k=1:n_up, i=1:nfe], 
         -v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i] <= 0
 
-    # Complementariedad (También correcta)
+    # Complementariedad
     FO_upt_cons[k=1:n_up, i=1:nfe],
         FO_upt[k,i] == (-v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i]) * alpha_upt[k,i]
 
@@ -1737,6 +1836,90 @@ println("Solver status = ", status)
 println("Primal status = ", pr_status)
 println("Objective FO   = ", safe_value(FO))
 println("Wall time (s)  = ", wall_time)
+
+# ============================================================
+# DIAGNÓSTICO DIMENSIONAL MICRO → MACRO (DEBUG)
+# ============================================================
+function print_dimensional_diagnostics(i=1, j=1)
+    println("\n========== DIMENSIONAL DIAGNOSTICS ==========")
+
+    # ---------------------------
+    # 1) Biomasa
+    # ---------------------------
+    X      = value(c[1,i,j])           # gDW/L
+    Xdot   = value(cdot[1,i,j])        # gDW/L/h
+    mu     = value(mu_j[i,j])          # 1/h
+    vx_loc = value(vx[i])              # debería ser 1/h (Zenteno)
+
+    println("---- BIOMASA ----")
+    println("X        (gDW/L)     = ", X)
+    println("Xdot     (gDW/L/h)   = ", Xdot)
+    println("mu       (1/h)       = ", mu)
+    println("mu*X     (gDW/L/h)   = ", mu * X)
+    println("vx (definido)       = ", vx_loc)
+
+    # ---------------------------
+    # 2) Glucosa
+    # ---------------------------
+    v_glu = value(v[glu,i])            # mmol/gDW/h
+    Gdot  = value(cdot[3,i,j])         # g/L/h
+
+    glu_macro = MW_GLU * (-v_glu) * X  # g/L/h
+
+    println("\n---- GLUCOSA ----")
+    println("v_glu (mmol/gDW/h)        = ", v_glu)
+    println("GLU macro FBA (g/L/h)    = ", glu_macro)
+    println("GLU ODE cdot[3] (g/L/h)  = ", Gdot)
+
+    # ---------------------------
+    # 3) Fructosa
+    # ---------------------------
+    v_fru = value(v[fru,i])            # mmol/gDW/h
+    Fdot  = value(cdot[4,i,j])         # g/L/h
+
+    fru_macro = MW_FRU * (-v_fru) * X  # g/L/h
+
+    println("\n---- FRUCTOSA ----")
+    println("v_fru (mmol/gDW/h)        = ", v_fru)
+    println("FRU macro FBA (g/L/h)    = ", fru_macro)
+    println("FRU ODE cdot[4] (g/L/h)  = ", Fdot)
+
+    # ---------------------------
+    # 4) Nitrógeno
+    # ---------------------------
+    vn_loc = value(vn[i])              # gN/gDW/h (según tu definición)
+    Ndot   = value(cdot[2,i,j])        # gN/L/h
+
+    N_sum = sum(
+        (-value(v[UPTAKE_IDXS[k],i])) * N_atoms_vec[UPTAKE_IDXS[k]]
+        for k in 1:length(UPTAKE_IDXS)
+    )                                  # mmol N/gDW/h
+
+    N_macro = MW_N * N_sum * X         # gN/L/h
+
+    println("\n---- NITRÓGENO ----")
+    println("vn (gN/gDW/h)            = ", vn_loc)
+    println("Sum N uptake (mmol/gDW/h)= ", N_sum)
+    println("N macro FBA (gN/L/h)     = ", N_macro)
+    println("N ODE cdot[2] (gN/L/h)   = ", Ndot)
+
+    # ---------------------------
+    # 5) Crecimiento FBA vs ODE
+    # ---------------------------
+    v_bio = value(v[obj,i])            # mmol/gDW/h
+    bio_macro = v_bio * X              # mmol/L/h (sin MW)
+
+    println("\n---- CRECIMIENTO ----")
+    println("v_biomass (mmol/gDW/h)   = ", v_bio)
+    println("v_biomass*X (mmol/L/h)  = ", bio_macro)
+    println("mu*X (gDW/L/h)          = ", mu * X)
+
+    println("============================================\n")
+end
+
+print_dimensional_diagnostics(1, 3)
+
+
 
 objective_val = try
     objective_value(m)
