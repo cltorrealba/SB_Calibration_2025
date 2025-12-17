@@ -26,6 +26,11 @@ const MOI = MathOptInterface
 const EXPORT_PLOT_CSV = get(ENV, "EXPORT_PLOT_CSV", "0") == "1"
 const USE_WARM_START = get(ENV, "USE_WARM_START", "1") == "1"
 const BASE_DIR   = @__DIR__
+const TEST_FIX_THETA_M = false       # Paso 7.1: true => fija theta_m=log(0.01) para solo simular
+const CALIBRATE_ONLY_THETA_M = true # Paso 7.2: true => solo calibra theta_m; otros teta fijados a data
+const DIAG_SIMPLE = get(ENV, "DIAG_SIMPLE", "0") == "1" # Modo diagnóstico sin complementariedad
+# Permite activar solo la complementariedad de cota superior (FO_U/alpha_U) en modo diagnóstico
+const DIAG_ENABLE_FO_U = get(ENV, "DIAG_ENABLE_FO_U", "0") == "1"
 const ESTIMA_DIR = BASE_DIR
 const PLOTS_DIR  = joinpath(ESTIMA_DIR, "plots")
 isdir(PLOTS_DIR) || mkpath(PLOTS_DIR)
@@ -33,7 +38,7 @@ isdir(PLOTS_DIR) || mkpath(PLOTS_DIR)
 const REDUCED_MODE = get(ENV, "REDUCED_MODE", "0") == "1"
 const REDUCED_SETS_PATH = joinpath(BASE_DIR, "julia_deploy", "results", "reduced_sets.jld2")
 
-const ESTIMATE_PARAMS = false
+const ESTIMATE_PARAMS = true
 
 function _sanitize_experiment_name(str::AbstractString)
     clean = strip(str)
@@ -75,9 +80,12 @@ const SC_X = 1.0     # biomasa/N se mantienen en ~1
 # ---------------------------------------------
 # Constantes de Penalización MPCC (Faltantes en versión anterior)
 # ---------------------------------------------
-const phi1 = 1e2
-const phi2 = 1e2
+const phi1 = 1e0
+const phi2 = 1e0
 const phi3 = 1e0
+
+# --- MANTENIMIENTO ---
+const IDX_ATPM = 3414          # Índice de la reacción de mantenimiento
 
 # ---------------------------------------------
 # Indices y tamanos del GEM
@@ -164,6 +172,45 @@ const PRODUCT_RXN_IDS = [
     "r_1865", # Isoamyl alcohol
 ]
 
+# Cofactores para válvulas de bypass en anaerobiosis
+const METS_ANAEROBIC_BYPASS = [
+    "s_3714[c]", # Heme A
+    "s_1198[c]", # Heme O
+    "s_1203[c]", # Coenzyme Q
+    "s_1207[c]", # Coenzyme Q6
+    "s_1212[c]", # Demethyl-menaquinone
+    "s_0529[c]"  # Calmodulin
+]
+
+# --- INYECCIÓN ESTRUCTURAL DE BYPASS ---
+println(">>> INYECTANDO REACCIONES BYPASS (Heme/CoQ)...")
+
+n_bypass = length(METS_ANAEROBIC_BYPASS)
+S_bypass = zeros(size(S,1), n_bypass)
+
+for (k, met_id) in enumerate(METS_ANAEROBIC_BYPASS)
+    if haskey(MET_INDEX, met_id)
+        row_idx = get_met(met_id)
+        S_bypass[row_idx, k] = 1.0
+    else
+        clean_id = replace(met_id, "[c]" => "")
+        if haskey(MET_INDEX, clean_id)
+            S_bypass[get_met(clean_id), k] = 1.0
+        end
+    end
+end
+
+S = hcat(S, S_bypass)
+nv_old = nv
+nv = size(S, 2)
+nm = size(S, 1)
+
+lb = vcat(lb, zeros(n_bypass))
+ub = vcat(ub, zeros(n_bypass))
+
+const IDX_BYPASS_START = nv_old + 1
+const IDX_BYPASS_END   = nv
+
 function apply_anaerobic_model!(S::AbstractMatrix, lb::AbstractVector, ub::AbstractVector)
     mets_ana = ["s_3714[c]", "s_1198[c]", "s_1203[c]", "s_1207[c]", "s_1212[c]", "s_0529[c]"]
     rxn_cofactor = get_rxn("r_4598")
@@ -218,22 +265,29 @@ function configure_uptake_and_products!(lb::AbstractVector, ub::AbstractVector)
 end
 
 # --- CORRECCIÓN DE EMERGENCIA: MANTENIMIENTO FLEXIBLE ---
-# Evita que el modelo se vuelva infactible cuando la cinética es baja.
-if length(lb) >= 3414
-    println(">>> RELAJANDO ATP MAINTENANCE (idx 3414) de $(lb[3414]) a 0.0 para evitar infeasibility inicial.")
-    lb[3414] = 0.1
+# Liberamos el límite inferior estricto para gestionarlo con Slack
+if length(lb) >= IDX_ATPM
+    println(">>> CONFIGURANDO SLACK PARA ATP MAINTENANCE (idx $IDX_ATPM). LB fijado a 0.0.")
+    lb[IDX_ATPM] = 0.01
+    # Mantenemos ub alto o fijo según tu CSV, lo importante es que lb sea 0
 end
 
-const SIM_MODE = lowercase(get(ENV, "SIM_MODE", "anaerobic"))
-println(">>> SIM_MODE = $(SIM_MODE)")
+println(">>> CONFIGURACIÓN FACULTATIVA: O2 inicial abierto y suplementos disponibles")
 
-if SIM_MODE == "anaerobic"
-    apply_anaerobic_model!(S, lb, ub)
-elseif SIM_MODE == "aerobic"
-    # Modelo base tal cual viene del GEM
-else
-    @warn "SIM_MODE desconocido: $(SIM_MODE). Se usa configuración por defecto (modelo base)."
-end
+# 1. Transporte de O2 (solo uptake; se prohíbe producción)
+lb[o2] = -1000.0
+ub[o2] = 0.0
+
+# 2. Suplementos anaerobios disponibles cuando se necesiten
+lb[get_rxn("r_1757")] = -1000.0  # ergosterol
+lb[get_rxn("r_1915")] = -1000.0  # lanosterol
+lb[get_rxn("r_1994")] = -1000.0  # palmitoleate
+lb[get_rxn("r_2106")] = -1000.0  # zymosterol
+lb[get_rxn("r_2134")] = -1000.0  # 14-demethyllanosterol
+lb[get_rxn("r_2137")] = -1000.0  # ergosta-5,7,22,24(28)-tetraen-3beta-ol
+lb[get_rxn("r_2189")] = -1000.0  # oleate
+
+# 3. No bloquear shuttles (r_0713, r_0714) ni forzar O2=0
 
 configure_uptake_and_products!(lb, ub)
 
@@ -249,9 +303,16 @@ const SELECT_UPTAKE = [Float64(mc == UPTAKE_IDXS[k]) for mc in 1:nv, k in 1:n_up
 # ---------------------------------------------
 # Modelo Zenteno (param nominal)
 # ---------------------------------------------
-const nc = 5 # X,N,G,F,E
+const nc = 6 # X, N, G, F, E, O2
 const NOISE_SEED = 1234
 const DEFAULT_LINEAR_SOLVER = "mumps"
+
+# --- Constantes Físicas y de Bypass ---
+const MW_O2   = 31.998   # g/mol
+const KO2_MM  = 0.009    # mmol/L     (Original en paper: ~33.1 mg/L, saturación O2 puro)
+const VO2_MAX = 0.606    # mmol/gDW/h (Original en paper: 19.4 mg/g/h)
+const O2_SAT  = 0.26     # mmol/L saturado
+const n_Hill  = 2.3      # Exponente ajustado según Tabla 2 de Cerda-Drago et al. (2016)
 
 # ---------------------------------------------
 # Selección de solver lineal (MUMPS por defecto)
@@ -350,12 +411,13 @@ function smooth_injection(t, t_shot, dose, width=1.0)
 end
 
 # SETTINGS PARA ESTIMACION DE PARAMETROS
-const np = 4
-const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn")
-const theta_data_params = log.([MU0_nom, YEG_nom, YEF_nom, YXN_nom])
-const theta_init_guess  = log.([MU0_nom*1.2, YEG_nom*1.2, YEF_nom*1.2, YXN_nom*1.2])
-LB = log.([0.5*MU0_nom, 0.5*YEG_nom, 0.5*YEF_nom, 0.5*YXN_nom])
-UB = log.([5.0*MU0_nom, 5.0*YEG_nom, 5.0*YEF_nom, 5.0*YXN_nom])
+const np = 5
+const IDX_THETA_M = np
+const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn", "mrate")
+const theta_data_params = log.([MU0_nom, YEG_nom, YEF_nom, YXN_nom, 0.01])
+const theta_init_guess  = log.([MU0_nom*1.0, YEG_nom*1.0, YEF_nom*1.0, YXN_nom*1.0, 0.01])
+LB = log.([1*MU0_nom, 1*YEG_nom, 1*YEF_nom, 1*YXN_nom, 1e-4])
+UB = log.([1*MU0_nom, 1*YEG_nom, 1*YEF_nom, 1*YXN_nom, 1e0])
 
 # Variables observadas y ruido aleatorio
 const MEAS_STATES = (3, 4, 5) # G, F, E
@@ -364,17 +426,18 @@ Random.seed!(NOISE_SEED)
 
 # Condiciones iniciales
 X0 = 0.5; N0 = 0.14; G0 = 110.0; F0 = 110.0; E0 = 0.0
-const C0_INIT = [X0, N0, G0, F0, E0]
+O2_init = O2_SAT * MW_O2 / 1000.0 # almacenar en g/L
+const C0_INIT = [X0, N0, G0, F0, E0, O2_init]
 c0 = copy(C0_INIT)
 
 # DISCRETIZACION
-nfe = 6   
+nfe = DIAG_SIMPLE ? 12 : 8   
 ncp = 3
-th  = 40.0
+th  = 120.0
 h   = th / nfe
 ph  = nfe
 hm    = fill(h, nfe)'
-var_h = 0.0
+var_h = 0.5
 
 colmat = [
     0.19681547722366   -0.06553542585020   0.02377097434822;
@@ -384,18 +447,18 @@ colmat = [
 const radau_nodes = (0.15505, 0.64495, 1.0)
 
 # OMEGA
-w     = 1e-20
-omega = 0
+w     = 1e-6
+omega = 1
 d   = zeros(nv); d[obj] = -1.0
 cs = ones(nc)
 vs = ones(nv)
 
 # PERFIL U DINAMICO
-const T_INJ_1 = 48.0   # horas
-const DOSE_1  = 0.10   # g/L (100 mg/L)
+const T_INJ_1 = 0   # horas
+const DOSE_1  = 0   # g/L (100 mg/L)
 const WIDTH_1 = 5.0    # ancho de pulso (h)
-const T_INJ_2 = 72.0   # segundo pulso (ajusta valores)
-const DOSE_2  = 0.10   # g/L (default neutro)
+const T_INJ_2 = 0   # segundo pulso (ajusta valores)
+const DOSE_2  = 0   # g/L (default neutro)
 const WIDTH_2 = 5.0
 
 
@@ -689,20 +752,22 @@ const K_AX, M_AX = _build_reduced_axes()
 # ---------------------------------------------
 # Herramientas de simulacion/plot
 # ---------------------------------------------
-const STATE_LABELS = ("X", "N", "G", "F", "E")
-const STATE_COLORS = (:royalblue, :forestgreen, :firebrick, :darkorange, :purple)
+const STATE_LABELS = ("X", "N", "G", "F", "E", "O2")
+const STATE_COLORS = (:royalblue, :forestgreen, :firebrick, :darkorange, :purple, :cyan)
 const STATE_MIN_CONC = (
-    1e-6, 
-    0.0,   
-    0.0,   
-    0.0,   
-    1e-6, 
+    1e-6,
+    0.0,
+    0.0,
+    0.0,
+    1e-6,
+    0.0,
 )
 struct ZentenoPlotParams
     mu0::Float64
     Yeg::Float64
     Yef::Float64
     Yxn::Float64
+    mrate0::Float64
 end
 
 function build_time_grid_from_lengths(lengths::AbstractVector{<:Real})
@@ -725,6 +790,8 @@ function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     G = max(u[3], 0.0)
     F = max(u[4], 0.0)
     E = max(u[5], 0.0)
+    O2_gL = max(u[6], 0.0)
+    O2_mmol = (O2_gL * 1000.0) / MW_O2
 
     T_curr = dynamic_temperature(t)
     safe_exp(val) = exp(clamp(val, -700.0, 100.0))
@@ -732,7 +799,7 @@ function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     mu_T =  safe_exp(59453.0 * (T_curr - 300.0) / (300.0 * R * T_curr))
     Kg_T =  safe_exp(46055.0 * (T_curr - 293.15) / (293.15 * R * T_curr))
     b_T  =  safe_exp(11000.0 * (T_curr - 296.15) / (296.15 * R * T_curr))
-    mrate = 0.01 * safe_exp(37681.0 * (T_curr - 293.30) / (293.30 * R * T_curr))
+    mrate = p.mrate0 * safe_exp(37681.0 * (T_curr - 293.30) / (293.30 * R * T_curr))
     denom = G + F + eps
     phiG = G / denom
     phiF = F / denom
@@ -746,6 +813,10 @@ function zenteno_ode!(du, u, p::ZentenoPlotParams, t)
     du[3] = -((mu / YXG_nom) + (betaG / p.Yeg) + mrate * phiG) * X
     du[4] = -((mu / YXF_nom) + (betaF / p.Yef) + mrate * phiF) * X
     du[5] = (betaG + betaF) * X
+    term_num = O2_mmol^2.3
+    term_den = term_num + (KO2_MM^2.3) + eps
+    vO2 = VO2_MAX * (term_num / term_den)
+    du[6] = - (MW_O2 / 1000.0) * vO2 * X
     return nothing
 end
 
@@ -1468,6 +1539,7 @@ function _simulate_zenteno_synthetic(; nfe::Int, ncp::Int, th::Float64, c0_vec::
         exp(theta_data_params[2]),
         exp(theta_data_params[3]),
         exp(theta_data_params[4]),
+        exp(theta_data_params[IDX_THETA_M]),
     )
     t_dense, U = simulate_zenteno(params; tspan=(0.0, th))
 
@@ -1500,6 +1572,7 @@ try
         exp(theta_data_params[2]),
         exp(theta_data_params[3]),
         exp(theta_data_params[4]),
+        exp(theta_data_params[IDX_THETA_M]),
     )
     local_t_pre, local_states_pre = simulate_zenteno(pre_params; tspan=(0.0, th))
     global t_pre = local_t_pre
@@ -1551,47 +1624,60 @@ if SELECTED_IPOPT_SOLVER in ("ma57", "ma77", "ma86", "ma97")
 end
 
 set_optimizer_attribute(m, "print_level", 5)
-set_optimizer_attribute(m, "max_iter", 700) # Damos más iteraciones por si el modo adaptativo es lento
-
-# 2. Tolerancia Estricta (El objetivo ideal)
-set_optimizer_attribute(m, "tol", 1e-4)
-
-# 3. Estrategia de Terminación Aceptable ("Caza-Óptimos")
-# Si el solver se atasca cerca de la solución pero no puede bajar el error dual, se detiene aquí.
-set_optimizer_attribute(m, "acceptable_iter", 5)       # Mantenerse estable 5 iteraciones
-set_optimizer_attribute(m, "acceptable_tol", 1e-1)     # Tolerancia relajada (suficiente para ingeniería)
-set_optimizer_attribute(m, "acceptable_constr_viol_tol", 1e-2) # Violación de restricciones aceptable
-# set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e10)   # ¡CRÍTICO! Ignora el ruido dual del MPCC
-set_optimizer_attribute(m, "acceptable_compl_inf_tol", 1e-2)   # Tolerancia de complementariedad
+if DIAG_SIMPLE
+    set_optimizer_attribute(m, "max_iter", 5000)
+    set_optimizer_attribute(m, "tol", 1e-2)
+    set_optimizer_attribute(m, "acceptable_iter", 5)
+    set_optimizer_attribute(m, "acceptable_tol", 1e-1)
+    set_optimizer_attribute(m, "acceptable_constr_viol_tol", 1e-1)
+else
+    set_optimizer_attribute(m, "max_iter", 1000) # Damos más iteraciones por si el modo adaptativo es lento
+    # 2. Tolerancia Estricta (El objetivo ideal)
+    set_optimizer_attribute(m, "tol", 1e-4)
+    # 3. Estrategia de Terminación Aceptable ("Caza-Óptimos")
+    # Si el solver se atasca cerca de la solución pero no puede bajar el error dual, se detiene aquí.
+    set_optimizer_attribute(m, "acceptable_iter", 5)       # Mantenerse estable 5 iteraciones
+    set_optimizer_attribute(m, "acceptable_tol", 1e-1)     # Tolerancia relajada (suficiente para ingeniería)
+    set_optimizer_attribute(m, "acceptable_constr_viol_tol", 1e-2) # Violación de restricciones aceptable
+    # set_optimizer_attribute(m, "acceptable_dual_inf_tol", 1e10)   # ¡CRÍTICO! Ignora el ruido dual del MPCC
+    set_optimizer_attribute(m, "acceptable_compl_inf_tol", 1e-2)   # Tolerancia de complementariedad
+end
 
 # 4. Estrategia de Barrera (Mu Strategy) - Anti-Rebote
 # "adaptive" es más lento pero mucho más seguro que "monotone" para problemas no convexos.
-set_optimizer_attribute(m, "mu_strategy", "adaptive")
+set_optimizer_attribute(m, "mu_strategy", "adaptive") # monotone adaptive
 set_optimizer_attribute(m, "mu_oracle", "quality-function") # Ayuda a elegir mejor el paso adaptativo
 
 # 5. Manejo de Cotas y Escalado
-set_optimizer_attribute(m, "bound_relax_factor", 0.0) # 0.0 para respetar estrictamente c >= 0 (física)
+set_optimizer_attribute(m, "bound_relax_factor", 1e-4) # 0.0 para respetar estrictamente c >= 0 (física)
 set_optimizer_attribute(m, "honor_original_bounds", "yes")
 set_optimizer_attribute(m, "nlp_scaling_method", "gradient-based") # A veces ayuda si los flujos tienen escalas muy distintas
 
 @variables(m, begin
     c[1:nc, 1:ph, 1:ncp] >= 0.0
     cdot[1:nc, 1:ph, 1:ncp]
-    FO
     teta[1:np]
-   
     v[1:nv, 1:nfe]
     lambda_[1:nm, 1:nfe]
-    alpha_U[1:nv, 1:nfe]>= 0.0
-    alpha_L[1:nv, 1:nfe]<= 0.0
-    alpha_upt[1:n_up, 1:nfe]<= 0.0
-    
-    FO_U[1:nv, 1:nfe]
-    FO_L[1:nv, 1:nfe]
-    FO_upt[1:n_up, 1:nfe]
-
     hv[1:nfe] >= 0.0
 end)
+const DIAG_ALPHA_U_ACTIVE = (!DIAG_SIMPLE) || DIAG_ENABLE_FO_U
+
+if DIAG_ALPHA_U_ACTIVE
+    @variables(m, begin
+        alpha_U[1:nv, 1:nfe]>= 0.0
+        FO_U[1:nv, 1:nfe]
+    end)
+end
+
+if !DIAG_SIMPLE
+    @variables(m, begin
+        alpha_L[1:nv, 1:nfe]<= 0.0
+        alpha_upt[1:n_up, 1:nfe]<= 0.0
+        FO_L[1:nv, 1:nfe]
+        FO_upt[1:n_up, 1:nfe]
+    end)
+end
 
 # ============================================================
 # PARTE 0: INICIALIZACION
@@ -1605,6 +1691,7 @@ end
 for k in 1:np
     set_start_value(teta[k], theta_init_guess[k]) 
 end
+set_start_value(teta[IDX_THETA_M], log(0.01))
 
 if USE_WARM_START
     # Warm Start: primero intenta cargar semilla guardada; si no hay, se arranca en cero (sin pFBA)
@@ -1618,7 +1705,7 @@ if USE_WARM_START
                         set_start_value(v[k, i], v_seed[k, i])
                     end
                 end
-                if haskey(f, "alpha_upt_seed")
+                if !DIAG_SIMPLE && haskey(f, "alpha_upt_seed")
                     au_seed = read(f, "alpha_upt_seed")
                     for i in 1:nfe, k in 1:n_up
                         set_start_value(alpha_upt[k, i], au_seed[k, i])
@@ -1648,12 +1735,16 @@ if USE_WARM_START
     if !seed_loaded
         println("[WARM-START] Sin semilla guardada; inicio en cero (sin pFBA).")
         for i in 1:nfe, k in 1:nv; set_start_value(v[k,i], 0.0); end
-        for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+        if !DIAG_SIMPLE
+            for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+        end
     end
 else
     # Cold Start
     for i in 1:nfe, k in 1:nv; set_start_value(v[k,i], 0.0); end
-    for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+    if !DIAG_SIMPLE
+        for i in 1:nfe, k in 1:n_up; set_start_value(alpha_upt[k,i], 0.0); end
+    end
 end
 
 # Normalización C0 local para el modelo
@@ -1662,13 +1753,18 @@ for i in 1:nc; c0[i] = c0[i] / cs[i]; end
 # ============================================================
 # PARTE 1: FUNCION OBJETIVO
 # ============================================================
-@NLobjective(m, Min, 
-    omega * FO + 
-    sum(
-        sum(-phi1*FO_L[mc,i] - phi3*FO_U[mc,i] for mc in 1:nv) + 
-        sum(phi2*FO_upt[k,i] for k in 1:n_up) 
-    for i in 1:nfe)
-)
+@NLexpression(m, FO_expr, sum( sum( sum( (data[i,j,mc] - c[i,j,mc])^2 for i in 1:nc) for j in 1:ph) for mc in 1:ncp))
+
+if DIAG_SIMPLE
+    @NLobjective(m, Min, omega * FO_expr)
+else
+    @NLobjective(m, Min,
+        omega * FO_expr +
+        phi1 * sum(FO_L[mc,i]^2   for mc in 1:nv,  i in 1:nfe) +
+        phi3 * sum(FO_U[mc,i]^2   for mc in 1:nv,  i in 1:nfe) +
+        phi2 * sum(FO_upt[k,i]^2  for k  in 1:n_up, i in 1:nfe)
+    )
+end
 
 # ============================================================
 # PARTE 2: EXPRESIONES ZENTENO
@@ -1689,13 +1785,24 @@ JuMP.register(m, :death_rate_T, 2, death_rate_T; autodiff = true)
 @NLexpression(m, mu_T_ij[i=1:ph, j=1:ncp], exp(59453.0 * (T_loc[i,j] - 300.0) / (300.0 * R * T_loc[i,j])))
 @NLexpression(m, Kg_T_ij[i=1:ph, j=1:ncp], exp(46055.0 * (T_loc[i,j] - 293.15) / (293.15 * R * T_loc[i,j])))
 @NLexpression(m, b_T_ij[i=1:ph, j=1:ncp], exp(11000.0 * (T_loc[i,j] - 296.15) / (296.15 * R * T_loc[i,j])))
-@NLexpression(m, mrate_ij[i=1:ph, j=1:ncp], 0.01 * exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j])))
+@NLexpression(m, mrate_ij[i=1:ph, j=1:ncp],
+    exp(teta[IDX_THETA_M]) *
+    exp(37681.0 * (T_loc[i,j] - 293.30) / (293.30 * R * T_loc[i,j])))
 
 @NLexpression(m, mu_j[i=1:ph, j=1:ncp], mu0 * mu_T_ij[i,j] * (c[2,i,j] / (c[2,i,j] + Kn0_nom * Kg_T_ij[i,j] + eps)))
 @NLexpression(m, betaG_j[i=1:ph, j=1:ncp], betaG0_nom * b_T_ij[i,j] * (c[3,i,j] / (c[3,i,j] + Kg0_nom * Kg_T_ij[i,j] + eps)) * (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps)))
 @NLexpression(m, betaF_j[i=1:ph, j=1:ncp], betaF0_nom * b_T_ij[i,j] * (c[4,i,j] / (c[4,i,j] + Kf0_nom * Kg_T_ij[i,j] + eps)) * (Kig0_nom * Kg_T_ij[i,j] / (c[3,i,j] + Kig0_nom * Kg_T_ij[i,j] + eps)) * (Kie0_nom * Kg_T_ij[i,j] / (c[5,i,j] + Kie0_nom * Kg_T_ij[i,j] + eps)))
 @NLexpression(m, Kd_j[i=1:ph, j=1:ncp], death_rate_T(c[5,i,j], T_loc[i,j]))
 @NLexpression(m, injection_rate[i=1:nfe, j=1:ncp], smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_1, DOSE_1, WIDTH_1) + smooth_injection((i - 1 + radau_nodes[j]) * hv[i], T_INJ_2, DOSE_2, WIDTH_2))
+
+# Oxígeno
+@NLexpression(m, O2_conc_mM[i=1:ph, j=1:ncp], (c[6,i,j] * 1000.0) / MW_O2)
+@NLexpression(m, v_limit_O2[i=1:ph, j=1:ncp], 
+    VO2_MAX * (
+        (O2_conc_mM[i,j]^n_Hill) / 
+        ( (O2_conc_mM[i,j]^n_Hill) + (KO2_MM^n_Hill) + 1e-9 )
+    ))
+@NLexpression(m, signal_anaerobic[i=1:nfe], 1.0 / (1.0 + ((c[6,i,3] * 1000.0 / MW_O2) / 0.01)^2))
 
 # ============================================================
 # PARTE 3: DATOS NITROGENO
@@ -1761,20 +1868,36 @@ end)
     MFE3[i=1:nfe], hv[i] >= 0.0
     MFE4[i=1:nfe], hv[i] >= (1.0 - var_h) * hm[1]
     MFE5[i=1:nfe], hv[i] <= (1.0 + var_h) * hm[1]
-
-    # KKT Lagrangiano
-    Lagr[mc=1:nv,i=1:nfe], d[mc] + w*v[mc,i]*vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] + sum(SELECT_UPTAKE[mc,k] * alpha_upt[k,i] for k in 1:n_up) + sum(S[k,mc]*lambda_[k,i] for k in 1:nm) == 0
 end)
 
-if ESTIMATE_PARAMS
+if !DIAG_SIMPLE
     @constraints(m, begin
-        teta_LB[p=1:np], teta[p] >= LB[p]
-        teta_UB[p=1:np], teta[p] <= UB[p]
+        # KKT Lagrangiano
+        Lagr[mc=1:nv,i=1:nfe], d[mc] + w*v[mc,i]*vs[mc] + alpha_L[mc,i] + alpha_U[mc,i] + sum(SELECT_UPTAKE[mc,k] * alpha_upt[k,i] for k in 1:n_up) + sum(S[k,mc]*lambda_[k,i] for k in 1:nm) == 0
     end)
+end
+
+if ESTIMATE_PARAMS
+    if CALIBRATE_ONLY_THETA_M
+        @constraints(m, begin
+            teta_fix_data[p=1:np-1], teta[p] == theta_data_params[p]
+            tetaM_LB, teta[IDX_THETA_M] >= LB[IDX_THETA_M]
+            tetaM_UB, teta[IDX_THETA_M] <= UB[IDX_THETA_M]
+        end)
+    else
+        @constraints(m, begin
+            teta_LB[p=1:np], teta[p] >= LB[p]
+            teta_UB[p=1:np], teta[p] <= UB[p]
+        end)
+    end
 else
     @constraints(m, begin
         teta_fix[p=1:np], teta[p] == theta_data_params[p]
     end)
+end
+
+if TEST_FIX_THETA_M
+    JuMP.fix(teta[IDX_THETA_M], log(0.01); force=true)
 end
 
 # ============================================================
@@ -1790,14 +1913,23 @@ end
 
     m1[i=1:ph, j=1:ncp], cdot[1,i,j] == 
         (v[obj,i] - Kd_j[i,j]) * c[1,i,j]
-    m2[i=1:ph, j=1:ncp], cdot[2,i,j] == 
-        - MW_N * sum( (-v[UPTAKE_IDXS[k],i] * vs[UPTAKE_IDXS[k]]) * N_atoms_vec[UPTAKE_IDXS[k]] for k in 3:n_up ) * c[1,i,j] + injection_rate[i,j]
+    m2[i=1:ph, j=1:ncp], cdot[2,i,j] ==
+        - MW_N * (
+            sum(
+                IS_NIT[k] *
+                (-v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]]) *
+                N_atoms_vec[UPTAKE_IDXS[k]]
+                for k = 1:n_up
+            )
+        ) * c[1,i,j] + injection_rate[i,j]
     m3[i=1:ph, j=1:ncp], cdot[3,i,j] == 
         - MW_GLU * (-v[glu,i]*vs[glu]) * c[1,i,j]
     m4[i=1:ph, j=1:ncp], cdot[4,i,j] == 
         - MW_FRU * (-v[fru,i]*vs[fru]) * c[1,i,j]
     m5[i=1:ph, j=1:ncp], cdot[5,i,j] == 
         MW_ETH * v[eth,i] * c[1,i,j]
+    m6[i=1:ph, j=1:ncp], cdot[6,i,j] == 
+        - MW_O2 * (-v[o2,i]*vs[o2]) * c[1,i,j]
     
 # ==========================================
     # 2. RESTRICCIONES DE ACOPLAMIENTO            
@@ -1806,10 +1938,20 @@ end
     growth_UB_dyn[i=1:nfe], 
         v[obj, i] * vs[obj] <= vx[i]
 
+    # Consumo de O2 acotado por cinética (Monod)
+    v_LB_O2_uptake[i=1:nfe], -v[o2, i] * vs[o2] - v_limit_O2[i,3] <= 0
+
+    # Control de válvulas bypass (Heme/CoQ) según señal anaeróbica
+    bypass_ctrl[k=IDX_BYPASS_START:IDX_BYPASS_END, i=1:nfe], v[k, i] * vs[k] <= 1000.0 * signal_anaerobic[i]
+
     # Uptake Coupling 
     v_LB_uptake[k=1:n_up, i=1:nfe], 
         -v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i] <= 0
 
+end)
+
+if !DIAG_SIMPLE
+@NLconstraints(m, begin
     # Complementariedad
     FO_upt_cons[k=1:n_up, i=1:nfe],
         FO_upt[k,i] == (-v[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - L_uptake[k,i]) * alpha_upt[k,i]
@@ -1817,10 +1959,13 @@ end
     # Bounds Complementarity
     FO1[mc=1:nv,i=1:nfe], FO_L[mc,i] == (v[mc,i]*vs[mc] -lb[mc])*alpha_L[mc,i]
     FO2[mc=1:nv,i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] -ub[mc])*alpha_U[mc,i]
-
-    # Data Fitting
-    m8, FO == sum( sum( sum( (data[i,j,mc]-c[i,j,mc])^2 for i in 1:nc)   for j in 1:ph)   for mc in 1:ncp)
 end)
+elseif DIAG_ENABLE_FO_U
+@NLconstraints(m, begin
+    # Solo complementariedad de cota superior en modo diagnóstico
+    FO2_diag[mc=1:nv,i=1:nfe], FO_U[mc,i] == (v[mc,i]*vs[mc] - ub[mc]) * alpha_U[mc,i]
+end)
+end
 
 
 println("Iniciando optimizacion robusta V3...")
@@ -1834,7 +1979,7 @@ pr_status = primal_status(m)
 
 println("Solver status = ", status)
 println("Primal status = ", pr_status)
-println("Objective FO   = ", safe_value(FO))
+println("Objective FO   = ", safe_value(FO_expr))
 println("Wall time (s)  = ", wall_time)
 
 # ============================================================
@@ -1890,18 +2035,28 @@ function print_dimensional_diagnostics(i=1, j=1)
     vn_loc = value(vn[i])              # gN/gDW/h (según tu definición)
     Ndot   = value(cdot[2,i,j])        # gN/L/h
 
-    N_sum = sum(
-        (-value(v[UPTAKE_IDXS[k],i])) * N_atoms_vec[UPTAKE_IDXS[k]]
+    N_inner = sum(
+        IS_NIT[k] *
+        (-value(v[UPTAKE_IDXS[k], i]) * vs[UPTAKE_IDXS[k]]) *
+        N_atoms_vec[UPTAKE_IDXS[k]]
         for k in 1:length(UPTAKE_IDXS)
     )                                  # mmol N/gDW/h
 
-    N_macro = MW_N * N_sum * X         # gN/L/h
+    N_macro = MW_N * N_inner * X       # gN/L/h
+    inj = value(injection_rate[i,j])
+
+    macro_from_v = MW_N * value(c[1,i,j]) * N_inner
 
     println("\n---- NITRÓGENO ----")
     println("vn (gN/gDW/h)            = ", vn_loc)
-    println("Sum N uptake (mmol/gDW/h)= ", N_sum)
+    println("Sum N uptake (mmol/gDW/h)= ", N_inner)
     println("N macro FBA (gN/L/h)     = ", N_macro)
     println("N ODE cdot[2] (gN/L/h)   = ", Ndot)
+    println(" -- inner (mmol/gDW/h)   = ", N_inner)
+    println(" -- macro_from_v (gN/L/h)= ", macro_from_v)
+    println(" -- cdot2 (gN/L/h)       = ", Ndot)
+    println(" -- inj (gN/L/h)         = ", inj)
+    println(" -- cdot2 - inj          = ", Ndot - inj)
 
     # ---------------------------
     # 5) Crecimiento FBA vs ODE
@@ -1926,7 +2081,7 @@ objective_val = try
 catch
     NaN
 end
-fo_val = safe_value(FO, NaN)
+fo_val = safe_value(FO_expr, NaN)
 dual_inf = optimizer_attr(m, "dual infeasibility")
 primal_inf = optimizer_attr(m, "primal infeasibility")
 compl = optimizer_attr(m, "complementarity")
@@ -1940,24 +2095,30 @@ if (stats = collect_ipopt_stats(m)) !== nothing
     iter_count = stats.iter_count
 end
 
-function _max_with_idx(name, arr)
-    vals = abs.(arr)
-    mx, idx = findmax(vals)
-    println(@sprintf("%-16s max=%.3e at %s raw=%.3e", name, mx, idx, arr[idx]))
-end
-
 function report_residuals()
     try
-        vval  = value.(v)
-        cval  = value.(c)
-        hvval = value.(hv)
-        cdval = value.(cdot)
-        alL   = value.(alpha_L)
-        alU   = value.(alpha_U)
-        alUp  = value.(alpha_upt)
-        lam   = value.(lambda_)
-        Llim  = value.(L_uptake)
-        vxval = value.(vx)
+        _v(x) = begin
+            try
+                value.(x; result=1)
+            catch
+                try
+                    value.(x)
+                catch
+                    fill(NaN, size(x))
+                end
+            end
+        end
+
+        vval  = _v(v)
+        cval  = _v(c)
+        hvval = _v(hv)
+        cdval = _v(cdot)
+        lam   = _v(lambda_)
+        Llim  = _v(L_uptake)
+        vxval = _v(vx)
+        alL   = DIAG_SIMPLE ? zeros(nv, nfe) : _v(alpha_L)
+        alU   = DIAG_ALPHA_U_ACTIVE ? _v(alpha_U) : zeros(nv, nfe)
+        alUp  = DIAG_SIMPLE ? zeros(n_up, nfe) : _v(alpha_upt)
 
         coll0 = [cval[l,1,j] - (c0[l] + hvval[1] * sum(colmat[j,k] * cdval[l,1,k] for k in 1:ncp))
                  for l in 1:nc, j in 1:ncp]
@@ -1972,23 +2133,106 @@ function report_residuals()
                  for mc in 1:nv, i in 1:nfe]
         grow  = (1 <= obj <= nv) ? [vval[obj,i] * vs[obj] - vxval[i] for i in 1:nfe] : zeros(nfe)
         upt   = [-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i] for k in 1:n_up, i in 1:nfe]
-        foL   = [(vval[mc,i] * vs[mc] - lb[mc]) * alL[mc,i] for mc in 1:nv, i in 1:nfe]
-        foU   = [(vval[mc,i] * vs[mc] - ub[mc]) * alU[mc,i] for mc in 1:nv, i in 1:nfe]
-        fou   = [(-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i]) * alUp[k,i] for k in 1:n_up, i in 1:nfe]
+
+        println("[RESID TYPES] coll0=", typeof(coll0), " eltype=", eltype(coll0))
+        println("[RESID TYPES] colln=", typeof(colln), " eltype=", eltype(colln))
+        println("[RESID TYPES] fba=", typeof(fba), " eltype=", eltype(fba))
+
+        # Tiempos locales para contextualizar
+        hv_prefix = vcat(0.0, cumsum(hvval[1:end-1]))
+        t_end = cumsum(hvval)
+        t_colloc(i, j) = hv_prefix[i] + radau_nodes[j] * hvval[i]
+
+        _finite_summary(name, arr) = begin
+            finite_vals = Float64[]
+            if arr isa AbstractArray
+                for x in arr
+                    if x isa Real && isfinite(x)
+                        push!(finite_vals, abs(x))
+                    end
+                end
+            else
+                if arr isa Real && isfinite(arr)
+                    push!(finite_vals, abs(arr))
+                end
+            end
+            if isempty(finite_vals)
+                println(@sprintf("%-16s finite=0", name))
+            else
+                println(@sprintf("%-16s finite=%d max|x|=%.3e", name, length(finite_vals), maximum(finite_vals)))
+            end
+        end
+
+        _max_with_label(name, arr, label_fn) = begin
+            println("[MAX LABEL] name=", name, " typeof=", typeof(name), " arr eltype=", arr isa AbstractArray ? string(eltype(arr)) : string(typeof(arr)))
+            max_val = -Inf
+            max_idx = nothing
+            raw_val = nothing
+            if arr isa AbstractArray
+                for idx in CartesianIndices(arr)
+                    x = arr[idx]
+                    x isa Real || continue
+                    isfinite(x) || continue
+                    ax = abs(x)
+                    if ax > max_val
+                        max_val = ax
+                        max_idx = idx
+                        raw_val = x
+                    end
+                end
+            else
+                x = arr
+                if x isa Real && isfinite(x)
+                    max_val = abs(x)
+                    max_idx = 1
+                    raw_val = x
+                end
+            end
+            if max_idx === nothing
+                println(@sprintf("%-16s max=NA (no numeric entries)", name))
+                return
+            end
+            raw_str = raw_val isa Real ? @sprintf("%.3e", raw_val) : string(raw_val)
+            println(@sprintf("%-16s max=%.3e %s raw=%s", name, max_val, label_fn(max_idx, raw_val), raw_str))
+        end
+
+        rxn_name(mc) = (1 <= mc <= length(RXN_IDS)) ? RXN_IDS[mc] : string(mc)
 
         println("=== Post-solve residuals ===")
-        _max_with_idx("colloc0", coll0)
-        _max_with_idx("collocN", colln)
-        _max_with_idx("FBA", fba)
-        _max_with_idx("v UB", ubv)
-        _max_with_idx("v LB", lbv)
-        _max_with_idx("Lagr", lagr)
-        _max_with_idx("growth_UB", grow)
-        _max_with_idx("uptake", upt)
-        _max_with_idx("FO_L", foL)
-        _max_with_idx("FO_U", foU)
-        _max_with_idx("FO_upt", fou)
+        _finite_summary("colloc0", coll0)
+        _max_with_label("colloc0", coll0, (idx, _) -> @sprintf("at t=%.2f l=%d j=%d", radau_nodes[idx.I[2]]*hvval[1], idx.I[1], idx.I[2]))
+        _finite_summary("collocN", colln)
+        _max_with_label("collocN", colln, (idx, _) -> @sprintf("at t=%.2f l=%d j=%d", t_colloc(idx.I[2], idx.I[3]), idx.I[1], idx.I[3]))
+        _finite_summary("FBA", fba)
+        _max_with_label("FBA", fba, (idx, _) -> @sprintf("rxn=%s t=%.2f", rxn_name(idx.I[1]), t_end[idx.I[2]]))
+        _finite_summary("v UB", ubv)
+        _max_with_label("v UB", ubv, (idx, _) -> begin mc = idx.I[1]; i = idx.I[2]; @sprintf("rxn=%s t=%.2f ub=%.3e v=%.3e", rxn_name(mc), t_end[i], ub[mc], vval[mc,i]*vs[mc]) end)
+        _finite_summary("v LB", lbv)
+        _max_with_label("v LB", lbv, (idx, _) -> begin mc = idx.I[1]; i = idx.I[2]; @sprintf("rxn=%s t=%.2f lb=%.3e v=%.3e", rxn_name(mc), t_end[i], lb[mc], vval[mc,i]*vs[mc]) end)
+        _finite_summary("Lagr", lagr)
+        _max_with_label("Lagr", lagr, (idx, _) -> @sprintf("rxn=%s t=%.2f", rxn_name(idx.I[1]), t_end[idx.I[2]]))
+        _finite_summary("growth_UB", grow)
+        _max_with_label("growth_UB", grow, (idx, _) -> @sprintf("t=%.2f", t_end[idx.I[1]]))
+        _finite_summary("uptake", upt)
+        _max_with_label("uptake", upt, (idx, _) -> begin k = idx.I[1]; i = idx.I[2]; mc = UPTAKE_IDXS[k]; @sprintf("rxn=%s t=%.2f L=%.3e v=%.3e", rxn_name(mc), t_end[i], Llim[k,i], vval[mc,i]*vs[mc]) end)
+
+        if !DIAG_SIMPLE
+            foL   = [(vval[mc,i] * vs[mc] - lb[mc]) * alL[mc,i] for mc in 1:nv, i in 1:nfe]
+            _max_with_label("FO_L", foL, (idx, _) -> begin mc = idx.I[1]; i = idx.I[2]; @sprintf("rxn=%s t=%.2f", rxn_name(mc), t_end[i]) end)
+        end
+
+        if (!DIAG_SIMPLE) || DIAG_ENABLE_FO_U
+            foU   = [(vval[mc,i] * vs[mc] - ub[mc]) * alU[mc,i] for mc in 1:nv, i in 1:nfe]
+            _max_with_label("FO_U", foU, (idx, _) -> begin mc = idx.I[1]; i = idx.I[2]; @sprintf("rxn=%s t=%.2f", rxn_name(mc), t_end[i]) end)
+        end
+
+        if !DIAG_SIMPLE
+            fou   = [(-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i]) * alUp[k,i] for k in 1:n_up, i in 1:nfe]
+            _max_with_label("FO_upt", fou, (idx, _) -> begin k = idx.I[1]; i = idx.I[2]; mc = UPTAKE_IDXS[k]; @sprintf("rxn=%s t=%.2f", rxn_name(mc), t_end[i]) end)
+        end
+
         println(@sprintf("%-16s min=%.3e", "c min", minimum(cval)))
+
     catch err
         @warn "No se pudieron imprimir residuales" err
     end
@@ -1998,14 +2242,14 @@ function report_uptake_details()
     try
         vval  = value.(v)
         Llim  = value.(L_uptake)
-        au    = value.(alpha_upt)
+        au    = DIAG_SIMPLE ? zeros(n_up, nfe) : value.(alpha_upt)
         upt   = [-vval[UPTAKE_IDXS[k], i] * vs[UPTAKE_IDXS[k]] - Llim[k, i] for k in 1:n_up, i in 1:nfe]
         mx, idx = findmax(abs.(upt))
         k = idx.I[1]; i = idx.I[2]; mc = UPTAKE_IDXS[k]
         println("=== Uptake detail ===")
         println("UPTAKE_IDXS = ", UPTAKE_IDXS)
-        println(@sprintf("max uptake viol=%.3e at k=%d (mc=%d) i=%d raw=%.3e L_upt=%.3e v=%.3e alpha_upt=%.3e FO_upt=%.3e",
-            mx, k, mc, i, upt[k,i], Llim[k,i], vval[mc,i], au[k,i], value(FO_upt[k,i])))
+        println(@sprintf("max uptake viol=%.3e at k=%d (mc=%d) i=%d raw=%.3e L_upt=%.3e v=%.3e alpha_upt=%.3e",
+            mx, k, mc, i, upt[k,i], Llim[k,i], vval[mc,i], au[k,i]))
         for kk in 1:min(n_up, 5)
             jmax = min(nfe, 3)
             vals_upt = [upt[kk, j] for j in 1:jmax]
@@ -2024,14 +2268,21 @@ function save_warm_start_seed(path::AbstractString)
         for i in 1:nfe, k in 1:nv
             v_seed[k, i] = safe_value(v[k, i], 0.0)
         end
-        alpha_upt_seed = zeros(n_up, nfe)
-        for i in 1:nfe, k in 1:n_up
-            alpha_upt_seed[k, i] = safe_value(alpha_upt[k, i], 0.0)
+        alpha_upt_seed = DIAG_SIMPLE ? nothing : zeros(n_up, nfe)
+        if !DIAG_SIMPLE
+            for i in 1:nfe, k in 1:n_up
+                alpha_upt_seed[k, i] = safe_value(alpha_upt[k, i], 0.0)
+            end
         end
         hv_seed = [safe_value(hv[i], hm[i]) for i in 1:nfe]
         teta_seed = [safe_value(teta[k], theta_data_params[k]) for k in 1:np]
-        JLD2.jldsave(path; v_seed=v_seed, alpha_upt_seed=alpha_upt_seed, hv_seed=hv_seed, teta_seed=teta_seed,
-                     omega=omega, phi1=phi1, phi2=phi2, phi3=phi3, timestamp=Dates.now())
+        if DIAG_SIMPLE
+            JLD2.jldsave(path; v_seed=v_seed, hv_seed=hv_seed, teta_seed=teta_seed,
+                         omega=omega, phi1=phi1, phi2=phi2, phi3=phi3, timestamp=Dates.now())
+        else
+            JLD2.jldsave(path; v_seed=v_seed, alpha_upt_seed=alpha_upt_seed, hv_seed=hv_seed, teta_seed=teta_seed,
+                         omega=omega, phi1=phi1, phi2=phi2, phi3=phi3, timestamp=Dates.now())
+        end
         println("[WARM-START] Semilla guardada en ", path)
     catch err
         @warn "[WARM-START] No se pudo guardar la semilla" err
@@ -2054,6 +2305,7 @@ try
         theta_final_vals[2],
         theta_final_vals[3],
         theta_final_vals[4],
+        theta_final_vals[IDX_THETA_M],
     )
     hv_vals = [safe_value(hv[i], hm[i]) for i in 1:nfe]
     mpcc_tgrid = build_time_grid_from_lengths(hv_vals)
