@@ -25,6 +25,14 @@ const MOI = MathOptInterface
 # ---------------------------------------------
 const EXPORT_PLOT_CSV = get(ENV, "EXPORT_PLOT_CSV", "0") == "1"
 const USE_WARM_START = get(ENV, "USE_WARM_START", "1") == "1"
+# Nuevo: control de datos sintéticos vía MPCC (cacheados en disco para evitar repetir IPOPT)
+const USE_MPCC_SYNTH_DATA = get(ENV, "USE_MPCC_SYNTH_DATA", "0") == "1"
+const MPCC_SYNTH_DATA_PATH = get(ENV, "MPCC_SYNTH_DATA_PATH", joinpath(@__DIR__, "mpcc_synth_data.jld2"))
+const MPCC_SYNTH_FORCE = get(ENV, "MPCC_SYNTH_FORCE", "0") == "1"
+const EXPORT_MPCC_SYNTH_DATA = get(ENV, "EXPORT_MPCC_SYNTH_DATA", "0") == "1"
+const EXPORT_MPCC_PRE_CURVE = get(ENV, "EXPORT_MPCC_PRE_CURVE", "0") == "1"
+# NUEVO: Fijar parámetros a θ_final (para generación de datos sintéticos "reales")
+const FIX_THETA_TO_FINAL = get(ENV, "FIX_THETA_TO_FINAL", "0") == "1"
 const BASE_DIR   = @__DIR__
 const TEST_FIX_THETA_M = false       # Paso 7.1: true => fija theta_m=log(0.01) para solo simular
 const CALIBRATE_ONLY_THETA_M = true # Paso 7.2: true => solo calibra theta_m; otros teta fijados a data
@@ -383,7 +391,7 @@ const eps = 1e-9
 const T_BASE = T_const
 const T_STEPS = [36.0, 96.0]   # dos eventos de cambio de T (ajusta valores a gusto)
 const T_DELTAS = [5.0, 3.0]    # salto asociado a cada evento (el 2do default es neutro)
-const T_STEEP = 1.0
+const T_STEEP = 0.5
 
 function dynamic_temperature(t)
     val = T_BASE
@@ -414,10 +422,11 @@ end
 const np = 5
 const IDX_THETA_M = np
 const THETA_NAMES = ("mu0", "Yeg", "Yef", "Yxn", "mrate")
-const theta_data_params = log.([MU0_nom, YEG_nom, YEF_nom, YXN_nom, 0.01])
-const theta_init_guess  = log.([MU0_nom*1.0, YEG_nom*1.0, YEF_nom*1.0, YXN_nom*1.0, 0.01])
+# const theta_data_params = [-1.95429, -1.95666, -0.0311605, 2.28297, 9.93659e-5]
+const theta_data_params = [-1.95429, -1.95666, -0.0311605, 2.28297, -6.9]
+const theta_init_guess  = copy(theta_data_params)
 LB = log.([1*MU0_nom, 1*YEG_nom, 1*YEF_nom, 1*YXN_nom, 1e-4])
-UB = log.([1*MU0_nom, 1*YEG_nom, 1*YEF_nom, 1*YXN_nom, 1e0])
+UB = log.([1*MU0_nom, 1*YEG_nom, 1*YEF_nom, 1*YXN_nom, 1.5])
 
 # Variables observadas y ruido aleatorio
 const MEAS_STATES = (3, 4, 5) # G, F, E
@@ -431,7 +440,7 @@ const C0_INIT = [X0, N0, G0, F0, E0, O2_init]
 c0 = copy(C0_INIT)
 
 # DISCRETIZACION
-nfe = DIAG_SIMPLE ? 12 : 8   
+nfe = DIAG_SIMPLE ? 24 : 8   
 ncp = 3
 th  = 120.0
 h   = th / nfe
@@ -486,8 +495,10 @@ function export_plot_data(prefix::AbstractString; mpcc_tgrid, mpcc_states, t_pos
     ts_mpcc = vec(mpcc_tgrid)
     rows_mpcc = NamedTuple[]
     for idx in eachindex(ts_mpcc)
-        i = div(idx-1, size(mpcc_tgrid, 2)) + 1
-        j = mod(idx-1, size(mpcc_tgrid, 2)) + 1
+        # Mapear índice lineal (column-major) a (i,j):
+        # vec(mpcc_tgrid) recorre primero filas i dentro de cada columna j.
+        i = mod(idx-1, size(mpcc_tgrid, 1)) + 1
+        j = div(idx-1, size(mpcc_tgrid, 1)) + 1
         push!(rows_mpcc, (
             time = ts_mpcc[idx],
             X = mpcc_states[1, i, j],
@@ -1256,24 +1267,56 @@ function _plot_state_series!(ax, state_idx, t_pre, states_pre, t_post, states_po
         ts_data, data_vals, mpcc_tgrid, mpcc_states; plot_data::Bool=false)
     color = STATE_COLORS[state_idx]
     label_base = STATE_LABELS[state_idx]
-    if ESTIMATE_PARAMS && t_pre !== nothing && states_pre !== nothing
-        plot!(ax, t_pre, states_pre[state_idx, :];
-            color=color, lw=2, linestyle=:dashdot, label="ODE pre $(label_base)")
-    end
+    # Curva post-optimización (línea continua) desde spline MPCC
     if t_post !== nothing && states_post !== nothing
         plot!(ax, t_post, states_post[state_idx, :];
-            color=color, lw=3, label="ODE post $(label_base)")
+            color=color, lw=3, label="MPCC post $(label_base)")
     end
+    # Puntos de colocación MPCC optimizados (si disponibles)
     if mpcc_tgrid !== nothing && mpcc_states !== nothing
         ts_mpcc = vec(mpcc_tgrid)
         ys_mpcc = reshape(mpcc_states[state_idx, :, :], length(ts_mpcc))
         scatter!(ax, ts_mpcc, ys_mpcc;
-            color=:purple, ms=5, alpha=0.9, marker=:diamond, label="MPCC $(label_base)")
+            color=:purple, ms=5, alpha=0.9, marker=:diamond, label="Colocación MPCC $(label_base)")
     end
-    if ESTIMATE_PARAMS && plot_data && data_vals !== nothing && !isempty(ts_data)
-        ys_data = reshape(data_vals[state_idx, :, :], length(ts_data))
+    # Datos experimentales (MPCC "real" con parámetros originales o fijados)
+    if plot_data && data_vals !== nothing && !isempty(ts_data)
+        # data_vals es matriz 2D [estados × puntos], no 3D
+        ys_data = vec(data_vals[state_idx, :])
         scatter!(ax, ts_data, ys_data;
-            color=color, ms=4, alpha=0.8, marker=:circle, label="Datos exp. $(label_base)")
+            color=color, ms=4, alpha=0.8, marker=:circle, label="Datos MPCC real $(label_base)")
+    end
+end
+
+function _plot_flux_panel!(ax, state_idx, uptake_series)
+    """Grafica flujo vs límite dinámico para todos los estados metabólicos"""
+    if uptake_series === nothing
+        return
+    end
+    
+    state_name = STATE_LABELS[state_idx]
+    color_map = Dict(1 => :darkblue, 2 => :green, 3 => :blue, 4 => :orange, 5 => :purple, 6 => :cyan)
+    state_color = get(color_map, state_idx, :black)
+    
+    # Mapear estado a clave en uptake_series
+    state_keys = Dict(1 => :biomass, 2 => :nitrogen, 3 => :glu, 4 => :fru, 5 => :ethanol, 6 => :oxygen)
+    key = get(state_keys, state_idx, nothing)
+    
+    if key !== nothing && haskey(uptake_series, key)
+        data = uptake_series[key]
+        t = data[:t]
+        v_flux = data[:flux]
+        
+        plot!(ax, t, v_flux; color=state_color, lw=2.5, label="Flujo $state_name")
+        
+        # Si tiene límite (G, F, N, X), graficarlo
+        if haskey(data, :limit)
+            limit = data[:limit]
+            plot!(ax, t, limit; color=:red, lw=2.5, ls=:dash, label="Límite $state_name")
+        end
+        
+        ylabel!(ax, "Flujo [mmol/gDW/h]")
+        xlabel!(ax, "Tiempo [h]")
     end
 end
 
@@ -1281,24 +1324,18 @@ function _plot_temperature_panel!(ax, t_pre, t_post, mpcc_tgrid)
     # Recolectar todos los valores de temperatura para analizar el rango
     all_temps = Float64[]
     
-    if ESTIMATE_PARAMS && t_pre !== nothing
-        vals = dynamic_temperature.(t_pre)
-        append!(all_temps, vals)
-        plot!(ax, t_pre, vals;
-            color=:royalblue, lw=2, linestyle=:dashdot, label="ODE pre temp")
-    end
     if t_post !== nothing
         vals = dynamic_temperature.(t_post)
         append!(all_temps, vals)
         plot!(ax, t_post, vals;
-            color=:firebrick, lw=3, label="ODE post temp")
+            color=:firebrick, lw=3, label="MPCC post temp")
     end
     if mpcc_tgrid !== nothing
         ts_mpcc = vec(mpcc_tgrid)
         vals = dynamic_temperature.(ts_mpcc)
         append!(all_temps, vals)
         scatter!(ax, ts_mpcc, vals;
-            color=:purple, marker=:diamond, ms=5, alpha=0.9, label="MPCC temp")
+            color=:purple, marker=:diamond, ms=5, alpha=0.9, label="Colocación MPCC temp")
     end
     
     # --- LÓGICA DE CENTRADO DE EJE Y ---
@@ -1340,29 +1377,42 @@ function _plot_ethyl_acetate_panel!(ax, mpcc_tgrid, mpcc_states, v_var, strippin
 end
 
 function plot_post_solution(t_pre, states_pre, t_post, states_post, tgrid_data, data_vals,
-        mpcc_tgrid, mpcc_states, v_var; title_str::AbstractString, save_path::AbstractString, stripping_inputs=nothing, ethyl_series=nothing)
+        mpcc_tgrid, mpcc_states, v_var; title_str::AbstractString, save_path::AbstractString, stripping_inputs=nothing, ethyl_series=nothing, uptake_series=nothing)
     ts_data = tgrid_data === nothing ? Float64[] : vec(tgrid_data)
-    # Layout en filas (una por variable + temp + etil acetato)
-    n_panels = nc + 2
-    plt = plot(layout=(n_panels, 1), size=(1000, 1900), legend=:topright, dpi=250)
+    
+    # Layout: grid 6 filas x 3 columnas
+    # Col 1: Estados (G, F, X, N, E, O2)
+    # Col 2: Flujos vs límites (G, F, vacío, vacío, vacío, vacío)
+    # Col 3: Temperatura (arriba) + Etil acetato (abajo)
+    plt = @layout [
+        grid(6,1) grid(6,1) grid(2,1)
+    ]
+    plt = plot(layout=plt, size=(1600, 2000), legend=:topright, dpi=250)
 
-    # Estados (una fila cada uno)
+    # Columna 1: Estados de concentración
     for s in 1:nc
-        _plot_state_series!(plt[s], s, t_pre, states_pre, t_post, states_post,
+        idx_plot = s
+        _plot_state_series!(plt[idx_plot], s, t_pre, states_pre, t_post, states_post,
             ts_data, data_vals, mpcc_tgrid, mpcc_states; plot_data=(s in MEAS_STATES))
-        ylabel!(plt[s], STATE_LABELS[s] * " [g/L]")
+        ylabel!(plt[idx_plot], STATE_LABELS[s] * " [g/L]")
         if s == 1
-            title!(plt[s], title_str)
+            title!(plt[idx_plot], title_str)
         end
     end
 
-    # Temperatura
-    temp_panel = nc + 1
+    # Columna 2: Flujos de cada estado (con o sin límites dinámicos)
+    for s in 1:nc
+        idx_plot = nc + s
+        _plot_flux_panel!(plt[idx_plot], s, uptake_series)
+    end
+
+    # Columna 3: Temperatura (panel 1) y Etil acetato (panel 2)
+    temp_panel = 2*nc + 1
     _plot_temperature_panel!(plt[temp_panel], t_pre, t_post, mpcc_tgrid)
     ylabel!(plt[temp_panel], "Temp [°C]")
+    title!(plt[temp_panel], "Condiciones auxiliares")
 
-    # Etil acetato + stripping
-    eth_panel = nc + 2
+    eth_panel = 2*nc + 2
     _plot_ethyl_acetate_panel!(plt[eth_panel], mpcc_tgrid, mpcc_states, v_var, stripping_inputs; ethyl_series=ethyl_series)
     ylabel!(plt[eth_panel], "Ethyl acetate [g/L]")
     xlabel!(plt[eth_panel], "Tiempo [h]")
@@ -1370,7 +1420,7 @@ function plot_post_solution(t_pre, states_pre, t_post, states_post, tgrid_data, 
     save_dir = dirname(save_path)
     isdir(save_dir) || mkpath(save_dir)
     savefig(plt, save_path)
-    println("[PLOT] Guardado Layout en filas: ", save_path)
+    println("[PLOT] Guardado layout 3-columnas: ", save_path)
 end
 
 safe_value(x, default=NaN) = try value(x) catch; default end
@@ -1560,26 +1610,171 @@ function _simulate_zenteno_synthetic(; nfe::Int, ncp::Int, th::Float64, c0_vec::
     return data
 end
 
-println("[SYNTH] Generando datos sinteticos...")
-data = _simulate_zenteno_synthetic(nfe=nfe, ncp=ncp, th=th, c0_vec=c0)
-println("[SYNTH] Datos sinteticos listos.")
+_load_if_has(f, key) = haskey(f, key) ? read(f, key) : nothing
 
-t_pre = nothing
-states_pre = nothing
-try
-    pre_params = ZentenoPlotParams(
-        exp(theta_data_params[1]),
-        exp(theta_data_params[2]),
-        exp(theta_data_params[3]),
-        exp(theta_data_params[4]),
-        exp(theta_data_params[IDX_THETA_M]),
-    )
-    local_t_pre, local_states_pre = simulate_zenteno(pre_params; tspan=(0.0, th))
-    global t_pre = local_t_pre
-    global states_pre = local_states_pre
-catch err
-    @warn "No se pudo simular la ODE previa a la optimizacion" err
+function _load_mpcc_synth_cache(path::AbstractString)
+    return JLD2.jldopen(path, "r") do f
+        (
+            data=_load_if_has(f, "data"),
+            data_tgrid=_load_if_has(f, "data_tgrid"),  # Grilla temporal de los datos
+            mpcc_states=_load_if_has(f, "mpcc_states"),
+            mpcc_tgrid=_load_if_has(f, "mpcc_tgrid"),
+            hv=_load_if_has(f, "hv"),
+            theta_log=_load_if_has(f, "theta_log"),
+            pre_t=_load_if_has(f, "pre_t"),
+            pre_states=_load_if_has(f, "pre_states"),
+            post_t=_load_if_has(f, "post_t"),
+            post_states=_load_if_has(f, "post_states"),
+            timestamp=_load_if_has(f, "timestamp"),
+        )
+    end
 end
+
+function _save_mpcc_synth_cache(path::AbstractString; data, mpcc_states, mpcc_tgrid, hv_vals, theta_log, pre_t, pre_states, post_t, post_states)
+    mkpath(dirname(path))
+    
+    # Extraer puntos de colocación como matriz 2D: [n_estados × n_puntos_totales]
+    # mpcc_states es [n_estados, n_elementos, n_cp]
+    n_estados, n_elem, n_cp = size(mpcc_states)
+    n_puntos_totales = n_elem * n_cp
+    
+    # Aplanar estados con el MISMO orden que vec(mpcc_tgrid):
+    # Julia es column-major, vec(A) recorre primero columna j, luego filas i.
+    # Por coherencia, iteramos j (cp) externo y i (elem) interno.
+    data_flat = zeros(n_estados, n_puntos_totales)
+    for s in 1:n_estados
+        idx = 1
+        for j in 1:n_cp
+            for i in 1:n_elem
+                data_flat[s, idx] = mpcc_states[s, i, j]
+                idx += 1
+            end
+        end
+    end
+    
+    # Grilla temporal también en formato plano, usando el mismo orden column-major
+    tgrid_flat = vec(mpcc_tgrid)  # [n_elem × n_cp] → vector 1D
+    
+    JLD2.jldsave(path; 
+                 data=data_flat,  # Matriz 2D plana [estados × puntos]
+                 data_tgrid=tgrid_flat,  # Vector 1D de tiempos
+                 mpcc_states=mpcc_states, 
+                 mpcc_tgrid=mpcc_tgrid, 
+                 hv=hv_vals,
+                 theta_log=theta_log, 
+                 pre_t=nothing,  # No guardar curvas pre (no existen con FIX_THETA_TO_FINAL)
+                 pre_states=nothing,
+                 post_t=post_t, 
+                 post_states=post_states, 
+                 timestamp=Dates.now())
+    
+    println("[SYNTH] 📦 Cache MPCC guardado en " * path)
+    println("[SYNTH]   ✓ Puntos de colocación guardados: $(n_puntos_totales)")
+    println("[SYNTH]   ✓ Grilla temporal: [$(tgrid_flat[1])h ... $(tgrid_flat[end])h]")
+end
+
+function _mpcc_spline_lines(mpcc_tgrid, mpcc_states)
+    ts = vec(mpcc_tgrid)
+    t_line = nothing
+    states_line = Array{Float64}(undef, nc, 0)
+    for s in 1:nc
+        ys = reshape(mpcc_states[s, :, :], length(ts))
+        line_t, line_vals = _sample_cubic_spline(ts, ys; nsamples=400)
+        if t_line === nothing
+            t_line = line_t
+            states_line = zeros(nc, length(line_t))
+        end
+        states_line[s, :] = line_vals
+    end
+    return (t=t_line, states=states_line)
+end
+
+function _build_synthetic_data()
+    # 1) Preferir cache MPCC si se solicita y existe
+    if USE_MPCC_SYNTH_DATA && isfile(MPCC_SYNTH_DATA_PATH) && !MPCC_SYNTH_FORCE
+        println("[SYNTH] 📂 Cargando datos sinteticos desde MPCC cacheado: " * MPCC_SYNTH_DATA_PATH)
+        cache = _load_mpcc_synth_cache(MPCC_SYNTH_DATA_PATH)
+        if cache.data === nothing
+            @warn "Cache MPCC encontrado pero sin clave 'data'" MPCC_SYNTH_DATA_PATH
+        else
+            # Verificar que data tenga formato correcto [n_estados × n_puntos]
+            if size(cache.data, 1) != nc
+                @warn "Dimensión de estados en cache ($(size(cache.data,1))) no coincide con nc=$(nc). Regenerando..."
+            else
+                println("[SYNTH]   ✓ Datos cargados: $(size(cache.data,2)) puntos experimentales")
+                println("[SYNTH]   ✓ Estados: $(size(cache.data,1))")
+                
+                # Reconstruir curva spline desde puntos de colocación MPCC (para línea continua)
+                t_pre_local = nothing
+                states_pre_local = nothing
+                if cache.mpcc_tgrid !== nothing && cache.mpcc_states !== nothing
+                    spline = _mpcc_spline_lines(cache.mpcc_tgrid, cache.mpcc_states)
+                    t_pre_local = spline.t
+                    states_pre_local = spline.states
+                    println("[SYNTH]   ✓ Curva spline generada: $(length(t_pre_local)) puntos interpolados")
+                end
+                
+                # Usar grilla temporal del cache (o generar desde mpcc_tgrid si no existe)
+                data_tgrid_local = cache.data_tgrid
+                if data_tgrid_local === nothing && cache.mpcc_tgrid !== nothing
+                    data_tgrid_local = vec(cache.mpcc_tgrid)
+                    println("[SYNTH]   ⚠ data_tgrid no encontrado, reconstruido desde mpcc_tgrid")
+                end
+                
+                # Reconstruir data en formato 3D para el modelo JuMP [estados × elementos × cp]
+                data_3d_local = zeros(nc, nfe, ncp)
+                n_datos = size(cache.data, 2)
+                expected_datos = nfe * ncp
+                if n_datos != expected_datos
+                    @warn "Inconsistencia: cache tiene $n_datos puntos pero se esperaban $expected_datos (nfe=$nfe, ncp=$ncp)"
+                end
+                
+                idx = 1
+                # Usar el mismo orden column-major que vec(mpcc_tgrid): j externo, i interno
+                for j in 1:ncp
+                    for i in 1:nfe
+                        if idx <= n_datos
+                            for s in 1:nc
+                                data_3d_local[s, i, j] = cache.data[s, idx]
+                            end
+                            idx += 1
+                        end
+                    end
+                end
+                
+                println("[SYNTH]   ✓ Data reconstruida en formato 3D para modelo: [$nc × $nfe × $ncp]")
+                
+                return cache.data, data_tgrid_local, data_3d_local, t_pre_local, states_pre_local
+            end
+        end
+    end
+
+    if USE_MPCC_SYNTH_DATA && !isfile(MPCC_SYNTH_DATA_PATH)
+        @warn "USE_MPCC_SYNTH_DATA=1 pero no existe el archivo cache; se usara fallback ODE" MPCC_SYNTH_DATA_PATH
+    end
+
+    # 2) Fallback ODE (compatibilidad)
+    println("[SYNTH] Generando datos sinteticos (fallback ODE)...")
+    local_data = _simulate_zenteno_synthetic(nfe=nfe, ncp=ncp, th=th, c0_vec=c0)
+    local_t_pre = nothing
+    local_states_pre = nothing
+    try
+        pre_params = ZentenoPlotParams(
+            exp(theta_data_params[1]),
+            exp(theta_data_params[2]),
+            exp(theta_data_params[3]),
+            exp(theta_data_params[4]),
+            exp(theta_data_params[IDX_THETA_M]),
+        )
+        local_t_pre, local_states_pre = simulate_zenteno(pre_params; tspan=(0.0, th))
+    catch err
+        @warn "No se pudo simular la ODE previa a la optimizacion" err
+    end
+    return local_data, DATA_TIME_GRID, local_data, local_t_pre, local_states_pre
+end
+
+data_2d, data_tgrid, data, t_pre, states_pre = _build_synthetic_data()
+println("[SYNTH] Datos sinteticos listos (" * (USE_MPCC_SYNTH_DATA ? "MPCC cache" : "ODE") * ").")
 
 # ---------------------------------------------
 # MODELO JuMP
@@ -1691,7 +1886,7 @@ end
 for k in 1:np
     set_start_value(teta[k], theta_init_guess[k]) 
 end
-set_start_value(teta[IDX_THETA_M], log(0.01))
+set_start_value(teta[IDX_THETA_M], theta_init_guess[IDX_THETA_M])
 
 if USE_WARM_START
     # Warm Start: primero intenta cargar semilla guardada; si no hay, se arranca en cero (sin pFBA)
@@ -1889,6 +2084,16 @@ if ESTIMATE_PARAMS
             teta_LB[p=1:np], teta[p] >= LB[p]
             teta_UB[p=1:np], teta[p] <= UB[p]
         end)
+    end
+elseif FIX_THETA_TO_FINAL
+    # ✅ NUEVO: Fijar parámetros a θ_final para generación de datos sintéticos "reales"
+    println("🔒 Parámetros FIJADOS a θ_final (generación datos sintéticos)")
+    # theta_vals_log = [-1.95429, -1.95666, -0.0311605, 2.28297, 9.93659e-05]
+    theta_vals_log = [-1.95429, -1.95666, -0.0311605, 2.28297, -6.9]
+
+    for p in 1:np
+        JuMP.fix(teta[p], theta_vals_log[p]; force=true)
+        println("  θ[$p] = ", theta_vals_log[p], " (exp = ", exp(theta_vals_log[p]), ")")
     end
 else
     @constraints(m, begin
@@ -2313,7 +2518,10 @@ try
     for l in 1:nc, i in 1:nfe, j in 1:ncp
         mpcc_states[l, i, j] = safe_value(c[l, i, j])
     end
-    t_post, states_post = simulate_zenteno(post_params; tspan=(0.0, th))
+    # Generar curva post desde splines MPCC (reemplaza ODE)
+    spline_post = _mpcc_spline_lines(mpcc_tgrid, mpcc_states)
+    t_post = spline_post.t
+    states_post = spline_post.states
     stripping_inputs = nothing
     try
         stripping_inputs = _build_stripping_inputs(t_post, states_post, post_params)
@@ -2321,13 +2529,92 @@ try
         @warn "No se pudo construir la serie de stripping (CO2 + UNIFAC)" err
     end
     ethyl_series = _build_ethyl_acetate_plot_data(mpcc_tgrid, mpcc_states, v; stripping_inputs=stripping_inputs)
+
+    # Serie de flujos y restricciones dinámicas para todos los estados
+    uptake_series = nothing
+    try
+        vval = value.(v)
+        Llim = value.(L_uptake)
+        vxval = value.(vx)  # Límite de crecimiento
+        vnval = value.(vn)  # Límite de nitrógeno macroscópico
+        
+        # Tiempo en nodos (longitud nfe): cumsum de hv_vals, incluyendo t=0 al inicio
+        uptake_t = [0.0; cumsum(hv_vals)]
+        uptake_series = Dict{Symbol, Any}()
+        
+        # 1. BIOMASA (X, estado 1): v[obj,i]*vs[obj] vs vx[i]
+        # Agregar valor inicial (típicamente 0 para flujos en t=0)
+        flux_biomass = [0.0; [vval[obj, i] * vs[obj] for i in 1:nfe]]
+        limit_biomass = [vxval[1]; [vxval[i] for i in 1:nfe]]
+        uptake_series[:biomass] = (t=uptake_t, flux=flux_biomass, limit=limit_biomass)
+        
+        # 2. NITRÓGENO (N, estado 2): suma de v_N vs suma de L_uptake[N]
+        k_nit_indices = findall(x -> x > 0, IS_NIT)  # Índices en UPTAKE_IDXS para nitrógeno
+        if !isempty(k_nit_indices)
+            flux_n = zeros(nfe+1)
+            limit_n = zeros(nfe+1)
+            for k in k_nit_indices
+                met_idx = UPTAKE_IDXS[k]
+                flux_n .+= [0.0; [-vval[met_idx, i] * vs[met_idx] for i in 1:nfe]]
+                limit_n .+= [Llim[k, 1]; [Llim[k, i] for i in 1:nfe]]
+            end
+            uptake_series[:nitrogen] = (t=uptake_t, flux=flux_n, limit=limit_n)
+        end
+        
+        # 3. GLUCOSA (G, estado 3): -v[glu,i] * vs[glu] vs L_uptake[glu]
+        k_glu = findfirst(==(glu), UPTAKE_IDXS)
+        if k_glu !== nothing
+            flux_glu = [0.0; [-vval[glu, i] * vs[glu] for i in 1:nfe]]
+            limit_glu = [Llim[k_glu, 1]; [Llim[k_glu, i] for i in 1:nfe]]
+            uptake_series[:glu] = (t=uptake_t, flux=flux_glu, limit=limit_glu)
+        end
+        
+        # 4. FRUCTOSA (F, estado 4): -v[fru,i] * vs[fru] vs L_uptake[fru]
+        k_fru = findfirst(==(fru), UPTAKE_IDXS)
+        if k_fru !== nothing
+            flux_fru = [0.0; [-vval[fru, i] * vs[fru] for i in 1:nfe]]
+            limit_fru = [Llim[k_fru, 1]; [Llim[k_fru, i] for i in 1:nfe]]
+            uptake_series[:fru] = (t=uptake_t, flux=flux_fru, limit=limit_fru)
+        end
+        
+        # 5. ETANOL (E, estado 5): v[eth,i] (producción, sin límite dinámico)
+        flux_eth = [0.0; [vval[eth, i] for i in 1:nfe]]
+        uptake_series[:ethanol] = (t=uptake_t, flux=flux_eth)
+        
+        # 6. OXÍGENO (O2, estado 6): -v[o2,i] * vs[o2] (consumo, sin límite dinámico)
+        flux_o2 = [0.0; [-vval[o2, i] * vs[o2] for i in 1:nfe]]
+        uptake_series[:oxygen] = (t=uptake_t, flux=flux_o2)
+        
+    catch err
+        @warn "No se pudo construir serie de flujos" err
+    end
+
+    if EXPORT_MPCC_SYNTH_DATA
+        try
+            _save_mpcc_synth_cache(MPCC_SYNTH_DATA_PATH;
+                data=mpcc_states,
+                mpcc_states=mpcc_states,
+                mpcc_tgrid=mpcc_tgrid,
+                hv_vals=hv_vals,
+                theta_log=theta_final_log,
+                pre_t=t_pre,
+                pre_states=states_pre,
+                post_t=t_post,
+                post_states=states_post,
+            )
+        catch err
+            @warn "No se pudo guardar cache de datos MPCC" err
+        end
+    end
+
     plot_post_solution(
-        t_pre, states_pre, t_post, states_post, DATA_TIME_GRID, data,
+        t_pre, states_pre, t_post, states_post, data_tgrid, data_2d,
         mpcc_tgrid, mpcc_states, v;
         title_str="MPCC post: $(status) / $(pr_status)",
         save_path=plot_output_path,
         stripping_inputs=stripping_inputs,
         ethyl_series=ethyl_series,
+        uptake_series=uptake_series,
     )
     if EXPORT_PLOT_CSV
         try
